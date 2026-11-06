@@ -2,4 +2,4 @@
 // where it is built. _overlay/ and kwasm/ only compile inside that checkout.
 module kwasm-overlay
 
-go 1.26
+go 1.27.3

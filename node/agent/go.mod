@@ -1,6 +1,6 @@
 module github.com/jkroepke/blog/kwasm/node/agent
 
-go 1.26.0
+go 1.27.3
 
 require (
 	github.com/pion/ice/v4 v4.4.8

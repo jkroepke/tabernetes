@@ -9,7 +9,7 @@
 # and fixing whatever k8s/patch.go complains about.
 
 [tools]
-go = "1.26"
+go = "1.27.3"
 
 [env]
 # renovate: datasource=github-tags depName=kubernetes/kubernetes
