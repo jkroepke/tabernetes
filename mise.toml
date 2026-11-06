@@ -1,6 +1,6 @@
 # kwasm: a Kubernetes control plane in the browser.
 #
-#   mise run build       build the WebAssembly binary and the terminal into ../static/kwasm/
+#   mise run build       build the WebAssembly binary and the terminal into ../assets/kwasm/
 #   mise run web         rebuild only the terminal (needs .build/wasm_exec.js)
 #   mise run test        run the etcd shim tests
 #   mise run node-image  build the node image (kwasm-node) for the local platform
@@ -44,41 +44,49 @@ touch .build/kubernetes/.patched
 '''
 
 [tasks.wasm]
-description = "Build ../static/kwasm/kwasm.wasm.zst"
+description = "Build ../assets/kwasm/kwasm.wasm.zst"
 depends = ["patch"]
 sources = [".build/kubernetes/.patched", "k8s/build.sh"]
-outputs = ["../static/kwasm/kwasm.wasm.zst", ".build/wasm_exec.js"]
+outputs = ["../assets/kwasm/kwasm.wasm.zst", ".build/wasm_exec.js"]
 run = '''
-mkdir -p ../static/kwasm
+mkdir -p ../assets/kwasm
 k8s/build.sh .build/kubernetes .build/kwasm.wasm
 # wasm_exec.js must come from the same Go version that built kwasm.wasm.
 cp "$(cd .build/kubernetes && go env GOROOT)/lib/wasm/wasm_exec.js" .build/wasm_exec.js
 # zstd -19 is about 40 % smaller than gzip -9. Node.js has zstd built in.
+# Independent frames of 32 MiB (0.6 % larger than one frame): the page unpacks
+# each frame in a worker as soon as it is downloaded, several in parallel.
 node -e '
   const fs = require("node:fs"), os = require("node:os"), zlib = require("node:zlib"), c = zlib.constants;
-  fs.writeFileSync(process.argv[2], zlib.zstdCompressSync(fs.readFileSync(process.argv[1]), { params: {
+  const wasm = fs.readFileSync(process.argv[1]), frames = [];
+  for (let i = 0; i < wasm.length; i += 32 << 20) frames.push(zlib.zstdCompressSync(wasm.subarray(i, i + (32 << 20)), { params: {
     [c.ZSTD_c_compressionLevel]: 19, [c.ZSTD_c_checksumFlag]: 1, [c.ZSTD_c_nbWorkers]: os.availableParallelism() } }));
-' .build/kwasm.wasm ../static/kwasm/kwasm.wasm.zst
+  fs.writeFileSync(process.argv[2], Buffer.concat(frames));
+' .build/kwasm.wasm ../assets/kwasm/kwasm.wasm.zst
 '''
 
 [tasks.web]
-description = "Bundle the terminal into ../static/kwasm/kwasm.js"
+description = "Bundle the terminal into ../assets/kwasm/"
 wait_for = ["wasm"]
 run = '''
 if [ ! -f .build/wasm_exec.js ]; then mise run wasm; fi
-mkdir -p ../static/kwasm
-out="$(cd ../static/kwasm && pwd)"
+# Hugo fingerprints these (layouts/_shortcodes/kwasm.html), so the browser
+# can cache them for good.
+mkdir -p ../assets/kwasm
+out="$(cd ../assets/kwasm && pwd)"
 cp .build/wasm_exec.js web/src/wasm_exec.js
 cd web
 npm ci --no-audit --no-fund
 npx esbuild src/index.js --bundle --minify --format=esm --target=es2022 \
   --define:KWASM_NODE_IMAGE="\"$NODE_IMAGE:$KUBERNETES_VERSION\"" \
   --outfile="$out/kwasm.js"
+# The zstd decoder runs in a worker, so that the page does not freeze.
+npx esbuild src/unzstd.js --bundle --minify --format=iife --target=es2022 --outfile="$out/unzstd.js"
 cp node_modules/@xterm/xterm/css/xterm.css "$out/xterm.css"
 '''
 
 [tasks.build]
-description = "Build everything into ../static/kwasm/"
+description = "Build everything into ../assets/kwasm/"
 depends = ["wasm", "web"]
 
 [tasks.test]

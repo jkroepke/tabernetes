@@ -1,5 +1,5 @@
 # kwasm-node: a Kubernetes node that joins a control plane running in a browser.
-ARG GO_IMAGE=mirror.gcr.io/library/golang:1.26-trixie
+ARG GO_IMAGE=mirror.gcr.io/library/golang:1.27-trixie
 ARG BASE_IMAGE=mirror.gcr.io/library/debian:trixie-slim
 
 FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS agent

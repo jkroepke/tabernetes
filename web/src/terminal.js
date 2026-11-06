@@ -3,7 +3,6 @@
 // only does the line editing and the builtins that need the browser.
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { decompress } from "fzstd";
 import { installFS } from "./fs.js";
 
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
@@ -24,9 +23,17 @@ export async function startTerminal(el, opts) {
 
   const logs = [];
   globalThis.kwasmLogs = logs;
+  // A crash trace is kept apart from the rotating log buffer, which would drop
+  // its beginning while the runtime prints thousands of goroutines.
+  const crash = [];
+  globalThis.kwasmCrash = crash;
   let crashing = false;
   installFS((fd, s) => {
-    if (crashing || /^(panic:|fatal error:)/m.test(s)) { crashing = true; console.error(s); }
+    if (crashing || /^(panic:|fatal error:)/m.test(s)) {
+      crashing = true;
+      console.error(s);
+      if (crash.length < 2000) crash.push(s);
+    }
     // Control plane logs: visible with the "Verbose" level in the DevTools console.
     else console.debug(s.replace(/\n$/, ""));
     logs.push(s);
@@ -39,32 +46,40 @@ export async function startTerminal(el, opts) {
   term.writeln("");
 
   // ---- download + boot ----
-  const resp = await fetch(opts.wasmURL);
-  if (!resp.ok) throw new Error(`download failed: ${resp.status}`);
-  const total = Number(resp.headers.get("content-length")) || opts.wasmSize || 0;
+  // Download, decompression (in a worker) and compilation run at the same time.
+  const t0 = performance.now();
+  const since = () => ((performance.now() - t0) / 1000).toFixed(1).padStart(5);
+  globalThis.kwasmStatus = (s) => term.writeln(`${DIM(`[${since()}s]`)} ${s}`);
+  const { body, total, cached } = await download(opts.wasmURL);
   let loaded = 0;
   const bar = (n, t) => {
     const w = 30, f = t ? Math.min(w, Math.round((n / t) * w)) : 0;
     return `[${"#".repeat(f)}${" ".repeat(w - f)}] ${(n / 1048576).toFixed(1)}${t ? "/" + (t / 1048576).toFixed(1) : ""} MB`;
   };
-  const counted = resp.body.pipeThrough(new TransformStream({
+  const what = cached ? "compiling from the browser cache" : "downloading and compiling";
+  const counted = body.pipeThrough(new TransformStream({
     transform(chunk, ctl) {
       loaded += chunk.length;
-      term.write(`\r${DIM("downloading")} ${bar(loaded, total)}`);
+      term.write(`\r${DIM(what)} ${bar(loaded, total || opts.wasmSize)}`);
       ctl.enqueue(chunk);
     },
   }));
-  const bytes = await unpack(opts.wasmURL, counted);
-  term.writeln("");
-
-  const t0 = performance.now();
-  const since = () => ((performance.now() - t0) / 1000).toFixed(1).padStart(5);
-  globalThis.kwasmStatus = (s) => term.writeln(`${DIM(`[${since()}s]`)} ${s}`);
-  globalThis.kwasmStatus("compiling WebAssembly");
   const go = new globalThis.Go();
   go.env = { HOME: "/root", USER: "root", PATH: "/usr/bin" };
-  const { instance } = await WebAssembly.instantiate(bytes, go.importObject);
-  go.run(instance).then(() => term.writeln("\r\n\x1b[31mthe control plane exited\x1b[0m"));
+  const instance = await instantiate(unpack(opts.wasmURL, counted, total, opts.workerURL), go.importObject);
+  term.writeln("");
+  globalThis.kwasmStatus(cached ? "compiled WebAssembly from the browser cache" : "downloaded and compiled WebAssembly");
+  // The "free" command reads the size of the linear memory from here.
+  globalThis.kwasmMemory = instance.exports.mem;
+  const exited = (why) => {
+    term.writeln(`\r\n\x1b[31mthe control plane exited${why ? `: ${why}` : ""}\x1b[0m`);
+    if (crash.length) {
+      // The first lines name the cause and the crashing goroutine.
+      term.writeln(crash.join("").split("\n").slice(0, 30).join("\n"));
+      term.writeln(DIM("The full trace is in kwasmCrash in the DevTools console."));
+    }
+  };
+  go.run(instance).then(() => exited(), (e) => exited(e?.message ?? String(e)));
   await globalThis.kwasm.ready;
   term.writeln("");
   term.writeln(`Try ${"\x1b[1m"}kubectl get nodes${"\x1b[0m"}, ${"\x1b[1m"}kubectl get pods -A | grep dns${"\x1b[0m"} or ${"\x1b[1m"}help${"\x1b[0m"}.`);
@@ -99,7 +114,7 @@ export async function startTerminal(el, opts) {
         "",
         "Terminal",
         "  join                     connect a real node via WebRTC (needs docker)",
-        "  accept <answer>          finish a join with the answer of the node",
+        "  accept <answer>          finish a join later (join asks for it)",
         "  logs [n]                 the last n lines of the control plane logs",
         "  clear                    clear the screen",
         ...terminal.filter((n) => !["join", "accept", "logs", "clear"].includes(n)).map((n) => `  ${n}`),
@@ -122,9 +137,45 @@ export async function startTerminal(el, opts) {
     },
     ...(opts.builtins || {}),
   };
+  // ask reads one line from the keyboard while a builtin runs (join waits for
+  // the accept line). Ctrl-C rejects.
+  let reader = null;
+  const ask = (text) => new Promise((resolve, reject) => {
+    reader = { line: "", resolve, reject };
+    term.write(text);
+  });
+  function readerFeed(data) {
+    for (const c of data) {
+      if (!reader) return;
+      if (c === "\r" || c === "\n") {
+        const r = reader;
+        reader = null;
+        term.write("\r\n");
+        r.resolve(r.line);
+      } else if (c === "\x03") {
+        const r = reader;
+        reader = null;
+        term.write("^C\r\n");
+        r.reject(new Error("cancelled"));
+      } else if (c === "\x7f") {
+        if (reader.line) { reader.line = reader.line.slice(0, -1); term.write("\b \b"); }
+      } else if (c >= " ") {
+        reader.line += c;
+        term.write(c);
+      }
+    }
+  }
+
   // Builtins get (args, {write, stdin}) from the shell, plus the terminal.
-  const shellBuiltins = Object.fromEntries(Object.entries(builtins).map(
-    ([name, fn]) => [name, (args, ctx) => fn(args, { term, exec, write: ctx.write, stdin: ctx.stdin })]));
+  // Ctrl-C ends the command line, but a JS builtin runs on: active() tells it
+  // whether it still belongs to the running command line, and ask() rejects
+  // when it does not, so a canceled join cannot take the keys later.
+  let run = 0;
+  const shellBuiltins = Object.fromEntries(Object.entries(builtins).map(([name, fn]) => [name, (args, ctx) => {
+    const id = run, active = () => busy && id === run;
+    const askActive = (text) => (active() ? ask(text) : Promise.reject(new Error("cancelled")));
+    return fn(args, { term, exec, ask: askActive, active, write: ctx.write, stdin: ctx.stdin });
+  }]));
 
   // exec runs a command line in the shell and resolves to its exit status.
   const exec = (src) => globalThis.kwasm.shell(src, (s) => term.write(s), shellBuiltins);
@@ -165,6 +216,7 @@ export async function startTerminal(el, opts) {
     pending = "";
     if (src.trim()) {
       busy = true;
+      run++;
       try { await exec(src); } catch (e) { term.writeln(`kwasm: ${e.message}`); }
       busy = false;
       // Output without a final newline: start the prompt on a new line.
@@ -177,10 +229,13 @@ export async function startTerminal(el, opts) {
 
   redraw();
   term.onData((data) => {
+    // A builtin that asks for a line (join) gets the keys first.
+    if (reader) return readerFeed(data);
     if (!busy) return feed(data);
     // A full screen program (vi, kubectl edit) gets every key.
     if (globalThis.kwasm.rawMode()) return globalThis.kwasm.input(data);
     if (data === "\x03") {
+      run++;
       globalThis.kwasm.cancel();
       term.write("^C\r\n");
     }
@@ -217,11 +272,107 @@ export async function startTerminal(el, opts) {
   return { term, exec };
 }
 
+// download fetches the binary, from the Cache Storage when it is there. The
+// file name has a hash of the content (Hugo fingerprint), so a cached copy is
+// always current. GitHub Pages sends max-age=600 and nothing longer.
+async function download(url) {
+  let cache = null;
+  try { cache = await caches.open("kwasm"); } catch { /* no Cache Storage (http, private mode) */ }
+  const hit = await cache?.match(url).catch(() => null);
+  if (hit) return { body: hit.body, total: Number(hit.headers.get("content-length")), cached: true };
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`download failed: ${resp.status}`);
+  if (cache) {
+    const href = new URL(url, location.href).href;
+    cache.put(url, resp.clone())
+      .then(() => cache.keys())
+      .then((keys) => Promise.all(keys.filter((k) => k.url !== href).map((k) => cache.delete(k))))
+      .catch((e) => console.warn("kwasm: caching the binary failed:", e));
+  }
+  return { body: resp.body, total: Number(resp.headers.get("content-length")), cached: false };
+}
+
 // GitHub Pages sends no Content-Encoding for the binary, so the page unpacks
-// it. DecompressionStream has no zstd (Chromium 153), so fzstd decodes the
-// 290 MB in JavaScript. That takes about 1.5 seconds.
-async function unpack(url, stream) {
-  if (url.endsWith(".zst")) return decompress(new Uint8Array(await new Response(stream).arrayBuffer()));
-  if (url.endsWith(".gz")) stream = stream.pipeThrough(new DecompressionStream("gzip"));
-  return new Response(stream).arrayBuffer();
+// it. DecompressionStream has no zstd (Chromium 153), so fzstd does it in
+// JavaScript. The file is a row of independent zstd frames of 32 MB each
+// (kwasm/mise.toml). Workers unpack each frame as soon as it is downloaded,
+// several at once, and the unpacked bytes go on to the compiler in order.
+function unpack(url, stream, size, workerURL) {
+  const path = new URL(url, location.href).pathname;
+  if (path.endsWith(".gz")) return stream.pipeThrough(new DecompressionStream("gzip"));
+  if (!path.endsWith(".zst")) return stream;
+  const workers = Array.from({ length: Math.min(4, navigator.hardwareConcurrency || 2) }, () => {
+    const w = new Worker(workerURL), queue = []; // a worker answers in order
+    w.onmessage = ({ data }) => { const q = queue.shift(); data.error ? q.reject(new Error(data.error)) : q.resolve(data.out); };
+    w.onerror = (e) => { e.preventDefault(); queue.splice(0).forEach((q) => q.reject(new Error(`zstd worker: ${e.message}`))); };
+    w.unpack = (frame) => new Promise((resolve, reject) => { queue.push({ resolve, reject }); w.postMessage(frame, [frame.buffer]); });
+    return w;
+  });
+  return new ReadableStream({
+    async start(ctl) {
+      try {
+        let n = 0, last = Promise.resolve();
+        for await (const frame of zstdFrames(stream, size)) {
+          const out = workers[n++ % workers.length].unpack(frame);
+          last = last.then(() => out).then((b) => ctl.enqueue(b));
+        }
+        await last;
+        ctl.close();
+      } catch (e) {
+        ctl.error(e);
+      } finally {
+        workers.forEach((w) => w.terminate());
+      }
+    },
+  });
+}
+
+// zstdFrames yields each zstd frame of the stream once all of it is there.
+async function* zstdFrames(stream, size) {
+  let buf = new Uint8Array(size || 32 << 20), len = 0, start = 0;
+  const r = stream.getReader();
+  for (;;) {
+    const { value, done } = await r.read();
+    if (value) {
+      if (len + value.length > buf.length) {
+        const b = new Uint8Array(Math.max(2 * buf.length, len + value.length));
+        b.set(buf.subarray(0, len));
+        buf = b;
+      }
+      buf.set(value, len);
+      len += value.length;
+    }
+    for (let end; (end = frameEnd(buf.subarray(start, len))); start += end) yield buf.slice(start, start + end);
+    if (done) {
+      if (start < len) throw new Error("zstd: the download is truncated");
+      return;
+    }
+  }
+}
+
+// frameEnd returns the length of the zstd frame at the start of b, or 0 when
+// b does not hold all of it yet. See RFC 8878, section 3.1.1.
+function frameEnd(b) {
+  if (b.length < 6) return 0;
+  if (((b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24) >>> 0) !== 0xfd2fb528) throw new Error("zstd: bad frame magic");
+  const fhd = b[4], single = (fhd >> 5) & 1;
+  let p = 5 + (single ? 0 : 1) + [0, 1, 2, 4][fhd & 3] + [single, 2, 4, 8][fhd >> 6];
+  for (let last = 0; !last;) {
+    if (p + 3 > b.length) return 0;
+    const h = b[p] | b[p + 1] << 8 | b[p + 2] << 16;
+    last = h & 1;
+    p += 3 + (((h >> 1) & 3) === 1 ? 1 : h >>> 3); // an RLE block has one byte
+  }
+  p += fhd & 4 ? 4 : 0; // checksum
+  return p <= b.length ? p : 0;
+}
+
+// instantiate compiles while the bytes still arrive.
+async function instantiate(stream, imports) {
+  if (WebAssembly.instantiateStreaming) {
+    const resp = new Response(stream, { headers: { "Content-Type": "application/wasm" } });
+    return (await WebAssembly.instantiateStreaming(resp, imports)).instance;
+  }
+  const bytes = await new Response(stream).arrayBuffer();
+  return (await WebAssembly.instantiate(bytes, imports)).instance;
 }

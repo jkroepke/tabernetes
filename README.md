@@ -39,12 +39,16 @@ browser tab (single wasm binary)                     docker run kwasm-node
   system, so `kubectl get cm x -o yaml > cm.yaml` works.
   `wget` downloads through the `fetch()` of the browser, so it only works for
   servers that allow CORS, for example `raw.githubusercontent.com`.
+- `free` shows the WebAssembly memory (wasm32 ends at 4 GiB, and the linear
+  memory never shrinks), the Go heap and the number of goroutines.
 - `vi` (`k8s/kwasm/vi.go`) is a small vi for manifests. It runs in raw mode:
   while it runs, the terminal sends every key to it. `kubectl edit` opens it
   in-process, because js/Wasm cannot start an editor process.
 - `join` creates a bootstrap token and a WebRTC offer. Signaling is copy and
-  paste: the offer goes into the `docker run` command, and the answer goes
-  back into the terminal. STUN is used for NAT traversal. The node agent
+  paste: the offer goes into the `docker run` command, and `join` then asks
+  for the answer of the node (`accept <answer>` works later, too). A status
+  line under the terminal shows every node and the state of its WebRTC
+  connection. STUN is used for NAT traversal. The node agent
   also advertises `127.0.0.1` for the `-p 127.0.0.1:<port>:<port>/udp`
   mapping. That way it works on Docker Desktop, where the browser cannot
   reach container IPs.
@@ -73,7 +77,7 @@ The tasks live in `kwasm/mise.toml`. mise installs Go and Node.js.
 
 ```bash
 cd kwasm
-mise run build       # static/kwasm/{kwasm.wasm.zst,kwasm.js,xterm.css}
+mise run build       # assets/kwasm/{kwasm.wasm.zst,kwasm.js,unzstd.js,xterm.css}
 mise run node-image  # ghcr.io/jkroepke/kwasm-node:<version> for the local platform
 cd .. && hugo server # http://localhost:1313/kubernetes/
 ```
@@ -81,7 +85,14 @@ cd .. && hugo server # http://localhost:1313/kubernetes/
 The binary is around 290 MB, or 28 MB with zstd (gzip: 45 MB). GitHub Pages
 does not send `Content-Encoding` for it, and `DecompressionStream` has no
 zstd. The page fetches the `.zst` file and unpacks it with
-[fzstd](https://github.com/101arrowz/fzstd) in about 1.5 seconds.
+[fzstd](https://github.com/101arrowz/fzstd) in a Web Worker, block by block
+while it downloads. The browser compiles the WebAssembly while the bytes
+arrive, so download, unpacking and compiling overlap.
+
+Hugo fingerprints the files in `assets/kwasm/`, so the name of the binary
+changes with its content. The page keeps the binary in the Cache Storage of
+the browser and the next visit downloads nothing. GitHub Pages itself sends
+only `max-age=600`.
 
 ## Update Kubernetes
 

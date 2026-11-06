@@ -130,6 +130,10 @@ func boot() *cluster {
 		"--authorization-mode=Node,RBAC",
 		"--enable-bootstrap-token-auth=true",
 		"--allow-privileged=true",
+		// Priority and fairness protects a shared apiserver from noisy
+		// clients. The browser has one user; without it the boot is about a
+		// second faster.
+		"--enable-priority-and-fairness=false",
 		"--service-cluster-ip-range=" + serviceCIDR,
 		"--profiling=false",
 		"--v=1",
@@ -201,7 +205,7 @@ func waitReady(c *cluster, url string) {
 			}
 			err = fmt.Errorf("status %d: %s", resp.StatusCode, strings.Join(failed, ", "))
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 

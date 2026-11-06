@@ -176,6 +176,10 @@ func main() {
 
 func newPeer(tok offerToken, stun, advertise string) (*webrtc.PeerConnection, error) {
 	se := webrtc.SettingEngine{}
+	// The ICE checks start with the answer, but the browser only joins them
+	// once the "accept" line is pasted. pion gives up after 30s by default;
+	// wait as long as for the browser in main.
+	se.SetICETimeouts(10*time.Second, 10*time.Minute, 2*time.Second)
 	se.DetachDataChannels()
 	if tok.Port > 0 {
 		// One socket for host and STUN candidates on the fixed port that

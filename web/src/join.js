@@ -31,15 +31,65 @@ function gatheringComplete(pc, timeout) {
   });
 }
 
-export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302" }) {
+const STATES = {
+  new: ["waiting for accept", "#d29922"],
+  connecting: ["connecting", "#d29922"],
+  connected: ["connected", "#3fb950"],
+  disconnected: ["disconnected", "#d29922"],
+  failed: ["failed", "#f85149"],
+  closed: ["closed", "#8b949e"],
+};
+
+// joinBuiltins returns the join and accept commands. status is an element
+// that shows every node and the state of its WebRTC connection.
+export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", status }) {
   const nodes = [];
   let pending = null;
+  let seq = 0;
+
+  const render = () => {
+    if (!status) return;
+    if (!nodes.length) {
+      status.textContent = "No nodes. Type join to connect one.";
+      return;
+    }
+    status.replaceChildren(...nodes.map(({ info, pc }) => {
+      const [text, color] = STATES[pc.connectionState] || [pc.connectionState, "#8b949e"];
+      const el = document.createElement("span");
+      el.className = "kwasm-node";
+      const dot = document.createElement("span");
+      dot.textContent = "\u25CF ";
+      dot.style.color = color;
+      el.append(dot, `${info.name} ${text}`);
+      return el;
+    }));
+  };
+  render();
+
+  // finish hands the answer of the node to the pending connection.
+  const finish = async (answer, term) => {
+    let ans;
+    try { ans = await decodeToken(answer.trim().replace(/^accept\s+/, "")); } catch { ans = null; }
+    if (typeof ans?.sdp !== "string") {
+      term.writeln(`That is not the ${B("accept ...")} line of the node.`);
+      return false;
+    }
+    await pending.pc.setRemoteDescription({ type: "answer", sdp: ans.sdp });
+    term.writeln(`Connecting ${pending.info.name}... the status line below the terminal shows the connection.`);
+    pending = null;
+    render();
+    return true;
+  };
 
   return {
-    async join(args, { term }) {
+    async join(args, { term, ask, active }) {
       if (pending) {
-        term.writeln(`There is already a pending join for ${pending.info.name}. Run ${B("accept <answer>")} first.`);
-        return;
+        // The node never answered (docker run failed, accept line lost): start over.
+        term.writeln(DIM(`dropping the pending join for ${pending.info.name}`));
+        pending.pc.close();
+        nodes.splice(nodes.indexOf(pending), 1);
+        pending = null;
+        render();
       }
       const pc = new RTCPeerConnection({ iceServers: stun ? [{ urls: stun }] : [] });
       pc.createDataChannel("ctl");
@@ -53,17 +103,20 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302" }) {
       const info = await globalThis.kwasm.prepareJoin(open);
       await pc.setLocalDescription(await pc.createOffer());
       await gatheringComplete(pc, 3000);
-      const port = 50000 + nodes.length + 1;
+      if (!active()) { pc.close(); return; } // Ctrl-C while preparing
+      const port = 50000 + ++seq;
       const token = await encodeToken({
         v: 1, n: info.name, ip: info.ip, t: info.token, ca: info.ca, sdp: pc.localDescription.sdp, p: port,
       });
       pc.onconnectionstatechange = () => {
-        const s = pc.connectionState;
-        term.writeln(`\r\n${DIM(`[webrtc]`)} ${info.name}: ${s}`);
+        render();
+        // A failed connection never recovers: free it and its data channels.
+        if (pc.connectionState === "failed") pc.close();
       };
       pending = { pc, info };
       globalThis.kwasmLastJoin = { token, port, name: info.name };
       nodes.push(pending);
+      render();
 
       term.writeln(`Start a node on a machine with docker (Linux, macOS or Windows):`);
       term.writeln("");
@@ -76,21 +129,24 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302" }) {
       term.writeln(`add ${B("--advertise <LAN IP of that machine>")} before the token:`);
       term.writeln(DIM(`  docker run ... -p ${port}:${port}/udp ... ${image} --advertise 192.168.x.y <token>`));
       term.writeln("");
-      term.writeln(`It prints an ${B("accept ...")} line. Paste it here.`);
       if (navigator.clipboard?.writeText) {
         const cmd = `docker run --rm -it -p 127.0.0.1:${port}:${port}/udp --name kwasm-${info.name} ${NODE_FLAGS} ${image} ${token}`;
-        navigator.clipboard.writeText(cmd).then(() => term.writeln(DIM("(the docker command was copied to your clipboard)")), () => {});
+        await navigator.clipboard.writeText(cmd).then(() => term.writeln(DIM("(the docker command was copied to your clipboard)")), () => {});
+      }
+      term.writeln(`The node prints an ${B("accept ...")} line. Paste it here, or press Ctrl-C and run ${B("accept ...")} later.`);
+      const me = pending;
+      for (;;) {
+        let answer;
+        try { answer = await ask("accept line: "); } catch { return; }
+        if (pending !== me) return; // another join replaced this one
+        if (answer.trim() && await finish(answer, term)) return;
       }
     },
 
     async accept(args, { term }) {
       if (!pending) { term.writeln(`Nothing to accept. Run ${B("join")} first.`); return; }
       if (!args[0]) { term.writeln(`usage: accept <answer>`); return; }
-      let ans;
-      try { ans = await decodeToken(args[0]); } catch (e) { term.writeln(`invalid answer: ${e.message}`); return; }
-      await pending.pc.setRemoteDescription({ type: "answer", sdp: ans.sdp });
-      term.writeln(`Connecting ${pending.info.name}... watch it with ${B("kubectl get nodes -w")}`);
-      pending = null;
+      await finish(args[0], term);
     },
   };
 }
