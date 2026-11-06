@@ -269,6 +269,10 @@ func init() {
 	// Channels opened by the browser: apiserver -> kubelet (logs, exec, port-forward).
 	onDataChannel = func(dc *webrtc.DataChannel) {
 		label := dc.Label()
+		if label == "ctl" {
+			// The browser only opens "ctl" so the offer carries an SCTP section; nothing to do.
+			return
+		}
 		target, ok := strings.CutPrefix(label, "kubelet:")
 		if !ok {
 			log.Printf("ignoring data channel %q", label)
