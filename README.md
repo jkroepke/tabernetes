@@ -39,6 +39,9 @@ browser tab (single wasm binary)                     docker run kwasm-node
   system, so `kubectl get cm x -o yaml > cm.yaml` works.
   `wget` downloads through the `fetch()` of the browser, so it only works for
   servers that allow CORS, for example `raw.githubusercontent.com`.
+- `vi` (`k8s/kwasm/vi.go`) is a small vi for manifests. It runs in raw mode:
+  while it runs, the terminal sends every key to it. `kubectl edit` opens it
+  in-process, because js/Wasm cannot start an editor process.
 - `join` creates a bootstrap token and a WebRTC offer. Signaling is copy and
   paste: the offer goes into the `docker run` command, and the answer goes
   back into the terminal. STUN is used for NAT traversal. The node agent

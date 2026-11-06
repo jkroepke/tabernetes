@@ -68,6 +68,8 @@ export async function startTerminal(el, opts) {
   term.writeln(`Try ${"\x1b[1m"}kubectl get nodes${"\x1b[0m"}, ${"\x1b[1m"}kubectl get pods -A | grep dns${"\x1b[0m"} or ${"\x1b[1m"}help${"\x1b[0m"}.`);
 
   // ---- shell ----
+  globalThis.kwasm.resize(term.cols, term.rows);
+  term.onResize(({ cols, rows }) => globalThis.kwasm.resize(cols, rows));
   const history = [];
   let hpos = 0, line = "", cursor = 0, busy = false, pending = "";
 
@@ -91,6 +93,7 @@ export async function startTerminal(el, opts) {
         "",
         "Kubernetes",
         "  kubectl, k               kubectl against the in-browser cluster",
+        "  kubectl edit ...         opens vi: :wq applies, :q! cancels",
         "",
         "Terminal",
         "  join                     connect a real node via WebRTC (needs docker)",
@@ -173,6 +176,8 @@ export async function startTerminal(el, opts) {
   redraw();
   term.onData((data) => {
     if (!busy) return feed(data);
+    // A full screen program (vi, kubectl edit) gets every key.
+    if (globalThis.kwasm.rawMode()) return globalThis.kwasm.input(data);
     if (data === "\x03") {
       globalThis.kwasm.cancel();
       term.write("^C\r\n");

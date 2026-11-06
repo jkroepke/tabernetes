@@ -41,6 +41,7 @@ func newShell() *shell {
 			"KUBECONFIG=/root/.kube/config",
 		)...)),
 		interp.CallHandler(s.call),
+		interp.OpenHandler(openHandler),
 		interp.ExecHandlers(s.exec),
 	)
 	if err != nil {
@@ -49,6 +50,20 @@ func newShell() *shell {
 	s.runner = r
 	return s
 }
+
+// openHandler adds /dev/null, which the in-memory file system does not have.
+func openHandler(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
+	if path == "/dev/null" {
+		return devNull{}, nil
+	}
+	return interp.DefaultOpenHandler()(ctx, path, flag, perm)
+}
+
+type devNull struct{}
+
+func (devNull) Read([]byte) (int, error)    { return 0, io.EOF }
+func (devNull) Write(b []byte) (int, error) { return len(b), nil }
+func (devNull) Close() error                { return nil }
 
 // incomplete reports whether src needs more lines, for example an open quote,
 // a here-document or a loop without done.
@@ -72,7 +87,9 @@ func (s *shell) run(src string, out js.Value, builtins js.Value) int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s.cancel, s.jsBuiltins = cancel, builtins
-	interp.StdIO(strings.NewReader(""), ctxWriter{ctx, w}, ctxWriter{ctx, w})(s.runner)
+	tty.setOutput(w)
+	hw := holdWriter{tty}
+	interp.StdIO(strings.NewReader(""), ctxWriter{ctx, hw}, ctxWriter{ctx, hw})(s.runner)
 
 	err = s.runner.Run(ctx, f)
 	code := 0

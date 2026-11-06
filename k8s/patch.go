@@ -62,6 +62,10 @@ func main() {
 	} {
 		jsFromWindows(unix, windows)
 	}
+	// kubectl edit: no editor process in js. _overlay/ has a launcher that
+	// runs the editor in-process (the vi of cmd/kwasm).
+	buildTag("staging/src/k8s.io/kubectl/pkg/cmd/util/editor/launcher_others.go", "(%s) && !js")
+
 	// The plain file system helpers work in js as well.
 	buildTag("pkg/util/filesystem/util_unix.go", "%s || js")
 

@@ -10,8 +10,8 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
-	"path"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -36,7 +36,7 @@ func init() {
 		"base64": base64Cmd, "cat": cat, "cut": cut, "env": env, "grep": grep,
 		"head": head, "ls": ls, "mkdir": mkdir, "rm": rm, "seq": seq, "sleep": sleepCmd,
 		"sort": sortCmd, "tail": tail, "tee": tee, "touch": touch, "tr": tr,
-		"uniq": uniq, "wc": wc, "wget": wget, "xargs": xargs,
+		"uniq": uniq, "vi": viCmd, "vim": viCmd, "wc": wc, "wget": wget, "xargs": xargs,
 	}
 }
 
@@ -122,7 +122,9 @@ func inputs(hc interp.HandlerContext, name string, files []string, fn func(file 
 		if r == nil {
 			r = strings.NewReader("")
 		}
-		if f != "-" {
+		if f == "/dev/null" {
+			r = strings.NewReader("")
+		} else if f != "-" {
 			fh, err := os.Open(abs(hc, f))
 			if err != nil {
 				fmt.Fprintf(hc.Stderr, "%s: %s: %v\n", name, f, unwrap(err))

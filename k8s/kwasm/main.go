@@ -249,6 +249,12 @@ func main() {
 	api.Set("incomplete", js.FuncOf(func(this js.Value, a []js.Value) any { return incomplete(a[0].String()) }))
 	// commands(): {tools: string[], builtins: string[]} for the help text
 	api.Set("commands", js.FuncOf(func(js.Value, []js.Value) any { return commands() }))
+	// rawMode(): boolean, true while a full screen program (vi) wants every key
+	api.Set("rawMode", js.FuncOf(func(js.Value, []js.Value) any { return tty.raw.Load() }))
+	// input(data: string) passes keys to a raw mode program
+	api.Set("input", js.FuncOf(func(this js.Value, a []js.Value) any { tty.input(a[0].String()); return nil }))
+	// resize(cols: number, rows: number) tells programs the terminal size
+	api.Set("resize", js.FuncOf(func(this js.Value, a []js.Value) any { tty.resize(a[0].Int(), a[1].Int()); return nil }))
 	// cwd(): string, the working directory of the shell
 	api.Set("cwd", js.FuncOf(func(js.Value, []js.Value) any { return sh.dir() }))
 	api.Set("cancel", js.FuncOf(func(js.Value, []js.Value) any { cancelKubectl(); sh.stop(); return nil }))
