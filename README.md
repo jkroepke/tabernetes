@@ -126,7 +126,7 @@ with all capabilities, but only over these namespaces:
 Alternative that keeps Docker's seccomp profile: capabilities instead of a user
 namespace.
 
-```
+```text
 --cap-add SYS_ADMIN --cap-add NET_ADMIN --cap-add SYS_RESOURCE --cap-add SYS_PTRACE --security-opt apparmor=unconfined
 ```
 
