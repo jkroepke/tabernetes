@@ -1,0 +1,56 @@
+package etcdshim
+
+import (
+	"context"
+	"net"
+	"testing"
+	"time"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
+)
+
+func TestWatch(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go Serve(l)
+	c, err := clientv3.New(clientv3.Config{Endpoints: []string{l.Addr().String()}, DialTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	r, err := c.Put(ctx, "/a/x", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("put rev %d", r.Header.Revision)
+	w1 := c.Watch(ctx, "/a/", clientv3.WithPrefix(), clientv3.WithRev(r.Header.Revision+1), clientv3.WithPrevKV(), clientv3.WithProgressNotify())
+	w2 := c.Watch(ctx, "/b/", clientv3.WithPrefix(), clientv3.WithPrevKV())
+	time.Sleep(100 * time.Millisecond)
+	c.Put(ctx, "/a/y", "2")
+	c.Put(ctx, "/b/y", "2")
+	for _, w := range []clientv3.WatchChan{w1, w2} {
+		select {
+		case resp := <-w:
+			t.Logf("got %v err=%v", resp.Events, resp.Err())
+			if len(resp.Events) != 1 {
+				t.Fatalf("expected one event, got %d", len(resp.Events))
+			}
+		case <-ctx.Done():
+			t.Fatal("timeout")
+		}
+	}
+	if err := c.RequestProgress(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case resp := <-w1:
+		t.Logf("progress: %v rev=%d", resp.IsProgressNotify(), resp.Header.Revision)
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	tx, err := c.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("/a/x"), "=", r.Header.Revision)).Then(clientv3.OpPut("/a/x", "3")).Else(clientv3.OpGet("/a/x")).Commit()
+	t.Logf("txn ok=%v err=%v", tx.Succeeded, err)
+}

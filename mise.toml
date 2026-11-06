@@ -1,0 +1,89 @@
+# kwasm: a Kubernetes control plane in the browser.
+#
+#   mise run build       build the WebAssembly binary and the terminal into ../static/kwasm/
+#   mise run web         rebuild only the terminal (needs .build/wasm_exec.js)
+#   mise run test        run the etcd shim tests
+#   mise run node-image  build the node image (kwasm-node) for the local platform
+#
+# Updating Kubernetes means bumping KUBERNETES_VERSION, running `mise run build`
+# and fixing whatever k8s/patch.go complains about.
+
+[tools]
+go = "1.26"
+
+[env]
+# renovate: datasource=github-tags depName=kubernetes/kubernetes
+KUBERNETES_VERSION = "v1.37.2"
+NODE_IMAGE = "ghcr.io/jkroepke/kwasm-node"
+
+[tasks.checkout]
+description = "Clone Kubernetes at KUBERNETES_VERSION into .build/kubernetes"
+run = '''
+k8s=.build/kubernetes
+if [ ! -e "$k8s/.version-$KUBERNETES_VERSION" ]; then
+  mkdir -p .build
+  if [ -e "$k8s" ]; then mv "$k8s" ".build/kubernetes.old-$$"; fi
+  git clone --quiet --depth 1 --branch "$KUBERNETES_VERSION" https://github.com/kubernetes/kubernetes "$k8s"
+  touch "$k8s/.version-$KUBERNETES_VERSION"
+fi
+'''
+
+[tasks.patch]
+description = "Reset the Kubernetes checkout and apply k8s/patch.go"
+depends = ["checkout"]
+sources = ["k8s/patch.go", "k8s/_overlay/**/*", "k8s/kwasm/**/*"]
+outputs = [".build/kubernetes/.patched"]
+run = '''
+git -C .build/kubernetes checkout --quiet -- .
+git -C .build/kubernetes clean --quiet -fd -e ".version-$KUBERNETES_VERSION"
+go -C k8s run . "$PWD/.build/kubernetes"
+touch .build/kubernetes/.patched
+'''
+
+[tasks.wasm]
+description = "Build ../static/kwasm/kwasm.wasm.zst"
+depends = ["patch"]
+sources = [".build/kubernetes/.patched", "k8s/build.sh"]
+outputs = ["../static/kwasm/kwasm.wasm.zst", ".build/wasm_exec.js"]
+run = '''
+mkdir -p ../static/kwasm
+k8s/build.sh .build/kubernetes .build/kwasm.wasm
+# wasm_exec.js must come from the same Go version that built kwasm.wasm.
+cp "$(cd .build/kubernetes && go env GOROOT)/lib/wasm/wasm_exec.js" .build/wasm_exec.js
+# zstd -19 is about 40 % smaller than gzip -9. Node.js has zstd built in.
+node -e '
+  const fs = require("node:fs"), os = require("node:os"), zlib = require("node:zlib"), c = zlib.constants;
+  fs.writeFileSync(process.argv[2], zlib.zstdCompressSync(fs.readFileSync(process.argv[1]), { params: {
+    [c.ZSTD_c_compressionLevel]: 19, [c.ZSTD_c_checksumFlag]: 1, [c.ZSTD_c_nbWorkers]: os.availableParallelism() } }));
+' .build/kwasm.wasm ../static/kwasm/kwasm.wasm.zst
+'''
+
+[tasks.web]
+description = "Bundle the terminal into ../static/kwasm/kwasm.js"
+wait_for = ["wasm"]
+run = '''
+if [ ! -f .build/wasm_exec.js ]; then mise run wasm; fi
+mkdir -p ../static/kwasm
+out="$(cd ../static/kwasm && pwd)"
+cp .build/wasm_exec.js web/src/wasm_exec.js
+cd web
+npm ci --no-audit --no-fund
+npx esbuild src/index.js --bundle --minify --format=esm --target=es2022 \
+  --define:KWASM_NODE_IMAGE="\"$NODE_IMAGE:$KUBERNETES_VERSION\"" \
+  --outfile="$out/kwasm.js"
+cp node_modules/@xterm/xterm/css/xterm.css "$out/xterm.css"
+'''
+
+[tasks.build]
+description = "Build everything into ../static/kwasm/"
+depends = ["wasm", "web"]
+
+[tasks.test]
+description = "Run the etcd shim tests"
+depends = ["patch"]
+dir = "{{config_root}}/.build/kubernetes"
+run = "go test ./cmd/kwasm/etcdshim/"
+
+[tasks.node-image]
+description = "Build the node image for the local platform"
+run = 'docker build --build-arg KUBERNETES_VERSION="$KUBERNETES_VERSION" -t "$NODE_IMAGE:$KUBERNETES_VERSION" node'
