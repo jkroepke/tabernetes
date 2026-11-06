@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"syscall/js"
 
+	"github.com/spf13/cobra"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/rest"
@@ -102,13 +103,29 @@ func runKubectl(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		}
 	}()
 
+	// kubectl installs its warning printer as the process wide default. Here
+	// the controllers share the process, so while kubectl runs (kubectl edit
+	// waits in vi) their deprecation warnings would land in its output.
+	// kubectl gets its own printer on its clients instead, and the default
+	// stays silent.
+	warnings := rest.NewWarningWriter(errOut, rest.WarningWriterOptions{Deduplicate: true})
+	flags := genericclioptions.NewConfigFlags(true).WithDiscoveryBurst(300).WithDiscoveryQPS(50.0).WithWarningPrinter(streams).
+		WithWrapConfigFn(func(c *rest.Config) *rest.Config {
+			c.WarningHandler = warnings
+			return c
+		})
 	cmd := kubectlcmd.NewDefaultKubectlCommandWithArgs(kubectlcmd.KubectlOptions{
 		Arguments:   append([]string{"kubectl"}, args...),
-		ConfigFlags: genericclioptions.NewConfigFlags(true).WithDiscoveryBurst(300).WithDiscoveryQPS(50.0).WithWarningPrinter(streams),
+		ConfigFlags: flags,
 		IOStreams:   streams,
 	})
-	// kubectl installs its warning printer as process wide default. Reset it:
-	// deprecation warnings of the in-process controllers are only noise.
+	if pre := cmd.PersistentPreRunE; pre != nil {
+		cmd.PersistentPreRunE = func(c *cobra.Command, args []string) error {
+			err := pre(c, args)
+			rest.SetDefaultWarningHandler(rest.NoWarnings{})
+			return err
+		}
+	}
 	defer rest.SetDefaultWarningHandler(rest.NoWarnings{})
 	cmd.SilenceErrors = true
 	cmd.SetArgs(args)
