@@ -4,6 +4,9 @@
 const B = (s) => `\x1b[1m${s}\x1b[0m`;
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
 
+// Instead of --privileged. See kwasm/README.md for why each flag is needed.
+const NODE_FLAGS = "--security-opt seccomp=unconfined --security-opt systempaths=unconfined --security-opt apparmor=unconfined --device /dev/net/tun";
+
 async function deflate(str) {
   const s = new Blob([str]).stream().pipeThrough(new CompressionStream("deflate-raw"));
   return new Uint8Array(await new Response(s).arrayBuffer());
@@ -64,7 +67,8 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302" }) {
 
       term.writeln(`Start a node on a machine with docker (Linux, macOS or Windows):`);
       term.writeln("");
-      term.writeln(B(`docker run --rm -it --privileged -p 127.0.0.1:${port}:${port}/udp --name kwasm-${info.name} \\`));
+      term.writeln(B(`docker run --rm -it -p 127.0.0.1:${port}:${port}/udp --name kwasm-${info.name} \\`));
+      term.writeln(B(`  ${NODE_FLAGS} \\`));
       term.writeln(B(`  ${image} \\`));
       term.writeln(B(`  ${token}`));
       term.writeln("");
@@ -74,7 +78,7 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302" }) {
       term.writeln("");
       term.writeln(`It prints an ${B("accept ...")} line. Paste it here.`);
       if (navigator.clipboard?.writeText) {
-        const cmd = `docker run --rm -it --privileged -p 127.0.0.1:${port}:${port}/udp --name kwasm-${info.name} ${image} ${token}`;
+        const cmd = `docker run --rm -it -p 127.0.0.1:${port}:${port}/udp --name kwasm-${info.name} ${NODE_FLAGS} ${image} ${token}`;
         navigator.clipboard.writeText(cmd).then(() => term.writeln(DIM("(the docker command was copied to your clipboard)")), () => {});
       }
     },

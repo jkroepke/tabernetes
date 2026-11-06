@@ -33,10 +33,12 @@ RUN set -eux; \
 
 FROM ${BASE_IMAGE}
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates iproute2 iptables conntrack ethtool socat mount util-linux kmod \
+ && apt-get install -y --no-install-recommends ca-certificates iproute2 iptables conntrack ethtool socat mount util-linux kmod passt \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=download /out/ /
 COPY --from=agent /kwasm-node /usr/local/bin/kwasm-node
+# containerd calls runc through the agent when the node is not privileged
+RUN ln -s kwasm-node /usr/local/bin/kwasm-runc
 COPY crictl.yaml /etc/crictl.yaml
 # containerd needs a real file system for its overlayfs snapshots
 VOLUME ["/var/lib/containerd"]

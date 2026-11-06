@@ -27,6 +27,8 @@ export async function startTerminal(el, opts) {
   let crashing = false;
   installFS((fd, s) => {
     if (crashing || /^(panic:|fatal error:)/m.test(s)) { crashing = true; console.error(s); }
+    // Control plane logs: visible with the "Verbose" level in the DevTools console.
+    else console.debug(s.replace(/\n$/, ""));
     logs.push(s);
     if (logs.length > 5000) logs.splice(0, logs.length - 5000);
   });

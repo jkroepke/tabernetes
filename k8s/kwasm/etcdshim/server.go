@@ -12,6 +12,7 @@ import (
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 const (
@@ -32,7 +33,12 @@ type Server struct {
 // Serve starts the shim on the given listener.
 func Serve(l net.Listener) error {
 	srv := &Server{s: newStore(), url: "http://" + l.Addr().String()}
-	g := grpc.NewServer()
+	// The etcd client pings every 30s. gRPC allows one ping per 5 minutes by
+	// default and answers more with GOAWAY "too_many_pings". Same as etcd.
+	g := grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+		MinTime:             5 * time.Second,
+		PermitWithoutStream: true,
+	}))
 	pb.RegisterKVServer(g, srv)
 	pb.RegisterWatchServer(g, srv)
 	pb.RegisterLeaseServer(g, srv)

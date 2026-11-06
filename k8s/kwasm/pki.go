@@ -44,11 +44,12 @@ func serial() *big.Int {
 	return n
 }
 
-func newPKI() *pki {
+// newPKI creates a CA and writes it to <name>.crt and <name>.key.
+func newPKI(name, cn string) *pki {
 	key := newKey()
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial(),
-		Subject:               pkix.Name{CommonName: "kwasm-ca"},
+		Subject:               pkix.Name{CommonName: cn},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
@@ -60,8 +61,8 @@ func newPKI() *pki {
 	cert, err := x509.ParseCertificate(der)
 	must(err)
 	ca := &pki{caCert: cert, caKey: key, caPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}
-	must(os.WriteFile(p("ca.crt"), ca.caPEM, 0o644))
-	must(os.WriteFile(p("ca.key"), keyPEM(key), 0o600))
+	must(os.WriteFile(p(name+".crt"), ca.caPEM, 0o644))
+	must(os.WriteFile(p(name+".key"), keyPEM(key), 0o600))
 	return ca
 }
 

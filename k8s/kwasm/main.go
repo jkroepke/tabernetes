@@ -18,6 +18,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"k8s.io/client-go/rest"
 	logsapi "k8s.io/component-base/logs/api/v1"
 
 	"k8s.io/kubernetes/cmd/kube-apiserver/app"
@@ -61,16 +62,21 @@ type cluster struct {
 func boot() *cluster {
 	// All components share one process and therefore one klog instance.
 	logsapi.ReapplyHandling = logsapi.ReapplyHandlingIgnoreUnchanged
+	// Deprecation warnings of the in-process controllers are only noise.
+	rest.SetDefaultWarningHandler(rest.NoWarnings{})
 	must(os.MkdirAll(p("certs"), 0o755))
 	must(os.MkdirAll("/root", 0o755))
 	os.Setenv("HOME", "/root")
 
 	status("generating PKI")
-	ca := newPKI()
+	ca := newPKI("ca", "kwasm-ca")
 	ca.issue("apiserver", "kube-apiserver", nil, true,
 		[]string{"localhost", "kubernetes", "kubernetes.default", "kubernetes.default.svc", "kubernetes.default.svc.cluster.local"},
 		[]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP(advertiseIP), net.ParseIP(kubernetesIP)})
 	ca.issue("apiserver-kubelet-client", "kube-apiserver-kubelet-client", []string{"system:masters"}, false, nil, nil)
+	// Aggregated API servers and the delegated authentication of the
+	// controller-manager and scheduler expect a request header CA.
+	newPKI("front-proxy-ca", "kwasm-front-proxy-ca").issue("front-proxy-client", "front-proxy-client", nil, false, nil, nil)
 	saKey := newKey()
 	must(os.WriteFile(p("sa.key"), keyPEM(saKey), 0o600))
 	pub, err := x509.MarshalPKIXPublicKey(&saKey.PublicKey)
@@ -110,6 +116,13 @@ func boot() *cluster {
 		"--kubelet-client-certificate=" + p("apiserver-kubelet-client.crt"),
 		"--kubelet-client-key=" + p("apiserver-kubelet-client.key"),
 		"--kubelet-preferred-address-types=InternalIP,Hostname",
+		"--requestheader-client-ca-file=" + p("front-proxy-ca.crt"),
+		"--requestheader-allowed-names=front-proxy-client",
+		"--requestheader-username-headers=X-Remote-User",
+		"--requestheader-group-headers=X-Remote-Group",
+		"--requestheader-extra-headers-prefix=X-Remote-Extra-",
+		"--proxy-client-cert-file=" + p("front-proxy-client.crt"),
+		"--proxy-client-key-file=" + p("front-proxy-client.key"),
 		"--service-account-issuer=https://kubernetes.default.svc.cluster.local",
 		"--service-account-key-file=" + p("sa.pub"),
 		"--service-account-signing-key-file=" + p("sa.key"),

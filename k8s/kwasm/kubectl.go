@@ -107,9 +107,9 @@ func runKubectl(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		ConfigFlags: genericclioptions.NewConfigFlags(true).WithDiscoveryBurst(300).WithDiscoveryQPS(50.0).WithWarningPrinter(streams),
 		IOStreams:   streams,
 	})
-	// kubectl installs its warning printer as process wide default; reset it so
-	// warnings of the in-process controllers do not end up in the terminal.
-	defer rest.SetDefaultWarningHandler(rest.NewWarningWriter(os.Stderr, rest.WarningWriterOptions{}))
+	// kubectl installs its warning printer as process wide default. Reset it:
+	// deprecation warnings of the in-process controllers are only noise.
+	defer rest.SetDefaultWarningHandler(rest.NoWarnings{})
 	cmd.SilenceErrors = true
 	cmd.SetArgs(args)
 	cmd.SetIn(stdin)

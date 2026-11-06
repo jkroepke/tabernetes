@@ -8,7 +8,9 @@ import (
 	"bytes"
 	"compress/flate"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -74,6 +76,10 @@ func decode(s string, v any) error {
 }
 
 func main() {
+	if filepath.Base(os.Args[0]) == filepath.Base(runcWrapper) {
+		runRuncWrapper(os.Args[1:])
+		return
+	}
 	stun := flag.String("stun", "stun:stun.l.google.com:19302", "STUN server, empty to disable")
 	noKubelet := flag.Bool("no-kubelet", false, "only run the tunnel (for testing)")
 	advertise := flag.String("advertise", "127.0.0.1", "extra host ICE candidate addresses, comma separated (for docker -p port mappings), empty to disable")
@@ -96,6 +102,14 @@ func main() {
 	}
 	if tok.V != 1 {
 		log.Fatalf("unsupported token version %d", tok.V)
+	}
+
+	if inUserNS {
+		if err := setupUserNS(); err != nil {
+			log.Fatal(err)
+		}
+	} else if !*noKubelet && !hasCapSysAdmin() {
+		os.Exit(runInUserNS(tok.Port))
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -333,6 +347,7 @@ func writeFile(path, content string, mode os.FileMode) error {
 }
 
 func runNode(ctx context.Context, tok offerToken) error {
+	prepareUnprivileged()
 	if err := setupCgroups(); err != nil {
 		log.Printf("cgroups: %v", err)
 	}
@@ -375,16 +390,40 @@ evictionHard:
 imageGCHighThresholdPercent: 100
 localStorageCapacityIsolation: false
 failCgroupV1: false
-staticPodPath: /etc/kubernetes/manifests
 `,
+	}
+	if inUserNS {
+		files["/var/lib/kubelet/config.yaml"] += "featureGates:\n  KubeletInUserNamespace: true\n"
 	}
 	for p, c := range files {
 		if err := writeFile(p, c, 0o600); err != nil {
 			return err
 		}
 	}
-	if err := writeFile("/etc/kwasm/containerd.toml", "version = 3\n", 0o644); err != nil {
+	containerdConfig := "version = 3\n"
+	if inUserNS {
+		// No AppArmor and no lower oom_score_adj than our own in a user namespace.
+		containerdConfig += "[plugins.'io.containerd.cri.v1.runtime']\n" +
+			"  disable_apparmor = true\n" +
+			"  restrict_oom_score_adj = true\n"
+	}
+	if inUserNS || seccompFiltered() {
+		// containerd calls runc through the agent, see runc.go.
+		containerdConfig += "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]\n" +
+			"  BinaryName = '" + runcWrapper + "'\n"
+	}
+	if err := writeFile("/etc/kwasm/containerd.toml", containerdConfig, 0o644); err != nil {
 		return err
+	}
+	// The kubelet reads the system UUID from /etc/machine-id.
+	if _, err := os.Stat("/etc/machine-id"); err != nil {
+		id := make([]byte, 16)
+		if _, err := rand.Read(id); err != nil {
+			return err
+		}
+		if err := writeFile("/etc/machine-id", hex.EncodeToString(id)+"\n", 0o444); err != nil {
+			return err
+		}
 	}
 	go supervise(ctx, "containerd", "containerd", "--config=/etc/kwasm/containerd.toml")
 	waitForSocket("/run/containerd/containerd.sock", 30*time.Second)
@@ -432,7 +471,7 @@ func supervise(ctx context.Context, name, bin string, args ...string) {
 			if logFile != nil {
 				fmt.Fprintln(logFile, line)
 			}
-			if os.Getenv("KWASM_VERBOSE") != "" || strings.HasPrefix(line, "E") || strings.HasPrefix(line, "F") {
+			if os.Getenv("KWASM_VERBOSE") != "" || (strings.HasPrefix(line, "E") || strings.HasPrefix(line, "F")) && !isNoise(line) {
 				log.Printf("%s: %s", name, line)
 			}
 		}
@@ -446,6 +485,93 @@ func supervise(ctx context.Context, name, bin string, args ...string) {
 		log.Printf("%s exited (%v), restarting", name, err)
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// noise are kubelet errors that are expected in a container or during the
+// first seconds of a node. They stay in /var/log/kubelet.log.
+var noise = []string{
+	"cannot find filesystem info for device", // cadvisor cannot map the container's overlay to a disk
+	"HasDedicatedImageFs",                    // same, from the eviction manager
+	"checkpoint is not found",                // first start
+	"PLEG is not healthy: pleg has yet to be successful",
+	"not found\" node=", // node not registered yet
+	"Error getting the current node from lister",
+	"Error updating node status, will retry",
+	"Failed to get node when trying to set owner ref to the node lease",
+	"/run/flannel/subnet.env",             // pods start before flannel is ready on this node
+	"Stopped receiving OOM notifications", // /dev/kmsg is /dev/null without --privileged
+	// The kubelet sends events before its client certificate exists.
+	`User \"system:anonymous\" cannot create resource \"events\"`,
+}
+
+func isNoise(line string) bool {
+	for _, n := range noise {
+		if strings.Contains(line, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// prepareUnprivileged makes a container without --privileged usable for
+// containerd and the kubelet. Docker mounts the cgroup tree and /proc/sys
+// read-only and hides /dev/kmsg there. With --privileged it does nothing.
+func prepareUnprivileged() {
+	for _, p := range []string{"/sys/fs/cgroup", "/proc/sys"} {
+		if err := remountRW(p); err != nil {
+			log.Printf("remount %s read-write: %v", p, err)
+		}
+	}
+	// The kubelet's OOM watcher needs to open /dev/kmsg.
+	if _, err := os.Lstat("/dev/kmsg"); errors.Is(err, os.ErrNotExist) {
+		if err := os.Symlink(kmsgTarget, "/dev/kmsg"); err != nil {
+			log.Printf("/dev/kmsg: %v", err)
+		}
+	}
+}
+
+const kmsgTarget = "/dev/null"
+
+// seccompFiltered reports whether this process runs under a seccomp filter,
+// as it does in a Docker container without --privileged.
+func seccompFiltered() bool {
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return false
+	}
+	for line := range strings.Lines(string(status)) {
+		if v, ok := strings.CutPrefix(line, "Seccomp:"); ok {
+			return strings.TrimSpace(v) == "2"
+		}
+	}
+	return false
+}
+
+func readOnly(path string) (bool, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return false, err
+	}
+	const stRdonly = 0x1
+	return st.Flags&stRdonly != 0, nil
+}
+
+func remountRW(path string) error {
+	ro, err := readOnly(path)
+	if err != nil || !ro {
+		return err
+	}
+	const keep = syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC
+	// /proc/sys is a read-only bind mount, /sys/fs/cgroup a read-only mount.
+	for _, flags := range []uintptr{syscall.MS_REMOUNT | syscall.MS_BIND | keep, syscall.MS_REMOUNT | keep} {
+		if err := syscall.Mount("", path, "", flags, ""); err != nil {
+			return err
+		}
+		if ro, err = readOnly(path); err != nil || !ro {
+			return err
+		}
+	}
+	return errors.New("still read-only")
 }
 
 // setupCgroups moves all processes into a child cgroup so that the kubelet
