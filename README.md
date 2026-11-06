@@ -88,4 +88,11 @@ version.
 - `kubectl exec`, `logs` and `port-forward` go through the WebRTC tunnel to
   the kubelet. The apiserver cannot reach pod or service IPs, so service
   proxy URLs do not work.
-- Behind a symmetric NAT, WebRTC needs TURN. There is no TURN server.
+- The printed `docker run` works when Docker runs on the same machine as the
+  browser. For Docker on another machine in the LAN, publish the port on all
+  interfaces (`-p 50001:50001/udp` for the first node) and pass
+  `--advertise <LAN IP>` before the token. The browser hides its own addresses
+  behind mDNS names, and the container cannot resolve them, so the browser has
+  to reach the container.
+- Across different networks, WebRTC needs a port forward or TURN. There is no
+  TURN server.

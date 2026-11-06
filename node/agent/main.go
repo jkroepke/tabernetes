@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 	"github.com/vishvananda/netlink"
 )
@@ -75,7 +76,7 @@ func decode(s string, v any) error {
 func main() {
 	stun := flag.String("stun", "stun:stun.l.google.com:19302", "STUN server, empty to disable")
 	noKubelet := flag.Bool("no-kubelet", false, "only run the tunnel (for testing)")
-	advertise := flag.String("advertise", "127.0.0.1", "extra host ICE candidate address (for docker -p port mappings), empty to disable")
+	advertise := flag.String("advertise", "127.0.0.1", "extra host ICE candidate addresses, comma separated (for docker -p port mappings), empty to disable")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: kwasm-node [flags] join <token>\n")
 		flag.PrintDefaults()
@@ -163,13 +164,18 @@ func newPeer(tok offerToken, stun, advertise string) (*webrtc.PeerConnection, er
 	se := webrtc.SettingEngine{}
 	se.DetachDataChannels()
 	if tok.Port > 0 {
-		if err := se.SetEphemeralUDPPortRange(uint16(tok.Port), uint16(tok.Port)); err != nil {
+		// One socket for host and STUN candidates on the fixed port that
+		// `docker run -p` publishes. A port range of one port would make every
+		// further candidate (the advertised address, STUN) fail to bind.
+		conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: tok.Port})
+		if err != nil {
 			return nil, err
 		}
+		se.SetICEUDPMux(ice.NewUniversalUDPMuxDefault(ice.UniversalUDPMuxParams{UDPConn: conn}))
 	}
 	if advertise != "" {
 		if err := se.SetICEAddressRewriteRules(webrtc.ICEAddressRewriteRule{
-			External:        []string{advertise},
+			External:        strings.Split(advertise, ","),
 			AsCandidateType: webrtc.ICECandidateTypeHost,
 			Mode:            webrtc.ICEAddressRewriteAppend,
 		}); err != nil {

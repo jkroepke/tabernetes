@@ -68,6 +68,10 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302" }) {
       term.writeln(B(`  ${image} \\`));
       term.writeln(B(`  ${token}`));
       term.writeln("");
+      term.writeln(`Docker on another machine in your network? Publish the port on all interfaces and`);
+      term.writeln(`add ${B("--advertise <LAN IP of that machine>")} before the token:`);
+      term.writeln(DIM(`  docker run ... -p ${port}:${port}/udp ... ${image} --advertise 192.168.x.y <token>`));
+      term.writeln("");
       term.writeln(`It prints an ${B("accept ...")} line. Paste it here.`);
       if (navigator.clipboard?.writeText) {
         const cmd = `docker run --rm -it --privileged -p 127.0.0.1:${port}:${port}/udp --name kwasm-${info.name} ${image} ${token}`;
