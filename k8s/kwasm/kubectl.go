@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -15,20 +17,24 @@ import (
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 )
 
-type exitPanic struct{ code int }
+type exitPanic struct {
+	code int
+	msg  string
+}
 
 var errCanceled = errors.New("canceled")
 
-// jsWriter forwards writes to a JS callback until it gets canceled.
-type jsWriter struct {
-	fn       js.Value
-	canceled *atomic.Bool
+func init() {
+	// kubectl calls os.Exit on fatal errors. Turn that into a panic that
+	// runKubectl recovers in the goroutine of the invocation, so the process
+	// survives and the message ends up in the right terminal stream.
+	cmdutil.BehaviorOnFatal(func(msg string, c int) { panic(exitPanic{c, msg}) })
 }
 
+// jsWriter forwards writes to a JS callback.
+type jsWriter struct{ fn js.Value }
+
 func (w jsWriter) Write(b []byte) (int, error) {
-	if w.canceled.Load() {
-		return 0, errCanceled
-	}
 	if w.fn.Type() != js.TypeFunction {
 		return os.Stderr.Write(b)
 	}
@@ -36,18 +42,32 @@ func (w jsWriter) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-var (
-	kubectlCancel atomic.Pointer[atomic.Bool]
-)
+// ctxWriter fails all writes once ctx is done. kubectl stops at the next
+// write, which is the only way to stop a "kubectl get -w".
+type ctxWriter struct {
+	ctx context.Context
+	w   io.Writer
+}
+
+func (w ctxWriter) Write(b []byte) (int, error) {
+	if w.ctx.Err() != nil {
+		return 0, errCanceled
+	}
+	return w.w.Write(b)
+}
 
 // runKubectl runs one kubectl invocation in-process and returns its exit code.
-func runKubectl(args []string, stdin string, out js.Value) (code int) {
-	if stdin != "" {
+func runKubectl(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
+	if stdin == nil {
+		stdin = strings.NewReader("")
+	}
+	if stdinFile(args) {
 		// kubectl's resource builder reads "-f -" from os.Stdin directly,
-		// so hand the heredoc over as a file instead.
+		// so hand stdin over as a file instead.
+		b, _ := io.ReadAll(stdin)
 		f, err := os.CreateTemp("", "stdin-*.yaml")
 		if err == nil {
-			f.WriteString(stdin)
+			f.Write(b)
 			f.Close()
 			defer os.Remove(f.Name())
 			for i, a := range args {
@@ -59,31 +79,25 @@ func runKubectl(args []string, stdin string, out js.Value) (code int) {
 				}
 			}
 		}
+		stdin = strings.NewReader("")
 	}
-	canceled := &atomic.Bool{}
-	kubectlCancel.Store(canceled)
-	w := jsWriter{fn: out, canceled: canceled}
-	streams := genericiooptions.IOStreams{In: strings.NewReader(stdin), Out: w, ErrOut: w}
+	out, errOut := ctxWriter{ctx, stdout}, ctxWriter{ctx, stderr}
+	streams := genericiooptions.IOStreams{In: stdin, Out: out, ErrOut: errOut}
 
-	cmdutil.BehaviorOnFatal(func(msg string, c int) {
-		if msg != "" {
-			if !strings.HasSuffix(msg, "\n") {
-				msg += "\n"
-			}
-			fmt.Fprint(w, msg)
-		}
-		panic(exitPanic{c})
-	})
 	defer func() {
 		if r := recover(); r != nil {
 			if e, ok := r.(exitPanic); ok {
 				code = e.code
-				return
+				if e.msg != "" && !strings.HasSuffix(e.msg, "\n") {
+					e.msg += "\n"
+				}
+				fmt.Fprint(errOut, e.msg)
+			} else {
+				fmt.Fprintf(errOut, "kubectl panicked: %v\n", r)
+				code = 2
 			}
-			fmt.Fprintf(w, "kubectl panicked: %v\n", r)
-			code = 2
 		}
-		if canceled.Load() {
+		if ctx.Err() != nil {
 			code = 130
 		}
 	}()
@@ -98,10 +112,11 @@ func runKubectl(args []string, stdin string, out js.Value) (code int) {
 	defer rest.SetDefaultWarningHandler(rest.NewWarningWriter(os.Stderr, rest.WarningWriterOptions{}))
 	cmd.SilenceErrors = true
 	cmd.SetArgs(args)
-	cmd.SetOut(w)
-	cmd.SetErr(w)
+	cmd.SetIn(stdin)
+	cmd.SetOut(out)
+	cmd.SetErr(errOut)
 	if err := cmd.Execute(); err != nil {
-		if !canceled.Load() {
+		if ctx.Err() == nil {
 			cmdutil.CheckErr(err)
 		}
 		return 1
@@ -109,8 +124,28 @@ func runKubectl(args []string, stdin string, out js.Value) (code int) {
 	return 0
 }
 
+func stdinFile(args []string) bool {
+	for i, a := range args {
+		if a == "-f-" || a == "--filename=-" || (a == "-" && i > 0 && (args[i-1] == "-f" || args[i-1] == "--filename")) {
+			return true
+		}
+	}
+	return false
+}
+
+var kubectlCancel atomic.Pointer[context.CancelFunc]
+
+// runKubectlJS backs the kwasm.kubectl JS function.
+func runKubectlJS(args []string, stdin string, out js.Value) int {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	kubectlCancel.Store(&cancel)
+	w := jsWriter{out}
+	return runKubectl(ctx, args, strings.NewReader(stdin), w, w)
+}
+
 func cancelKubectl() {
 	if c := kubectlCancel.Load(); c != nil {
-		c.Store(true)
+		(*c)()
 	}
 }

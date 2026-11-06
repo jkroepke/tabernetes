@@ -30,6 +30,15 @@ browser tab (single wasm binary)                     docker run kwasm-node
   implements only what kube-apiserver uses. It persists nothing.
 - The browser has no file system. `web/src/fs.js` is an in-memory file
   system with the Node.js callback API that Go's `syscall/js` expects.
+- The terminal runs a real POSIX shell: [mvdan.cc/sh](https://github.com/mvdan/sh),
+  a shell interpreter in Go, compiled into the same binary. Pipes, variables,
+  loops, `$(...)`, redirects and here-documents work. There are no processes,
+  so every command is a function: kubectl runs in-process, a few coreutils
+  (`grep`, `head`, `wc`, `xargs`, ...) live in `k8s/kwasm/coreutils.go`, and
+  `join`, `logs` and `clear` are JavaScript. Files land in the in-memory file
+  system, so `kubectl get cm x -o yaml > cm.yaml` works.
+  `wget` downloads through the `fetch()` of the browser, so it only works for
+  servers that allow CORS, for example `raw.githubusercontent.com`.
 - `join` creates a bootstrap token and a WebRTC offer. Signaling is copy and
   paste: the offer goes into the `docker run` command, and the answer goes
   back into the terminal. STUN is used for NAT traversal. The node agent
@@ -49,6 +58,8 @@ same on macOS and Linux:
 - A sleep in the APF bootstrap ensurer. It busy-loops until the informer
   catches up, and Wasm has no preemption, so the informer never gets the CPU.
 - An idempotent `SetupSignalContext`, because all components share one process.
+- mvdan.cc/sh is vendored into the checkout at `MVDAN_SH_VERSION` from
+  `mise.toml`. Kubernetes already vendors its only dependencies.
 
 Every content patch fails when its target is gone. A Kubernetes update shows
 exactly what needs attention.

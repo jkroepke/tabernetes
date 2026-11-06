@@ -216,6 +216,13 @@ export function createFS({ cwd = "/", onOutput = () => {} } = {}) {
     ops.write(fd, b, 0, b.length, null);
     ops.close(fd);
   };
+  // process.cwd/chdir: Go's os.Chdir and os.Getwd end up here.
+  fs.cwd = () => cwd;
+  fs.chdir = (path) => {
+    const { node } = must(path);
+    if (!isDir(node)) throw fsErr("ENOTDIR", path);
+    cwd = "/" + split(path).join("/");
+  };
   fs.mkdirSync = (path) => {
     let cur = "";
     for (const part of split(path)) {
@@ -235,7 +242,7 @@ export function installFS(onOutput) {
   Object.assign(globalThis.process, {
     getuid: () => 0, getgid: () => 0, geteuid: () => 0, getegid: () => 0,
     getgroups: () => [0], pid: 1, ppid: 0, umask: () => 0o022,
-    cwd: () => "/root", chdir: () => {},
+    cwd: () => fs.cwd(), chdir: (path) => fs.chdir(path),
   });
   return fs;
 }

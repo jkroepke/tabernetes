@@ -233,9 +233,25 @@ func main() {
 		if len(a) > 2 && a[2].Type() == js.TypeString {
 			stdin = a[2].String()
 		}
-		return promise(func() (any, error) { return runKubectl(args, stdin, out), nil })
+		return promise(func() (any, error) { return runKubectlJS(args, stdin, out), nil })
 	}))
-	api.Set("cancel", js.FuncOf(func(js.Value, []js.Value) any { cancelKubectl(); return nil }))
+
+	// shell(src: string, write: (s: string) => void, builtins: {[name]: (args, {write, stdin}) => Promise}): Promise<number>
+	sh := newShell()
+	api.Set("shell", js.FuncOf(func(this js.Value, a []js.Value) any {
+		src, out, builtins := a[0].String(), a[1], js.Undefined()
+		if len(a) > 2 {
+			builtins = a[2]
+		}
+		return promise(func() (any, error) { return sh.run(src, out, builtins), nil })
+	}))
+	// incomplete(src: string): boolean, true while src needs more lines
+	api.Set("incomplete", js.FuncOf(func(this js.Value, a []js.Value) any { return incomplete(a[0].String()) }))
+	// commands(): {tools: string[], builtins: string[]} for the help text
+	api.Set("commands", js.FuncOf(func(js.Value, []js.Value) any { return commands() }))
+	// cwd(): string, the working directory of the shell
+	api.Set("cwd", js.FuncOf(func(js.Value, []js.Value) any { return sh.dir() }))
+	api.Set("cancel", js.FuncOf(func(js.Value, []js.Value) any { cancelKubectl(); sh.stop(); return nil }))
 
 	// prepareJoin(open: (label: string) => Promise<RTCDataChannel>): Promise<{name, ip, token, ca, caHash}>
 	api.Set("prepareJoin", js.FuncOf(func(this js.Value, a []js.Value) any {

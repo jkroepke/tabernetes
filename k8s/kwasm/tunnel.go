@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"syscall/js"
 	"time"
@@ -183,7 +184,7 @@ stringData:
   usage-bootstrap-signing: "true"
   auth-extra-groups: system:bootstrappers:kwasm:default-node-token
 `, id, id, secret, time.Now().Add(2*time.Hour).UTC().Format(time.RFC3339))
-	if code := runKubectl([]string{"apply", "-f", "-"}, manifest, js.Undefined()); code != 0 {
+	if code := runKubectl(context.Background(), []string{"apply", "-f", "-"}, strings.NewReader(manifest), os.Stderr, os.Stderr); code != 0 {
 		return nil, fmt.Errorf("creating bootstrap token failed (exit %d)", code)
 	}
 

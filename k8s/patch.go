@@ -7,7 +7,8 @@
 //
 //   - excludes unix-only files from js with build tags,
 //   - copies _overlay/ (js stubs and helpers) into the tree,
-//   - applies a few content patches and
+//   - applies a few content patches,
+//   - vendors mvdan.cc/sh (the terminal's shell) at MVDAN_SH_VERSION and
 //   - copies kwasm/ (the main package) to cmd/kwasm.
 //
 // Every patch fails when its target is gone. A Kubernetes update shows exactly
@@ -15,10 +16,13 @@
 package main
 
 import (
+	"bytes"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -111,11 +115,95 @@ func main() {
 		"\t\"os/signal\"\n\t\"sync\"\n",
 	)
 
+	// The shell of the terminal. Its only other dependencies, golang.org/x/sys
+	// and golang.org/x/term, are vendored by Kubernetes already.
+	vendorModule("mvdan.cc/sh/v3", os.Getenv("MVDAN_SH_VERSION"),
+		"expand", "fileutil", "internal", "interp", "pattern", "syntax")
+
 	// The kwasm main package.
 	if err := os.RemoveAll("cmd/kwasm"); err != nil {
 		fail("%v", err)
 	}
 	copyTree("kwasm", "cmd/kwasm")
+}
+
+// vendorModule adds packages of a module that Kubernetes does not use to the
+// vendor directory, the way "go mod vendor" would: go.mod, go.sum,
+// vendor/modules.txt and the sources without tests.
+func vendorModule(path, version string, pkgs ...string) {
+	if version == "" {
+		fail("vendor %s: no version set", path)
+	}
+	cmd := exec.Command("go", "mod", "download", "-json", path+"@"+version)
+	cmd.Dir = os.TempDir()
+	cmd.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=")
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	if err != nil {
+		fail("vendor %s: go mod download: %v", path, err)
+	}
+	var mod struct{ Dir, GoMod, Sum, GoModSum string }
+	if err := json.Unmarshal(out, &mod); err != nil {
+		fail("vendor %s: %v", path, err)
+	}
+	goVersion := regexp.MustCompile(`(?m)^go (\S+)`).FindStringSubmatch(read(mod.GoMod))
+	if goVersion == nil {
+		fail("vendor %s: no go directive in go.mod", path)
+	}
+
+	modules := read("vendor/modules.txt")
+	if strings.Contains(modules, "\n# "+path+" ") {
+		fail("vendor %s: Kubernetes vendors it already, drop vendorModule", path)
+	}
+	entry := fmt.Sprintf("# %s %s\n## explicit; go %s\n", path, version, goVersion[1])
+	for _, p := range pkgs {
+		entry += path + "/" + p + "\n"
+	}
+	// modules.txt is sorted by module path.
+	at := len(modules)
+	for _, m := range regexp.MustCompile(`(?m)^# (\S+) `).FindAllStringSubmatchIndex(modules, -1) {
+		if modules[m[2]:m[3]] > path {
+			at = m[0]
+			break
+		}
+	}
+	write("vendor/modules.txt", modules[:at]+entry+modules[at:])
+	gomod := read("go.mod")
+	if !strings.Contains(gomod, "\nrequire (\n") {
+		fail("go.mod: patch target not found: require block")
+	}
+	write("go.mod", strings.Replace(gomod, "\nrequire (\n", "\nrequire (\n\t"+path+" "+version+"\n", 1))
+	write("go.sum", read("go.sum")+fmt.Sprintf("%s %s %s\n%s %s/go.mod %s\n", path, version, mod.Sum, path, version, mod.GoModSum))
+
+	dst := filepath.Join("vendor", path)
+	for _, p := range pkgs {
+		entries, err := os.ReadDir(filepath.Join(mod.Dir, p))
+		if err != nil {
+			fail("vendor %s: %v", path, err)
+		}
+		must(os.MkdirAll(filepath.Join(dst, p), 0o755))
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join(mod.Dir, p, e.Name()))
+			must(err)
+			// "go mod vendor" drops files with an ignore build tag as well.
+			if bytes.Contains(b, []byte("//go:build ignore")) {
+				continue
+			}
+			must(os.WriteFile(filepath.Join(dst, p, e.Name()), b, 0o644))
+		}
+	}
+	b, err := os.ReadFile(filepath.Join(mod.Dir, "LICENSE"))
+	must(err)
+	must(os.WriteFile(filepath.Join(dst, "LICENSE"), b, 0o644))
+}
+
+func must(err error) {
+	if err != nil {
+		fail("%v", err)
+	}
 }
 
 func fail(format string, args ...any) {

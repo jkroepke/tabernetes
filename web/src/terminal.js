@@ -1,31 +1,12 @@
-// Browser terminal for kwasm: boots the control plane and runs kubectl.
+// Browser terminal for kwasm: boots the control plane and runs a shell.
+// The shell (mvdan.cc/sh) and kubectl live in the wasm binary. This file
+// only does the line editing and the builtins that need the browser.
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { decompress } from "fzstd";
 import { installFS } from "./fs.js";
 
-const PROMPT = "\x1b[1;34mkwasm\x1b[0m:\x1b[1;32m~\x1b[0m$ ";
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
-
-// Minimal POSIX-ish word splitting with single/double quotes and backslashes.
-export function splitWords(line) {
-  const out = [];
-  let cur = "", quote = null, has = false;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (quote) {
-      if (c === quote) quote = null;
-      else if (c === "\\" && quote === '"' && i + 1 < line.length) cur += line[++i];
-      else cur += c;
-    } else if (c === "'" || c === '"') { quote = c; has = true; }
-    else if (c === "\\" && i + 1 < line.length) { cur += line[++i]; has = true; }
-    else if (/\s/.test(c)) { if (cur || has) out.push(cur); cur = ""; has = false; }
-    else { cur += c; has = true; }
-  }
-  if (quote) throw new Error("unterminated quote");
-  if (cur || has) out.push(cur);
-  return out;
-}
 
 export async function startTerminal(el, opts) {
   const term = new Terminal({
@@ -84,112 +65,147 @@ export async function startTerminal(el, opts) {
   go.run(instance).then(() => term.writeln("\r\n\x1b[31mthe control plane exited\x1b[0m"));
   await globalThis.kwasm.ready;
   term.writeln("");
-  term.writeln(`Try ${"\x1b[1m"}kubectl get nodes${"\x1b[0m"}, ${"\x1b[1m"}kubectl get pods -A${"\x1b[0m"} or ${"\x1b[1m"}help${"\x1b[0m"}.`);
+  term.writeln(`Try ${"\x1b[1m"}kubectl get nodes${"\x1b[0m"}, ${"\x1b[1m"}kubectl get pods -A | grep dns${"\x1b[0m"} or ${"\x1b[1m"}help${"\x1b[0m"}.`);
 
   // ---- shell ----
   const history = [];
-  let hpos = 0, line = "", cursor = 0, busy = null, heredoc = null;
+  let hpos = 0, line = "", cursor = 0, busy = false, pending = "";
 
   const builtins = {
-    help() {
-      term.writeln("Commands:");
-      term.writeln("  kubectl ... (alias: k)   run kubectl against the in-browser cluster");
-      term.writeln("  kubectl apply -f - <<EOF heredocs work, finish with a line containing EOF");
-      term.writeln("  join                     connect a real node via WebRTC (needs docker)");
-      term.writeln("  logs                     show control plane logs");
-      term.writeln("  clear                    clear the screen");
-      term.writeln("Keys: Ctrl-C cancels a running command, Ctrl-L clears, ↑/↓ history.");
+    help(args, { write }) {
+      // Wrap a list of names to the terminal width, indented.
+      const list = (names) => {
+        const out = [];
+        let row = " ";
+        for (const n of names) {
+          if (row.length + n.length + 1 > Math.max(40, term.cols - 2)) { out.push(row); row = " "; }
+          row += " " + n;
+        }
+        return [...out, row];
+      };
+      const { tools, builtins: shell } = globalThis.kwasm.commands();
+      const terminal = Object.keys(builtins).filter((n) => n !== "help").sort();
+      write([
+        "A POSIX shell (mvdan.cc/sh) inside the wasm binary: pipes, variables, loops,",
+        "functions, $(...), redirects and here-documents work. All commands:",
+        "",
+        "Kubernetes",
+        "  kubectl, k               kubectl against the in-browser cluster",
+        "",
+        "Terminal",
+        "  join                     connect a real node via WebRTC (needs docker)",
+        "  accept <answer>          finish a join with the answer of the node",
+        "  logs [n]                 the last n lines of the control plane logs",
+        "  clear                    clear the screen",
+        ...terminal.filter((n) => !["join", "accept", "logs", "clear"].includes(n)).map((n) => `  ${n}`),
+        "",
+        "Tools (small versions, the common flags)",
+        ...list(tools),
+        "",
+        "Shell builtins (help <name> for details)",
+        ...list(shell),
+        "",
+        "Example: kubectl get pods -A -o name | grep dns | xargs kubectl describe",
+        "Keys: Ctrl-C cancels a running command, Ctrl-L clears, ↑/↓ history.",
+        "",
+      ].join("\n"));
     },
     clear() { term.clear(); },
-    logs(args) {
+    logs(args, { write }) {
       const n = Number(args[0]) || 40;
-      term.write(logs.join("").split("\n").slice(-n - 1).join("\n"));
+      write(logs.join("").split("\n").slice(-n - 1).join("\n"));
     },
     ...(opts.builtins || {}),
   };
+  // Builtins get (args, {write, stdin}) from the shell, plus the terminal.
+  const shellBuiltins = Object.fromEntries(Object.entries(builtins).map(
+    ([name, fn]) => [name, (args, ctx) => fn(args, { term, exec, write: ctx.write, stdin: ctx.stdin })]));
 
-  async function exec(input, stdin = "") {
-    let words;
-    try { words = splitWords(input); } catch (e) { term.writeln(`kwasm: ${e.message}`); return; }
-    if (!words.length) return;
-    const [cmd, ...args] = words;
-    if (cmd === "kubectl" || cmd === "k") {
-      const p = globalThis.kwasm.kubectl(args, (s) => term.write(s), stdin);
-      busy = p;
-      await Promise.race([p, new Promise((r) => (busy.cancel = r))]);
-      busy = null;
-    } else if (builtins[cmd]) {
-      busy = Promise.resolve(builtins[cmd](args, { term, stdin, exec }));
-      await busy;
-      busy = null;
-    } else {
-      term.writeln(`kwasm: ${cmd}: command not found (try "help")`);
-    }
-  }
+  // exec runs a command line in the shell and resolves to its exit status.
+  const exec = (src) => globalThis.kwasm.shell(src, (s) => term.write(s), shellBuiltins);
 
-  const redraw = () => {
-    term.write("\r\x1b[K" + (heredoc ? "> " : PROMPT) + line);
-    const back = line.length - cursor;
-    if (back > 0) term.write(`\x1b[${back}D`);
+  const prompt = () => {
+    if (pending) return "> ";
+    const dir = globalThis.kwasm.cwd().replace(/^\/root(?=\/|$)/, "~");
+    return `\x1b[1;34mkwasm\x1b[0m:\x1b[1;32m${dir}\x1b[0m$ `;
   };
+  // redraw renders prompt and line, also when the line wraps over several rows.
+  let row = 0; // row of the cursor, relative to the prompt
+  const redraw = () => {
+    const p = prompt(), plen = p.replace(/\x1b\[[0-9;]*m/g, "").length, cols = term.cols;
+    let out = (row > 0 ? `\x1b[${row}A` : "") + "\r\x1b[J" + p + line;
+    const end = plen + line.length, at = plen + cursor;
+    if (end > 0 && end % cols === 0) out += "\r\n"; // leave the pending wrap state
+    const up = Math.floor(end / cols) - Math.floor(at / cols);
+    out += (up > 0 ? `\x1b[${up}A` : "") + "\r" + (at % cols ? `\x1b[${at % cols}C` : "");
+    row = Math.floor(at / cols);
+    term.write(out);
+  };
+  const newline = (s = "") => { term.write(s + "\r\n"); row = 0; };
 
   async function submit() {
     const input = line;
+    cursor = line.length; redraw(); // the cursor goes behind the line first
     line = ""; cursor = 0;
-    term.write("\r\n");
-    if (heredoc) {
-      if (input.trim() === heredoc.marker) {
-        const { cmd, body } = heredoc;
-        heredoc = null;
-        await exec(cmd, body);
-      } else {
-        heredoc.body += input + "\n";
-        term.write("> ");
-        return;
-      }
-    } else {
-      if (input.trim()) { history.push(input); }
-      hpos = history.length;
-      const m = input.match(/^(.*?)\s*<<-?\s*['"]?(\w+)['"]?\s*$/);
-      if (m) {
-        heredoc = { cmd: m[1], marker: m[2], body: "" };
-        term.write("> ");
-        return;
-      }
-      await exec(input);
-    }
-    term.write(PROMPT);
-  }
-
-  term.write(PROMPT);
-  term.onData((data) => {
-    if (busy) {
-      if (data === "\x03") {
-        globalThis.kwasm.cancel();
-        busy.cancel?.();
-        term.write("^C\r\n");
-      }
+    newline();
+    if (!pending && input.trim()) history.push(input);
+    hpos = history.length;
+    const src = pending ? pending + "\n" + input : input;
+    // Open quotes, here-documents, loops without "done": read more lines.
+    if (globalThis.kwasm.incomplete(src)) {
+      pending = src;
+      redraw();
       return;
     }
+    pending = "";
+    if (src.trim()) {
+      busy = true;
+      try { await exec(src); } catch (e) { term.writeln(`kwasm: ${e.message}`); }
+      busy = false;
+      // Output without a final newline: start the prompt on a new line.
+      await new Promise((r) => term.write("", r));
+      if (term.buffer.active.cursorX > 0) term.write("\r\n");
+    }
+    row = 0;
+    redraw();
+  }
+
+  redraw();
+  term.onData((data) => {
+    if (!busy) return feed(data);
+    if (data === "\x03") {
+      globalThis.kwasm.cancel();
+      term.write("^C\r\n");
+    }
+  });
+  function feed(data) {
     for (let i = 0; i < data.length; i++) {
-      const c = data[i];
-      if (c === "\r") { submit(); return; }
+      let c = data[i];
+      if (c === "\r" || c === "\n") {
+        // A paste with several lines (a here-document, a script) runs line by line.
+        const rest = data.slice(i + 1).replace(/^\n/, "");
+        submit().then(() => rest && feed(rest));
+        return;
+      }
       if (c === "\x7f") { if (cursor > 0) { line = line.slice(0, cursor - 1) + line.slice(cursor); cursor--; redraw(); } continue; }
-      if (c === "\x03") { term.write("^C\r\n"); line = ""; cursor = 0; heredoc = null; redraw(); continue; }
-      if (c === "\x0c") { term.clear(); redraw(); continue; }
+      if (c === "\x03") { cursor = line.length; redraw(); newline("^C"); line = ""; cursor = 0; pending = ""; redraw(); continue; }
+      if (c === "\x0c") { term.clear(); row = 0; redraw(); continue; }
       if (c === "\x15") { line = line.slice(cursor); cursor = 0; redraw(); continue; }
+      if (c === "\x01") { cursor = 0; redraw(); continue; }
+      if (c === "\x05") { cursor = line.length; redraw(); continue; }
       if (c === "\x1b") {
         const seq = data.slice(i, i + 3);
         i += 2;
         if (seq === "\x1b[A" && hpos > 0) { line = history[--hpos]; cursor = line.length; redraw(); }
         else if (seq === "\x1b[B") { hpos = Math.min(history.length, hpos + 1); line = history[hpos] || ""; cursor = line.length; redraw(); }
-        else if (seq === "\x1b[D" && cursor > 0) { cursor--; term.write(seq); }
-        else if (seq === "\x1b[C" && cursor < line.length) { cursor++; term.write(seq); }
+        else if (seq === "\x1b[D" && cursor > 0) { cursor--; redraw(); }
+        else if (seq === "\x1b[C" && cursor < line.length) { cursor++; redraw(); }
         continue;
       }
+      if (c === "\t") c = " ";
       if (c >= " ") { line = line.slice(0, cursor) + c + line.slice(cursor); cursor++; redraw(); }
     }
-  });
+  }
   term.focus();
   return { term, exec };
 }

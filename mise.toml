@@ -15,6 +15,9 @@ go = "1.26"
 # renovate: datasource=github-tags depName=kubernetes/kubernetes
 KUBERNETES_VERSION = "v1.37.2"
 NODE_IMAGE = "ghcr.io/jkroepke/kwasm-node"
+# The shell of the terminal, vendored into the Kubernetes checkout by k8s/patch.go.
+# renovate: datasource=go depName=mvdan.cc/sh/v3
+MVDAN_SH_VERSION = "v3.14.1"
 
 [tasks.checkout]
 description = "Clone Kubernetes at KUBERNETES_VERSION into .build/kubernetes"
@@ -31,7 +34,7 @@ fi
 [tasks.patch]
 description = "Reset the Kubernetes checkout and apply k8s/patch.go"
 depends = ["checkout"]
-sources = ["k8s/patch.go", "k8s/_overlay/**/*", "k8s/kwasm/**/*"]
+sources = ["mise.toml", "k8s/patch.go", "k8s/_overlay/**/*", "k8s/kwasm/**/*"]
 outputs = [".build/kubernetes/.patched"]
 run = '''
 git -C .build/kubernetes checkout --quiet -- .

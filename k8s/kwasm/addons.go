@@ -9,8 +9,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"syscall/js"
-
 	"k8s.io/component-base/version"
 )
 
@@ -38,7 +36,7 @@ func installAddons(ctx context.Context, c *cluster) error {
 	}
 	// The controllers may still be busy creating default service accounts etc.
 	for i := 0; ; i++ {
-		code := runKubectl([]string{"apply", "--server-side", "-f", dir}, "", js.Undefined())
+		code := runKubectl(ctx, []string{"apply", "--server-side", "-f", dir}, nil, os.Stderr, os.Stderr)
 		if code == 0 {
 			return nil
 		}
