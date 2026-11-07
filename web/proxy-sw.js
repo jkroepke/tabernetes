@@ -77,7 +77,11 @@ async function ask(msg) {
     const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     tabs = all.filter((c) => !new URL(c.url).pathname.startsWith(scope));
   }
-  if (!tabs.length) throw new Error("the kwasm terminal tab is closed");
+  if (!tabs.length) {
+    // The terminal tab is gone without unregistering (crash, closed browser).
+    self.registration.unregister();
+    throw new Error("the kwasm terminal tab is closed");
+  }
   const replies = tabs.map((tab) => new Promise((resolve) => {
     const { port1, port2 } = new MessageChannel();
     port1.onmessage = (m) => {

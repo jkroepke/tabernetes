@@ -22,7 +22,13 @@ export function proxyBuiltins({ worker = "/kwasm-proxy/sw.js", scope = "/kwasm-p
     sw.startMessages();
   }
 
+  // The worker only serves the tabs of this page. When the page goes away,
+  // so does the worker. Tabs it still controls keep it until they close.
   let registration = null;
+  addEventListener("pagehide", () => {
+    registration?.unregister();
+    registration = null;
+  });
   async function activeWorker() {
     registration ||= await sw.register(worker, { scope });
     const reg = registration;
