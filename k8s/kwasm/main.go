@@ -276,6 +276,9 @@ func main() {
 	api.Set("cwd", js.FuncOf(func(js.Value, []js.Value) any { return sh.dir() }))
 	api.Set("cancel", js.FuncOf(func(js.Value, []js.Value) any { cancelKubectl(); sh.stop(); return nil }))
 
+	// proxy(port, method, path, headers, body): Promise<{status, statusText, headers, body}>, see proxy.go
+	api.Set("proxy", js.FuncOf(func(this js.Value, a []js.Value) any { return proxyJS(a) }))
+
 	// prepareJoin(open: (label: string) => Promise<RTCDataChannel>): Promise<{name, ip, token, ca, caHash}>
 	api.Set("prepareJoin", js.FuncOf(func(this js.Value, a []js.Value) any {
 		open := a[0]

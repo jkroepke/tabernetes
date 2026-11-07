@@ -39,6 +39,15 @@ browser tab (single wasm binary)                     docker run kwasm-node
   system, so `kubectl get cm x -o yaml > cm.yaml` works.
   `wget` downloads through the `fetch()` of the browser, so it only works for
   servers that allow CORS, for example `raw.githubusercontent.com`.
+  `localhost` and `127.0.0.1` stay in the in-process network of the Wasm, so
+  `k port-forward deploy/web 8080:80 &` and `wget -qO- localhost:8080` work.
+- `cmd &` runs in the background, `jobs` lists the jobs, `kill %1` stops one.
+  Ctrl-C stops the foreground command, `kubectl port-forward` and
+  `kubectl proxy` included.
+- `proxy 8080` opens `localhost:8080` of the Wasm in a new browser tab. A
+  service worker under `/kwasm-proxy/` (`static/kwasm-proxy/sw.js`) hands
+  every request of that tab to the terminal tab, which sends it to the
+  in-process network. The tab works as long as the terminal tab is open.
 - `free` shows the WebAssembly memory (wasm32 ends at 4 GiB, and the linear
   memory never shrinks), the Go heap and the number of goroutines.
 - `vi` (`k8s/kwasm/vi.go`) is a small vi for manifests. It runs in raw mode:
@@ -66,7 +75,11 @@ same on macOS and Linux:
   catches up, and Wasm has no preemption, so the informer never gets the CPU.
 - An idempotent `SetupSignalContext`, because all components share one process.
 - mvdan.cc/sh is vendored into the checkout at `MVDAN_SH_VERSION` from
-  `mise.toml`. Kubernetes already vendors its only dependencies.
+  `mise.toml`. Kubernetes already vendors its only dependencies. A hook in
+  its interpreter gives background jobs their own context, so they outlive
+  their command line.
+- `kubectl port-forward` and `kubectl proxy` stop with their command
+  context. Otherwise their listeners would stay until the tab closes.
 
 Every content patch fails when its target is gone. A Kubernetes update shows
 exactly what needs attention.

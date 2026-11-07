@@ -137,6 +137,44 @@ func main() {
 	vendorModule("mvdan.cc/sh/v3", os.Getenv("MVDAN_SH_VERSION"),
 		"expand", "fileutil", "internal", "interp", "pattern", "syntax")
 
+	// A background job ("k port-forward ... &") runs with the context of its
+	// command line, which ends with the line. The hook lets kwasm give each
+	// job its own context (kwasm/jobs.go).
+	edit("vendor/mvdan.cc/sh/v3/interp/runner.go",
+		"\t\tgo func() {\n\t\t\tr2.Run(ctx, &st2)\n",
+		"\t\tctx, done := BackgroundContext(ctx, &st2) // kwasm\n\t\tgo func() {\n\t\t\tdefer done()\n\t\t\tr2.Run(ctx, &st2)\n",
+	)
+	write("vendor/mvdan.cc/sh/v3/interp/kwasm.go", `package interp
+
+import (
+	"context"
+
+	"mvdan.cc/sh/v3/syntax"
+)
+
+// BackgroundContext returns the context of a background job and the func
+// called when the job ends. Added by kwasm (k8s/patch.go).
+var BackgroundContext = func(ctx context.Context, stmt *syntax.Stmt) (context.Context, func()) {
+	return ctx, func() {}
+}
+`)
+
+	// port-forward and proxy serve until the process ends. Here the process is
+	// the browser tab, so stop them with the command's context (Ctrl-C,
+	// kill %1). port-forward has RunPortForwardContext, the command does not
+	// use it.
+	edit("staging/src/k8s.io/kubectl/pkg/cmd/portforward/portforward.go",
+		"cmdutil.CheckErr(opts.RunPortForward())", "cmdutil.CheckErr(opts.RunPortForwardContext(cmd.Context()))",
+	)
+	edit("staging/src/k8s.io/kubectl/pkg/cmd/proxy/proxy.go",
+		"import (\n", "import (\n\t\"context\"\n",
+		"cmdutil.CheckErr(o.RunProxy())", "cmdutil.CheckErr(o.runProxyContext(cmd.Context()))",
+		"func (o ProxyOptions) RunProxy() error {\n",
+		"func (o ProxyOptions) RunProxy() error { return o.runProxyContext(context.Background()) }\n\nfunc (o ProxyOptions) runProxyContext(ctx context.Context) error {\n",
+		"\treturn server.ServeOnListener(l)\n",
+		"\tstop := context.AfterFunc(ctx, func() { l.Close() })\n\tdefer stop()\n\tif err := server.ServeOnListener(l); ctx.Err() == nil {\n\t\treturn err\n\t}\n\treturn nil\n",
+	)
+
 	// The kwasm main package.
 	if err := os.RemoveAll("cmd/kwasm"); err != nil {
 		fail("%v", err)

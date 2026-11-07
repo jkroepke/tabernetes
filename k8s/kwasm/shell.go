@@ -89,7 +89,9 @@ func (s *shell) run(src string, out js.Value, builtins js.Value) int {
 	s.cancel, s.jsBuiltins = cancel, builtins
 	tty.setOutput(w)
 	hw := holdWriter{tty}
-	interp.StdIO(strings.NewReader(""), ctxWriter{ctx, hw}, ctxWriter{ctx, hw})(s.runner)
+	// Commands get writers bound to their own context in exec: a background
+	// job writes on after this line has ended.
+	interp.StdIO(strings.NewReader(""), hw, hw)(s.runner)
 
 	err = s.runner.Run(ctx, f)
 	code := 0
@@ -106,6 +108,7 @@ func (s *shell) run(src string, out js.Value, builtins js.Value) int {
 	}
 	if s.runner.Exited() {
 		// "exit" starts a fresh shell, the cluster stays.
+		jobs.stopAll()
 		s.runner.Reset()
 	}
 	return code
@@ -117,7 +120,7 @@ func (s *shell) dir() string { return s.runner.Dir }
 // interp.IsBuiltin filters out any that a newer version drops.
 var shellBuiltins = []string{
 	"alias", "cd", "echo", "eval", "exit", "export", "false", "printf", "pwd",
-	"read", "set", "shift", "source", "test", "true", "type", "unset", "wait",
+	"jobs", "kill", "read", "set", "shift", "source", "test", "true", "type", "unset", "wait",
 }
 
 // commands lists the Go commands for the help text of the terminal.
@@ -142,10 +145,14 @@ func (s *shell) stop() {
 }
 
 // call renames the bare "help" so it reaches the terminal help instead of the
-// bash builtin. "help <builtin>" still goes to the builtin.
+// bash builtin. "help <builtin>" still goes to the builtin. jobs and kill are
+// builtins mvdan.cc/sh does not implement, kwasm does (jobs.go).
 func (s *shell) call(ctx context.Context, args []string) ([]string, error) {
-	if len(args) == 1 && args[0] == "help" {
+	switch {
+	case len(args) == 1 && args[0] == "help":
 		return []string{"kwasm-help"}, nil
+	case len(args) > 0 && (args[0] == "jobs" || args[0] == "kill"):
+		return append([]string{"kwasm-" + args[0]}, args[1:]...), nil
 	}
 	return args, nil
 }
@@ -154,8 +161,13 @@ func (s *shell) exec(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	var self interp.ExecHandlerFunc
 	self = func(ctx context.Context, args []string) error {
 		hc := interp.HandlerCtx(ctx)
+		hc.Stdout, hc.Stderr = ctxWriter{ctx, hc.Stdout}, ctxWriter{ctx, hc.Stderr}
 		name := args[0]
 		switch {
+		case name == "kwasm-jobs":
+			return jobsCmd(hc)
+		case name == "kwasm-kill":
+			return killCmd(hc, args[1:])
 		case name == "kwasm-help":
 			return s.callJS(ctx, hc, "help", args[1:])
 		case name == "kubectl" || name == "k":

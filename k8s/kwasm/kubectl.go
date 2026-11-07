@@ -132,7 +132,8 @@ func runKubectl(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	cmd.SetIn(stdin)
 	cmd.SetOut(out)
 	cmd.SetErr(errOut)
-	if err := cmd.Execute(); err != nil {
+	// port-forward, logs -f and wait stop with the context: Ctrl-C, kill %1.
+	if err := cmd.ExecuteContext(ctx); err != nil {
 		if ctx.Err() == nil {
 			cmdutil.CheckErr(err)
 		}
