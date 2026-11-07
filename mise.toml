@@ -90,10 +90,14 @@ description = "Build everything into ../assets/kwasm/"
 depends = ["wasm", "web"]
 
 [tasks.test]
-description = "Run the etcd shim tests"
+description = "Run the etcd shim tests and the shell tests (in node), vet the node agent"
 depends = ["patch"]
 dir = "{{config_root}}/.build/kubernetes"
-run = "go test ./cmd/kwasm/etcdshim/"
+run = """
+go test ./cmd/kwasm/etcdshim/
+GOOS=js GOARCH=wasm go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./cmd/kwasm/
+GOOS=linux go -C {{config_root}}/node/agent vet ./...
+"""
 
 [tasks.node-image]
 description = "Build the node image for the local platform"

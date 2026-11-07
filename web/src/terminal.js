@@ -36,6 +36,10 @@ export async function startTerminal(el, opts) {
     }
     // Control plane logs: visible with the "Verbose" level in the DevTools console.
     else console.debug(s.replace(/\n$/, ""));
+    // Expected in a single-threaded control plane: a controller found its
+    // informer a few versions behind its own write and retries. Kept in the
+    // console, left out of "logs".
+    if (s.includes("is not as new as written version")) return;
     logs.push(s);
     if (logs.length > 5000) logs.splice(0, logs.length - 5000);
   });

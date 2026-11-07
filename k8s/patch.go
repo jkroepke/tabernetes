@@ -262,7 +262,12 @@ func must(err error) {
 }
 
 func fail(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "patch: "+format+"\n", args...)
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintln(os.Stderr, "patch: "+msg)
+	if os.Getenv("GITHUB_ACTIONS") == "true" {
+		// An annotation puts the failing patch at the top of the run and the PR.
+		fmt.Printf("::error file=kwasm/k8s/patch.go,title=Kubernetes patch failed::%s\n", msg)
+	}
 	os.Exit(1)
 }
 

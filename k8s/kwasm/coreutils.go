@@ -771,50 +771,22 @@ func xargs(ctx context.Context, hc interp.HandlerContext, args []string, exec in
 // localhost stays in the wasm: kubectl port-forward 8080:80 & then
 // wget -qO- localhost:8080 reaches the pod.
 func wget(ctx context.Context, hc interp.HandlerContext, args []string, _ interp.ExecHandlerFunc) error {
-	// Options may follow the urls, as with GNU wget: wget url -O x.
-	var flags, urls []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch {
-		case a == "--":
-			urls = append(urls, args[i+1:]...)
-			i = len(args)
-		case a == "-O" || a == "--output-document":
-			flags = append(flags, a)
-			if i+1 < len(args) {
-				i++
-				flags = append(flags, args[i])
-			}
-		case strings.HasPrefix(a, "-") && a != "-":
-			flags = append(flags, a)
-		default:
-			urls = append(urls, a)
-		}
-	}
+	flags, urls := splitWgetArgs(args)
 	o, _, err := opts("wget", flags, "qvO:", map[string]string{"quiet": "q", "verbose": "v", "output-document": "O"})
 	if err != nil {
 		return fail(hc, 2, "%v", err)
 	}
-	args = urls
-	if len(args) == 0 {
+	if len(urls) == 0 {
 		return fail(hc, 2, "usage: wget [-q] [-v] [-O file] url...")
 	}
 	out, toFile := o["O"], has(o, "O")
-	if toFile && out != "-" && len(args) > 1 {
+	if toFile && out != "-" && len(urls) > 1 {
 		return fail(hc, 2, "wget: -O with several urls is not supported")
 	}
-	for _, raw := range args {
-		if !strings.Contains(raw, "://") {
-			// Without a scheme: http for localhost (kubectl port-forward), else https.
-			scheme := "https://"
-			if h, _, _ := strings.Cut(raw, "/"); h == "localhost" || strings.HasPrefix(h, "localhost:") || h == "127.0.0.1" || strings.HasPrefix(h, "127.0.0.1:") {
-				scheme = "http://"
-			}
-			raw = scheme + raw
-		}
-		u, err := url.Parse(raw)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-			return fail(hc, 1, "wget: %s: invalid url", raw)
+	for _, raw := range urls {
+		u, err := wgetURL(raw)
+		if err != nil {
+			return fail(hc, 1, "wget: %v", err)
 		}
 		name := out
 		if !toFile {
@@ -827,6 +799,46 @@ func wget(ctx context.Context, hc interp.HandlerContext, args []string, _ interp
 		}
 	}
 	return nil
+}
+
+// splitWgetArgs separates options from urls. Options may follow the urls, as
+// with GNU wget: wget url -O x.
+func splitWgetArgs(args []string) (flags, urls []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			return flags, append(urls, args[i+1:]...)
+		case a == "-O" || a == "--output-document":
+			flags = append(flags, a)
+			if i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		case strings.HasPrefix(a, "-") && a != "-":
+			flags = append(flags, a)
+		default:
+			urls = append(urls, a)
+		}
+	}
+	return flags, urls
+}
+
+// wgetURL parses a url of the command line. Without a scheme it is http for
+// localhost (kubectl port-forward) and https for everything else.
+func wgetURL(raw string) (*url.URL, error) {
+	if !strings.Contains(raw, "://") {
+		scheme := "https://"
+		if h, _, _ := strings.Cut(raw, "/"); h == "localhost" || strings.HasPrefix(h, "localhost:") || h == "127.0.0.1" || strings.HasPrefix(h, "127.0.0.1:") {
+			scheme = "http://"
+		}
+		raw = scheme + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("%s: invalid url", raw)
+	}
+	return u, nil
 }
 
 // No keep-alive: a pooled connection would keep answering for a server that
