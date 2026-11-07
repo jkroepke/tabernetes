@@ -181,6 +181,9 @@ func newPeer(tok offerToken, stun, advertise string) (*webrtc.PeerConnection, er
 	// wait as long as for the browser in main.
 	se.SetICETimeouts(10*time.Second, 10*time.Minute, 2*time.Second)
 	se.DetachDataChannels()
+	// Writes wait until SCTP has sent what is queued. Without it a fast
+	// sender (kubectl logs -f, kubectl cp) queues without limit in memory.
+	se.EnableDataChannelBlockWrite(true)
 	if tok.Port > 0 {
 		// One socket for host and STUN candidates on the fixed port that
 		// `docker run -p` publishes. A port range of one port would make every
@@ -396,6 +399,8 @@ evictionHard:
   nodefs.inodesFree: "1%"
   imagefs.available: "1%"
 imageGCHighThresholdPercent: 100
+# flannel, kube-proxy, CoreDNS and pause are pulled on every join: in parallel.
+serializeImagePulls: false
 localStorageCapacityIsolation: false
 failCgroupV1: false
 `,
@@ -434,7 +439,9 @@ failCgroupV1: false
 		}
 	}
 	go supervise(ctx, "containerd", "containerd", "--config=/etc/kwasm/containerd.toml")
-	waitForSocket("/run/containerd/containerd.sock", 30*time.Second)
+	if err := waitForSocket(ctx, "/run/containerd/containerd.sock", 30*time.Second); err != nil {
+		return fmt.Errorf("containerd did not start, see /var/log/containerd.log: %w", err)
+	}
 	go supervise(ctx, "kubelet", "kubelet",
 		"--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf",
 		"--kubeconfig=/var/lib/kubelet/kubeconfig",
@@ -446,14 +453,22 @@ failCgroupV1: false
 	return nil
 }
 
-func waitForSocket(path string, timeout time.Duration) {
+func waitForSocket(ctx context.Context, path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if c, err := net.Dial("unix", path); err == nil {
+	for {
+		c, err := net.Dial("unix", path)
+		if err == nil {
 			c.Close()
-			return
+			return nil
 		}
-		time.Sleep(200 * time.Millisecond)
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no socket at %s after %s: %w", path, timeout, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 }
 

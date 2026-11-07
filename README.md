@@ -112,6 +112,7 @@ The node container runs a kubelet, containerd and runc, but it needs neither
 
 | Flag | Why |
 | --- | --- |
+| `--memory 2g --pids-limit 4096` | the node evicts and garbage collects almost never, so the limits keep a runaway pod from taking down the host |
 | `--security-opt seccomp=unconfined` | Docker's profile allows a new user namespace only with `CAP_SYS_ADMIN` |
 | `--security-opt systempaths=unconfined` | the kernel refuses a new `sysfs` and `cgroup2` mount while Docker masks parts of `/proc` and `/sys` |
 | `--device /dev/net/tun` | pasta connects the node's network namespace through a tap device |
