@@ -44,14 +44,25 @@ func must(err error) {
 
 var status = func(string) {}
 
-func run(name string, cmd *cobra.Command, args []string) {
+// bootTimeout bounds the wait for kube-apiserver. It is ready after about
+// 7 seconds; a slow machine may take a few times that.
+const bootTimeout = 3 * time.Minute
+
+// run starts a component. The channel gets its error once it exits.
+func run(name string, cmd *cobra.Command, args []string) <-chan error {
 	cmd.SetArgs(args)
+	exited := make(chan error, 1)
 	go func() {
-		if err := cmd.Execute(); err != nil {
+		err := cmd.Execute()
+		if err == nil {
+			err = fmt.Errorf("%s exited", name)
+		} else {
 			status(name + " failed: " + err.Error())
-			fmt.Fprintln(os.Stderr, name, "exited:", err)
 		}
+		fmt.Fprintln(os.Stderr, name, "exited:", err)
+		exited <- err
 	}()
+	return exited
 }
 
 type cluster struct {
@@ -59,7 +70,7 @@ type cluster struct {
 	adminToken string
 }
 
-func boot() *cluster {
+func boot() (*cluster, error) {
 	// All components share one process and therefore one klog instance.
 	logsapi.ReapplyHandling = logsapi.ReapplyHandlingIgnoreUnchanged
 	// Deprecation warnings of the in-process controllers are only noise.
@@ -104,7 +115,7 @@ func boot() *cluster {
 	go func() { must(etcdshim.Serve(l)) }()
 
 	status("starting kube-apiserver")
-	run("kube-apiserver", app.NewAPIServerCommand(), []string{
+	apiserver := run("kube-apiserver", app.NewAPIServerCommand(), []string{
 		"--etcd-servers=http://127.0.0.1:2379",
 		"--bind-address=127.0.0.1",
 		"--advertise-address=" + advertiseIP,
@@ -138,7 +149,9 @@ func boot() *cluster {
 		"--profiling=false",
 		"--v=1",
 	})
-	waitReady(c, "https://127.0.0.1:6443/readyz")
+	if err := waitReady(c, "https://127.0.0.1:6443/readyz", apiserver); err != nil {
+		return nil, fmt.Errorf("kube-apiserver did not get ready: %w", err)
+	}
 
 	status("starting kube-controller-manager")
 	run("kube-controller-manager", cmapp.NewControllerManagerCommand(), []string{
@@ -175,18 +188,23 @@ func boot() *cluster {
 	})
 
 	status("installing addons")
-	must(installAddons(context.Background(), c))
+	if err := installAddons(context.Background(), c); err != nil {
+		return nil, fmt.Errorf("installing addons: %w", err)
+	}
 	status("ready")
-	return c
+	return c, nil
 }
 
-func waitReady(c *cluster, url string) {
+// waitReady polls url until it answers 200. It gives up when the component
+// exits or after bootTimeout, with the last failure as the error.
+func waitReady(c *cluster, url string, exited <-chan error) error {
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(c.ca.caPEM)
 	hc := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{RootCAs: pool},
 		DialContext:     (&net.Dialer{}).DialContext, // force Go networking instead of fetch()
 	}}
+	deadline := time.After(bootTimeout)
 	for {
 		req, _ := http.NewRequest(http.MethodGet, url+"?verbose", nil)
 		req.Header.Set("Authorization", "Bearer "+c.adminToken)
@@ -195,7 +213,7 @@ func waitReady(c *cluster, url string) {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return
+				return nil
 			}
 			var failed []string
 			for _, l := range strings.Split(string(body), "\n") {
@@ -205,7 +223,13 @@ func waitReady(c *cluster, url string) {
 			}
 			err = fmt.Errorf("status %d: %s", resp.StatusCode, strings.Join(failed, ", "))
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case exitErr := <-exited:
+			return exitErr
+		case <-deadline:
+			return fmt.Errorf("no answer after %v: %w", bootTimeout, err)
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
@@ -234,24 +258,11 @@ func main() {
 
 	var c *cluster
 	ready := promise(func() (any, error) {
-		c = boot()
-		return nil, nil
+		var err error
+		c, err = boot()
+		return nil, err
 	})
 	api.Set("ready", ready)
-
-	// kubectl(args: string[], write: (s: string) => void, stdin?: string): Promise<number>
-	api.Set("kubectl", js.FuncOf(func(this js.Value, a []js.Value) any {
-		args := make([]string, a[0].Length())
-		for i := range args {
-			args[i] = a[0].Index(i).String()
-		}
-		out := a[1]
-		stdin := ""
-		if len(a) > 2 && a[2].Type() == js.TypeString {
-			stdin = a[2].String()
-		}
-		return promise(func() (any, error) { return runKubectlJS(args, stdin, out), nil })
-	}))
 
 	// shell(src: string, write: (s: string) => void, builtins: {[name]: (args, {write, stdin}) => Promise}): Promise<number>
 	sh := newShell()
@@ -272,9 +283,28 @@ func main() {
 	api.Set("input", js.FuncOf(func(this js.Value, a []js.Value) any { tty.input(a[0].String()); return nil }))
 	// resize(cols: number, rows: number) tells programs the terminal size
 	api.Set("resize", js.FuncOf(func(this js.Value, a []js.Value) any { tty.resize(a[0].Int(), a[1].Int()); return nil }))
+	// complete(line: string, builtins: string[]): Promise<{word, items, noSpace}>, tab completion
+	api.Set("complete", js.FuncOf(func(this js.Value, a []js.Value) any {
+		line := a[0].String()
+		var builtins []string
+		if len(a) > 1 && a[1].Type() == js.TypeObject {
+			for i := range a[1].Length() {
+				builtins = append(builtins, a[1].Index(i).String())
+			}
+		}
+		return promise(func() (any, error) {
+			c := sh.complete(line, builtins)
+			items := make([]any, len(c.items))
+			for i, it := range c.items {
+				items[i] = it
+			}
+			return map[string]any{"word": c.word, "items": items, "noSpace": c.noSpace}, nil
+		})
+	}))
 	// cwd(): string, the working directory of the shell
 	api.Set("cwd", js.FuncOf(func(js.Value, []js.Value) any { return sh.dir() }))
-	api.Set("cancel", js.FuncOf(func(js.Value, []js.Value) any { cancelKubectl(); sh.stop(); return nil }))
+	// cancel() stops the running command line (Ctrl-C)
+	api.Set("cancel", js.FuncOf(func(js.Value, []js.Value) any { sh.stop(); return nil }))
 
 	// proxy(port, method, path, headers, body): Promise<{status, statusText, headers, body}>, see proxy.go
 	api.Set("proxy", js.FuncOf(func(this js.Value, a []js.Value) any { return proxyJS(a) }))

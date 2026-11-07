@@ -37,6 +37,8 @@ browser tab (single wasm binary)                     docker run kwasm-node
   (`grep`, `head`, `wc`, `xargs`, ...) live in `k8s/kwasm/coreutils.go`, and
   `join`, `logs` and `clear` are JavaScript. Files land in the in-memory file
   system, so `kubectl get cm x -o yaml > cm.yaml` works.
+  Tab completes commands and files, and kubectl through its own `__complete`
+  command, so resource types and names come from the cluster.
   `wget` downloads through the `fetch()` of the browser, so it only works for
   servers that allow CORS, for example `raw.githubusercontent.com`.
   `localhost` and `127.0.0.1` stay in the in-process network of the Wasm, so

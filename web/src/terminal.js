@@ -87,7 +87,13 @@ export async function startTerminal(el, opts) {
     }
   };
   go.run(instance).then(() => exited(), (e) => exited(e?.message ?? String(e)));
-  await globalThis.kwasm.ready;
+  try {
+    await globalThis.kwasm.ready;
+  } catch (e) {
+    term.writeln(`\r\n\x1b[31mthe cluster did not start: ${e.message}\x1b[0m`);
+    term.writeln(DIM("The control plane logs are in kwasmLogs in the DevTools console. Reload to try again."));
+    return { term };
+  }
   term.writeln("");
   term.writeln(`Try ${"\x1b[1m"}k version${"\x1b[0m"}, ${"\x1b[1m"}join${"\x1b[0m"} or ${"\x1b[1m"}help${"\x1b[0m"}.`);
 
@@ -134,7 +140,8 @@ export async function startTerminal(el, opts) {
         ...list(shell),
         "",
         "Example: kubectl get pods -A -o name | grep dns | xargs kubectl describe",
-        "Keys: Ctrl-C cancels a running command, Ctrl-L clears, ↑/↓ history.",
+        "Keys: Tab completes (kubectl too), Ctrl-C cancels a running command, Ctrl-L clears,",
+        "↑/↓ history, Ctrl-W/Alt-⌫ delete a word, Ctrl-K/Ctrl-U delete to the end/start.",
         "",
       ].join("\n"));
     },
@@ -239,6 +246,8 @@ export async function startTerminal(el, opts) {
   term.onData((data) => {
     // A builtin that asks for a line (join) gets the keys first.
     if (reader) return readerFeed(data);
+    // Keys typed while a completion is running wait for it.
+    if (completing) { queued += data; return; }
     if (!busy) return feed(data);
     // A full screen program (vi, kubectl edit) gets every key.
     if (globalThis.kwasm.rawMode()) return globalThis.kwasm.input(data);
@@ -248,32 +257,112 @@ export async function startTerminal(el, opts) {
       term.write("^C\r\n");
     }
   });
+  // edit applies a change to the line and redraws it.
+  const edit = (newLine, newCursor) => { line = newLine; cursor = newCursor; redraw(); };
+  const wordStart = () => { let i = cursor; while (i > 0 && line[i - 1] === " ") i--; while (i > 0 && line[i - 1] !== " ") i--; return i; };
+  const wordEnd = () => { let i = cursor; while (i < line.length && line[i] === " ") i++; while (i < line.length && line[i] !== " ") i++; return i; };
+  // Escape sequences of the keys, also the variants of other terminals and of
+  // the application cursor mode (ESC O).
+  const keys = {
+    "\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
+    "\x1b[C": "right", "\x1bOC": "right", "\x1b[D": "left", "\x1bOD": "left",
+    "\x1b[H": "home", "\x1bOH": "home", "\x1b[1~": "home", "\x1b[7~": "home",
+    "\x1b[F": "end", "\x1bOF": "end", "\x1b[4~": "end", "\x1b[8~": "end",
+    "\x1b[3~": "delete",
+    "\x1b[1;5D": "wordLeft", "\x1b[1;3D": "wordLeft", "\x1bb": "wordLeft",
+    "\x1b[1;5C": "wordRight", "\x1b[1;3C": "wordRight", "\x1bf": "wordRight",
+    "\x1b\x7f": "deleteWord", "\x1bd": "deleteWordRight",
+  };
+  const actions = {
+    up() { if (hpos > 0) { const l = history[--hpos]; edit(l, l.length); } },
+    down() { hpos = Math.min(history.length, hpos + 1); const l = history[hpos] || ""; edit(l, l.length); },
+    left() { if (cursor > 0) edit(line, cursor - 1); },
+    right() { if (cursor < line.length) edit(line, cursor + 1); },
+    home() { edit(line, 0); },
+    end() { edit(line, line.length); },
+    delete() { if (cursor < line.length) edit(line.slice(0, cursor) + line.slice(cursor + 1), cursor); },
+    wordLeft() { edit(line, wordStart()); },
+    wordRight() { edit(line, wordEnd()); },
+    deleteWord() { const i = wordStart(); edit(line.slice(0, i) + line.slice(cursor), i); },
+    deleteWordRight() { edit(line.slice(0, cursor) + line.slice(wordEnd()), cursor); },
+  };
+
+  // complete asks the shell for the candidates of the word before the cursor.
+  // One candidate replaces the word, several extend it to their common
+  // prefix, or are listed when there is nothing to extend.
+  let completing = false, queued = "";
+  async function complete() {
+    completing = true;
+    try {
+      const { word, items, noSpace } = await globalThis.kwasm.complete(line.slice(0, cursor), Object.keys(shellBuiltins));
+      if (!items.length) return term.write("\x07");
+      let insert = items[0];
+      if (items.length === 1) insert += noSpace ? "" : " ";
+      else for (const it of items) while (!it.startsWith(insert)) insert = insert.slice(0, -1);
+      if (items.length === 1 || insert.length > word.length) {
+        const start = cursor - word.length;
+        return edit(line.slice(0, start) + insert + line.slice(cursor), start + insert.length);
+      }
+      // List the candidates in columns below the line, then the line again.
+      const at = cursor;
+      edit(line, line.length);
+      const shown = items.slice(0, 200), width = Math.max(...shown.map((it) => it.length)) + 2;
+      const perRow = Math.max(1, Math.floor(term.cols / width)), rows = [];
+      for (let i = 0; i < shown.length; i += perRow) rows.push(shown.slice(i, i + perRow).map((it) => it.padEnd(width)).join("").trimEnd());
+      if (items.length > shown.length) rows.push(DIM(`... ${items.length - shown.length} more`));
+      newline();
+      term.write(rows.join("\r\n") + "\r\n");
+      cursor = at;
+      redraw();
+    } catch (e) {
+      console.debug("completion failed", e);
+    } finally {
+      completing = false;
+      const rest = queued;
+      queued = "";
+      if (rest) feed(rest);
+    }
+  }
+
   function feed(data) {
     for (let i = 0; i < data.length; i++) {
-      let c = data[i];
+      const c = data[i];
       if (c === "\r" || c === "\n") {
         // A paste with several lines (a here-document, a script) runs line by line.
         const rest = data.slice(i + 1).replace(/^\n/, "");
         submit().then(() => rest && feed(rest));
         return;
       }
-      if (c === "\x7f") { if (cursor > 0) { line = line.slice(0, cursor - 1) + line.slice(cursor); cursor--; redraw(); } continue; }
-      if (c === "\x03") { cursor = line.length; redraw(); newline("^C"); line = ""; cursor = 0; pending = ""; redraw(); continue; }
-      if (c === "\x0c") { term.clear(); row = 0; redraw(); continue; }
-      if (c === "\x15") { line = line.slice(cursor); cursor = 0; redraw(); continue; }
-      if (c === "\x01") { cursor = 0; redraw(); continue; }
-      if (c === "\x05") { cursor = line.length; redraw(); continue; }
+      if (c === "\t") {
+        queued += data.slice(i + 1);
+        complete();
+        return;
+      }
       if (c === "\x1b") {
-        const seq = data.slice(i, i + 3);
-        i += 2;
-        if (seq === "\x1b[A" && hpos > 0) { line = history[--hpos]; cursor = line.length; redraw(); }
-        else if (seq === "\x1b[B") { hpos = Math.min(history.length, hpos + 1); line = history[hpos] || ""; cursor = line.length; redraw(); }
-        else if (seq === "\x1b[D" && cursor > 0) { cursor--; redraw(); }
-        else if (seq === "\x1b[C" && cursor < line.length) { cursor++; redraw(); }
+        // CSI (ESC [ params final), SS3 (ESC O x) or Alt+key (ESC x). Unknown
+        // sequences are skipped whole, so their tail does not land in the line.
+        const seq = /^\x1b(?:\[[0-9;?]*[@-~]|O.|[^]?)/.exec(data.slice(i))[0];
+        i += seq.length - 1;
+        actions[keys[seq]]?.();
         continue;
       }
-      if (c === "\t") c = " ";
-      if (c >= " ") { line = line.slice(0, cursor) + c + line.slice(cursor); cursor++; redraw(); }
+      switch (c) {
+        case "\x7f": case "\b": if (cursor > 0) edit(line.slice(0, cursor - 1) + line.slice(cursor), cursor - 1); break;
+        case "\x03": cursor = line.length; redraw(); newline("^C"); line = ""; cursor = 0; pending = ""; redraw(); break;
+        case "\x0c": term.clear(); row = 0; redraw(); break;
+        case "\x15": edit(line.slice(cursor), 0); break; // Ctrl-U
+        case "\x0b": edit(line.slice(0, cursor), cursor); break; // Ctrl-K
+        case "\x17": actions.deleteWord(); break; // Ctrl-W
+        case "\x04": actions.delete(); break; // Ctrl-D
+        case "\x01": actions.home(); break; // Ctrl-A
+        case "\x05": actions.end(); break; // Ctrl-E
+        case "\x02": actions.left(); break; // Ctrl-B
+        case "\x06": actions.right(); break; // Ctrl-F
+        case "\x10": actions.up(); break; // Ctrl-P
+        case "\x0e": actions.down(); break; // Ctrl-N
+        default:
+          if (c >= " ") edit(line.slice(0, cursor) + c + line.slice(cursor), cursor + 1);
+      }
     }
   }
   term.focus();

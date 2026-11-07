@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"sync/atomic"
 	"syscall/js"
 
 	"github.com/spf13/cobra"
@@ -149,21 +148,4 @@ func stdinFile(args []string) bool {
 		}
 	}
 	return false
-}
-
-var kubectlCancel atomic.Pointer[context.CancelFunc]
-
-// runKubectlJS backs the kwasm.kubectl JS function.
-func runKubectlJS(args []string, stdin string, out js.Value) int {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	kubectlCancel.Store(&cancel)
-	w := jsWriter{out}
-	return runKubectl(ctx, args, strings.NewReader(stdin), w, w)
-}
-
-func cancelKubectl() {
-	if c := kubectlCancel.Load(); c != nil {
-		(*c)()
-	}
 }
