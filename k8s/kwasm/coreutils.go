@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -767,23 +768,51 @@ func xargs(ctx context.Context, hc interp.HandlerContext, args []string, exec in
 
 // wget downloads with the fetch() of the browser (net/http on js/wasm), so
 // only servers that send CORS headers work, raw.githubusercontent.com does.
+// localhost stays in the wasm: kubectl port-forward 8080:80 & then
+// wget -qO- localhost:8080 reaches the pod.
 func wget(ctx context.Context, hc interp.HandlerContext, args []string, _ interp.ExecHandlerFunc) error {
-	o, args, err := opts("wget", args, "qO:", map[string]string{"quiet": "q", "output-document": "O"})
+	// Options may follow the urls, as with GNU wget: wget url -O x.
+	var flags, urls []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			urls = append(urls, args[i+1:]...)
+			i = len(args)
+		case a == "-O" || a == "--output-document":
+			flags = append(flags, a)
+			if i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		case strings.HasPrefix(a, "-") && a != "-":
+			flags = append(flags, a)
+		default:
+			urls = append(urls, a)
+		}
+	}
+	o, _, err := opts("wget", flags, "qvO:", map[string]string{"quiet": "q", "verbose": "v", "output-document": "O"})
 	if err != nil {
 		return fail(hc, 2, "%v", err)
 	}
+	args = urls
 	if len(args) == 0 {
-		return fail(hc, 2, "usage: wget [-q] [-O file] url...")
+		return fail(hc, 2, "usage: wget [-q] [-v] [-O file] url...")
 	}
 	out, toFile := o["O"], has(o, "O")
 	if toFile && out != "-" && len(args) > 1 {
 		return fail(hc, 2, "wget: -O with several urls is not supported")
 	}
 	for _, raw := range args {
-		u, err := url.Parse(raw)
-		if err == nil && u.Scheme == "" {
-			u, err = url.Parse("https://" + raw)
+		if !strings.Contains(raw, "://") {
+			// Without a scheme: http for localhost (kubectl port-forward), else https.
+			scheme := "https://"
+			if h, _, _ := strings.Cut(raw, "/"); h == "localhost" || strings.HasPrefix(h, "localhost:") || h == "127.0.0.1" || strings.HasPrefix(h, "127.0.0.1:") {
+				scheme = "http://"
+			}
+			raw = scheme + raw
 		}
+		u, err := url.Parse(raw)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 			return fail(hc, 1, "wget: %s: invalid url", raw)
 		}
@@ -800,12 +829,34 @@ func wget(ctx context.Context, hc interp.HandlerContext, args []string, _ interp
 	return nil
 }
 
+// No keep-alive: a pooled connection would keep answering for a server that
+// has stopped since.
+var localClient = &http.Client{Transport: &http.Transport{DialContext: dialLocal, DisableKeepAlives: true}}
+
+// dialLocal dials in the in-process network of the wasm. It has no resolver,
+// so localhost becomes 127.0.0.1.
+func dialLocal(ctx context.Context, network, addr string) (net.Conn, error) {
+	if host, port, err := net.SplitHostPort(addr); err == nil && host == "localhost" {
+		addr = net.JoinHostPort("127.0.0.1", port)
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, addr)
+}
+
 func download(ctx context.Context, hc interp.HandlerContext, u, name string, quiet bool) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return fail(hc, 1, "wget: %v", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := http.DefaultClient
+	if h := req.URL.Hostname(); h == "localhost" || h == "127.0.0.1" || h == "::1" {
+		// localhost is the in-process network of the wasm, where kubectl
+		// port-forward listens. A Transport with a dialer skips fetch().
+		client = localClient
+	}
+	resp, err := client.Do(req)
+	if err != nil && client == localClient {
+		return fail(hc, 4, "wget: %s: %v", u, err)
+	}
 	if err != nil {
 		// fetch() reports a CORS block as a plain network error.
 		return fail(hc, 4, "wget: %s: %v (the server must allow CORS requests)", u, err)

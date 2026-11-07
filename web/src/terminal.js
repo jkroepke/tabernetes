@@ -190,7 +190,7 @@ export async function startTerminal(el, opts) {
   const prompt = () => {
     if (pending) return "> ";
     const dir = globalThis.kwasm.cwd().replace(/^\/root(?=\/|$)/, "~");
-    return `\x1b[1;34mkwasm\x1b[0m:\x1b[1;32m${dir}\x1b[0m$ `;
+    return `\x1b[1;34mjkroepke.de\x1b[0m:\x1b[1;32m${dir}\x1b[0m$ `;
   };
   // redraw renders prompt and line, also when the line wraps over several rows.
   let row = 0; // row of the cursor, relative to the prompt
