@@ -78,7 +78,7 @@ cp .build/wasm_exec.js web/src/wasm_exec.js
 cd web
 npm ci --no-audit --no-fund
 npx esbuild src/index.js --bundle --minify --format=esm --target=es2022 \
-  --define:KWASM_NODE_IMAGE="\"$NODE_IMAGE:$KUBERNETES_VERSION\"" \
+  --define:KWASM_NODE_IMAGE="\"$NODE_IMAGE:latest\"" \
   --outfile="$out/kwasm.js"
 # The zstd decoder runs in a worker, so that the page does not freeze.
 npx esbuild src/unzstd.js --bundle --minify --format=iife --target=es2022 --outfile="$out/unzstd.js"
@@ -97,4 +97,4 @@ run = "go test ./cmd/kwasm/etcdshim/"
 
 [tasks.node-image]
 description = "Build the node image for the local platform"
-run = 'docker build --build-arg KUBERNETES_VERSION="$KUBERNETES_VERSION" -t "$NODE_IMAGE:$KUBERNETES_VERSION" node'
+run = 'docker build --build-arg KUBERNETES_VERSION="$KUBERNETES_VERSION" -t "$NODE_IMAGE:latest" node'

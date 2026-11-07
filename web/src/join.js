@@ -5,7 +5,7 @@ const B = (s) => `\x1b[1m${s}\x1b[0m`;
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
 
 // Instead of --privileged. See kwasm/README.md for why each flag is needed.
-const NODE_FLAGS = "--memory 2g --pids-limit 4096 --security-opt seccomp=unconfined --security-opt systempaths=unconfined --security-opt apparmor=unconfined --device /dev/net/tun";
+const NODE_FLAGS = "--pull always --memory 2g --pids-limit 4096 --security-opt seccomp=unconfined --security-opt systempaths=unconfined --security-opt apparmor=unconfined --device /dev/net/tun";
 
 async function deflate(str) {
   const s = new Blob([str]).stream().pipeThrough(new CompressionStream("deflate-raw"));
