@@ -127,6 +127,7 @@ export async function startTerminal(el, opts) {
   term.onResize(({ cols, rows }) => globalThis.kwasm.resize(cols, rows));
   const history = [];
   let hpos = 0, line = "", cursor = 0, busy = false, pending = "";
+  let search = null; // { query, at, failed, saved: [line, cursor] }
 
   const builtins = {
     help(args, { write }) {
@@ -155,8 +156,9 @@ export async function startTerminal(el, opts) {
         "  accept <answer>          finish a join later (join asks for it)",
         "  proxy <port>             open localhost:<port> (kubectl port-forward) in a new tab",
         "  logs [n]                 the last n lines of the control plane logs",
+        "  history [n] | -c         the commands of this tab (Ctrl-R searches them)",
         "  clear                    clear the screen",
-        ...terminal.filter((n) => !["join", "accept", "proxy", "logs", "clear"].includes(n)).map((n) => `  ${n}`),
+        ...terminal.filter((n) => !["join", "accept", "proxy", "logs", "history", "clear"].includes(n)).map((n) => `  ${n}`),
         "",
         "Tools (small versions, the common flags)",
         ...list(tools),
@@ -166,11 +168,19 @@ export async function startTerminal(el, opts) {
         "",
         "Example: kubectl get pods -A -o name | grep dns | xargs kubectl describe",
         "Keys: Tab completes (kubectl too), Ctrl-C cancels a running command, Ctrl-L clears,",
-        "↑/↓ history, Ctrl-W/Alt-⌫ delete a word, Ctrl-K/Ctrl-U delete to the end/start.",
+        "↑/↓ history, Ctrl-R searches it, Ctrl-W/Alt-⌫ delete a word, Ctrl-K/Ctrl-U delete to the end/start.",
         "",
       ].join("\n"));
     },
     clear() { term.clear(); },
+    // history lists the command lines of this tab like bash, history n the
+    // last n, history -c forgets them.
+    history(args, { write }) {
+      if (args[0] === "-c") { history.length = 0; hpos = 0; return; }
+      const n = Number(args[0]) || history.length;
+      const from = Math.max(0, history.length - n);
+      write(history.slice(from).map((l, i) => `${String(from + i + 1).padStart(5)}  ${l}`).join("\n"));
+    },
     logs(args, { write }) {
       const n = Number(args[0]) || 40;
       write(logs.join("").split("\n").slice(-n - 1).join("\n"));
@@ -221,6 +231,7 @@ export async function startTerminal(el, opts) {
   const exec = (src) => globalThis.kwasm.shell(src, (s) => term.write(s), shellBuiltins);
 
   const prompt = () => {
+    if (search) return `(${search.failed ? "failed " : ""}reverse-i-search)\`${search.query}': `;
     if (pending) return "> ";
     const dir = globalThis.kwasm.cwd().replace(/^\/root(?=\/|$)/, "~");
     return `\x1b[1;34mjkroepke.de\x1b[0m:\x1b[1;32m${dir}\x1b[0m$ `;
@@ -312,6 +323,42 @@ export async function startTerminal(el, opts) {
     deleteWordRight() { edit(line.slice(0, cursor) + line.slice(wordEnd()), cursor); },
   };
 
+  // Ctrl-R searches the history backwards like bash. Typing narrows the
+  // search, Ctrl-R again finds an older match, Ctrl-G gives the line back.
+  // Any other key takes the match and does its usual job: Enter runs it, the
+  // arrows edit it.
+  const searchFrom = (from) => {
+    for (let i = from; i >= 0; i--) {
+      const at = history[i].indexOf(search.query);
+      if (at >= 0) { Object.assign(search, { at: i, failed: false }); line = history[i]; cursor = at; return; }
+    }
+    search.failed = true;
+  };
+  // searchKey handles a key during the search and returns false when the key
+  // ends the search and still needs its usual handling.
+  function searchKey(key) {
+    if (key === "\x12") { // Ctrl-R
+      if (search.query && !search.failed) searchFrom(search.at - 1);
+    } else if (key === "\x7f" || key === "\b") {
+      search.query = search.query.slice(0, -1);
+      if (search.query) searchFrom(history.length - 1);
+      else { [line, cursor] = search.saved; search.failed = false; search.at = history.length; }
+    } else if (key === "\x07") { // Ctrl-G
+      [line, cursor] = search.saved;
+      search = null;
+    } else if (key.length === 1 && key >= " ") {
+      search.query += key;
+      searchFrom(Math.min(search.at, history.length - 1));
+    } else {
+      if (!search.failed && search.at < history.length) hpos = search.at;
+      search = null;
+      redraw();
+      return false;
+    }
+    redraw();
+    return true;
+  }
+
   // complete asks the shell for the candidates of the word before the cursor.
   // One candidate replaces the word, several extend it to their common
   // prefix, or are listed when there is nothing to extend.
@@ -352,6 +399,10 @@ export async function startTerminal(el, opts) {
   function feed(data) {
     for (let i = 0; i < data.length; i++) {
       const c = data[i];
+      if (search) {
+        const key = c === "\x1b" ? escape(data.slice(i)) : c;
+        if (searchKey(key)) { i += key.length - 1; continue; }
+      }
       if (c === "\r" || c === "\n") {
         // A paste with several lines (a here-document, a script) runs line by line.
         const rest = data.slice(i + 1).replace(/^\n/, "");
@@ -366,7 +417,7 @@ export async function startTerminal(el, opts) {
       if (c === "\x1b") {
         // CSI (ESC [ params final), SS3 (ESC O x) or Alt+key (ESC x). Unknown
         // sequences are skipped whole, so their tail does not land in the line.
-        const seq = /^\x1b(?:\[[0-9;?]*[@-~]|O.|[^]?)/.exec(data.slice(i))[0];
+        const seq = escape(data.slice(i));
         i += seq.length - 1;
         actions[keys[seq]]?.();
         continue;
@@ -385,6 +436,7 @@ export async function startTerminal(el, opts) {
         case "\x06": actions.right(); break; // Ctrl-F
         case "\x10": actions.up(); break; // Ctrl-P
         case "\x0e": actions.down(); break; // Ctrl-N
+        case "\x12": search = { query: "", at: history.length, failed: false, saved: [line, cursor] }; redraw(); break; // Ctrl-R
         default:
           if (c >= " ") edit(line.slice(0, cursor) + c + line.slice(cursor), cursor + 1);
       }
@@ -393,6 +445,10 @@ export async function startTerminal(el, opts) {
   term.focus();
   return { term, exec };
 }
+
+// escape returns the escape sequence at the start of s: CSI (ESC [ params
+// final), SS3 (ESC O x) or Alt+key (ESC x).
+const escape = (s) => /^\x1b(?:\[[0-9;?]*[@-~]|O.|[^]?)/.exec(s)[0];
 
 // download fetches the binary, from the Cache Storage when it is there. The
 // file name has a hash of the content (Hugo fingerprint), so a cached copy is

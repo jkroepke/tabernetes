@@ -146,12 +146,13 @@ func (s *shell) stop() {
 
 // call renames the bare "help" so it reaches the terminal help instead of the
 // bash builtin. "help <builtin>" still goes to the builtin. jobs and kill are
-// builtins mvdan.cc/sh does not implement, kwasm does (jobs.go).
+// builtins mvdan.cc/sh does not implement, kwasm does (jobs.go). history is
+// one, too: the terminal keeps the command lines.
 func (s *shell) call(ctx context.Context, args []string) ([]string, error) {
 	switch {
 	case len(args) == 1 && args[0] == "help":
 		return []string{"kwasm-help"}, nil
-	case len(args) > 0 && (args[0] == "jobs" || args[0] == "kill"):
+	case len(args) > 0 && (args[0] == "jobs" || args[0] == "kill" || args[0] == "history"):
 		return append([]string{"kwasm-" + args[0]}, args[1:]...), nil
 	}
 	return args, nil
@@ -170,6 +171,8 @@ func (s *shell) exec(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 			return killCmd(hc, args[1:])
 		case name == "kwasm-help":
 			return s.callJS(ctx, hc, "help", args[1:])
+		case name == "kwasm-history":
+			return s.callJS(ctx, hc, "history", args[1:])
 		case name == "kubectl" || name == "k":
 			return s.kubectl(ctx, hc, args[1:])
 		case interp.IsBuiltin(name):

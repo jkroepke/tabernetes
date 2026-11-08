@@ -43,6 +43,8 @@ browser tab (single wasm binary)                     docker run kwasm-node
   servers that allow CORS, for example `raw.githubusercontent.com`.
   `localhost` and `127.0.0.1` stay in the in-process network of the Wasm, so
   `k port-forward deploy/web 8080:80 &` and `wget -qO- localhost:8080` work.
+- `history` lists the command lines of the tab, and Ctrl-R searches them
+  backwards like Bash. The history ends with the tab.
 - `cmd &` runs in the background, `jobs` lists the jobs, `kill %1` stops one.
   Ctrl-C stops the foreground command, `kubectl port-forward` and
   `kubectl proxy` included. On Windows and Linux, Ctrl-C copies instead while
