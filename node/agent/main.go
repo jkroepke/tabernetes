@@ -413,7 +413,13 @@ failCgroupV1: false
 			return err
 		}
 	}
-	containerdConfig := "version = 3\n"
+	// Now and then a registry download stops in the middle and never sends
+	// another byte (seen behind pasta on WSL2). containerd cancels a pull
+	// without progress, and the next try opens new connections and works.
+	// Do that after one minute instead of the default five.
+	containerdConfig := "version = 3\n" +
+		"[plugins.'io.containerd.cri.v1.images']\n" +
+		"  image_pull_progress_timeout = '1m'\n"
 	if inUserNS {
 		// No AppArmor and no lower oom_score_adj than our own in a user namespace.
 		containerdConfig += "[plugins.'io.containerd.cri.v1.runtime']\n" +
