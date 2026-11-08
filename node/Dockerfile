@@ -1,6 +1,7 @@
 # Tabernetes: a Kubernetes node that joins a control plane running in a browser.
 ARG GO_IMAGE=mirror.gcr.io/library/golang:1.27-trixie
 ARG BASE_IMAGE=mirror.gcr.io/library/debian:trixie-slim
+ARG KUBERNETES_VERSION=v1.37.2
 
 FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS agent
 ARG TARGETOS TARGETARCH
@@ -13,7 +14,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags=
 FROM ${BASE_IMAGE} AS download
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
-ARG KUBERNETES_VERSION=v1.37.2
+ARG KUBERNETES_VERSION
 ARG CONTAINERD_VERSION=2.4.2
 ARG RUNC_VERSION=v1.5.2
 ARG CNI_PLUGINS_VERSION=v1.9.1
@@ -49,7 +50,10 @@ RUN set -eux; \
     rm -f /tmp/*.tar.gz /tmp/*.tgz; \
     # crictl and the CNI plugins ship with symbols: about 12 MB less compressed
     strip usr/local/bin/crictl opt/cni/bin/*; \
-    chmod +x usr/local/bin/*
+    chmod +x usr/local/bin/*; \
+    # the pause image of this containerd, for the images stage
+    usr/local/bin/containerd config default | sed -n "s/^ *sandbox = [\"']\(.*\)[\"']\$/\1/p" > /pause-image; \
+    grep . /pause-image
 
 # pasta from upstream: Debian trixie stays on a snapshot from May 2025. A fixed
 # commit, so the hash checks what git fetches.
@@ -67,6 +71,27 @@ RUN set -eux; \
     for f in passt passt.avx2 pasta pasta.avx2; do if [ -e "$f" ]; then cp -d "$f" /out/usr/local/bin/; fi; done; \
     /out/usr/local/bin/pasta --version
 
+# pause, kube-proxy, flannel and CoreDNS: every join needs them, and their
+# downloads sometimes stall on Docker Desktop. The agent serves them to
+# containerd from this OCI image layout (agent/imagemirror.go). The images come
+# from the addon manifests of the control plane, so they always match:
+#   docker build --build-context addons=k8s/tabernetes/addons node
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS images
+ARG TARGETARCH
+ARG KUBERNETES_VERSION
+ARG CRANE_VERSION=v0.22.1
+RUN CGO_ENABLED=0 go install "github.com/google/go-containerregistry/cmd/crane@${CRANE_VERSION}"
+COPY --from=addons *.yaml /addons/
+COPY --from=download /pause-image /pause-image
+# One crane call per image in a fixed order, so index.json is the same on every build.
+RUN set -eux; \
+    sed -n 's/^ *image: *//p' /addons/*.yaml | sed "s/KUBERNETES_VERSION/${KUBERNETES_VERSION}/" | cat /pause-image - | sort -u > /images; \
+    out=/out/usr/share/tabernetes/images; \
+    while read -r image; do \
+      crane pull --platform "linux/${TARGETARCH}" --format oci --annotate-ref "${image}" "${out}"; \
+    done < /images; \
+    cat "${out}/index.json"
+
 FROM ${BASE_IMAGE}
 # only while building, not in the image
 ARG DEBIAN_FRONTEND=noninteractive
@@ -75,6 +100,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=download /out/ /
 COPY --from=passt /out/ /
+COPY --from=images /out/ /
 COPY --from=agent /tabernetes /usr/local/bin/tabernetes
 # containerd calls runc through the agent when the node is not privileged
 RUN ln -s tabernetes /usr/local/bin/tabernetes-runc

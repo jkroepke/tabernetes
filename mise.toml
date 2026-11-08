@@ -101,4 +101,4 @@ GOOS=linux go -C {{config_root}}/node/agent vet ./...
 
 [tasks.node-image]
 description = "Build the node image for the local platform"
-run = 'docker build --build-arg KUBERNETES_VERSION="$KUBERNETES_VERSION" -t "$NODE_IMAGE:latest" node'
+run = 'docker build --build-arg KUBERNETES_VERSION="$KUBERNETES_VERSION" --build-context addons=k8s/tabernetes/addons -t "$NODE_IMAGE:latest" node'

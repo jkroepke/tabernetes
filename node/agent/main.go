@@ -429,6 +429,10 @@ failCgroupV1: false
 		"[plugins.'io.containerd.cri.v1.images']\n" +
 		"  image_pull_progress_timeout = '20s'\n" +
 		"  use_local_image_pull = true\n"
+	if startImageMirror() {
+		containerdConfig += "[plugins.'io.containerd.cri.v1.images'.registry]\n" +
+			"  config_path = '" + registryConfigDir + "'\n"
+	}
 	if inUserNS {
 		// No AppArmor and no lower oom_score_adj than our own in a user namespace.
 		containerdConfig += "[plugins.'io.containerd.cri.v1.runtime']\n" +

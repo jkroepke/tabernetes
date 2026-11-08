@@ -127,6 +127,15 @@ The node image is built by `.github/workflows/tabernetes-image.yaml` with the sa
 version and pushed as `latest` only. The printed `docker run` uses
 `--pull always`, so a join always runs the current image.
 
+The node image also brings the images that every join needs: pause,
+kube-proxy, flannel and CoreDNS. The `images` stage of `node/Dockerfile` takes
+the list from the addon manifests in `k8s/tabernetes/addons/` and the pause
+image from containerd, so an update needs no extra step. The agent serves them
+to containerd from a read-only registry on 127.0.0.1
+(`node/agent/imagemirror.go`); every other image comes from its registry as
+before. Downloads from the registries stalled now and then on Docker Desktop,
+and the join waited for the retries.
+
 ## Node without --privileged
 
 The node container runs a kubelet, containerd and runc, but it needs neither
