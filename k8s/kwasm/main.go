@@ -12,6 +12,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall/js"
 	"time"
@@ -250,6 +252,14 @@ func promise(fn func() (any, error)) js.Value {
 }
 
 func main() {
+	// The allocation profiler takes a stack trace now and then. When that
+	// happens in runtime.beforeIdle, the js/wasm runtime cannot unwind the
+	// stack and dies with "invalid runtime symbol table". Nobody profiles
+	// the browser tab, so turn it off.
+	runtime.MemProfileRate = 0
+	// wasm32 ends at 4 GiB. With GOGC=100 the heap may grow to twice the live
+	// heap first; the limit makes the GC work harder before it gets there.
+	debug.SetMemoryLimit(3 << 30)
 	api := js.Global().Get("Object").New()
 	js.Global().Set("kwasm", api)
 	if cb := js.Global().Get("kwasmStatus"); cb.Type() == js.TypeFunction {
