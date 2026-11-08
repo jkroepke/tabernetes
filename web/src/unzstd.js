@@ -1,4 +1,4 @@
-// Web Worker: unpacks one zstd frame of kwasm.wasm.zst per message. The page
+// Web Worker: unpacks one zstd frame of tabernetes.wasm.zst per message. The page
 // runs a few of these, so the frames unpack in parallel and off the main
 // thread while the rest of the binary still downloads.
 import { decompress } from "fzstd";

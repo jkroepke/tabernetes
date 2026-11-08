@@ -1,6 +1,6 @@
 package main
 
-// containerd calls runc through the agent (as kwasm-runc) when the node runs
+// containerd calls runc through the agent (as tabernetes-runc) when the node runs
 // without --privileged. The wrapper adapts the call and executes the real runc.
 
 import (
@@ -14,7 +14,7 @@ import (
 	"syscall"
 )
 
-const runcWrapper = "/usr/local/bin/kwasm-runc"
+const runcWrapper = "/usr/local/bin/tabernetes-runc"
 
 func runRuncWrapper(args []string) {
 	out := make([]string, 0, len(args)+2)
@@ -33,7 +33,7 @@ func runRuncWrapper(args []string) {
 			// Docker mounts the container's /sys read-only, so in a user
 			// namespace the kernel allows only read-only sysfs mounts.
 			if err := readOnlySysfs(bundleDir(args[i+1:])); err != nil {
-				log.Printf("kwasm-runc: %v", err)
+				log.Printf("tabernetes-runc: %v", err)
 			}
 		}
 	}

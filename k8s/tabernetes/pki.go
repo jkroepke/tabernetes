@@ -109,16 +109,16 @@ func writeKubeconfig(name, token string) {
 	cfg := fmt.Sprintf(`apiVersion: v1
 kind: Config
 clusters:
-- name: kwasm
+- name: tabernetes
   cluster:
     server: https://127.0.0.1:6443
     certificate-authority: %s
 contexts:
-- name: kwasm
+- name: tabernetes
   context:
-    cluster: kwasm
+    cluster: tabernetes
     user: %s
-current-context: kwasm
+current-context: tabernetes
 users:
 - name: %s
   user:

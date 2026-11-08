@@ -45,9 +45,9 @@ func addForwards(namespace, pod string, ports []clientpf.ForwardedPort) func() {
 	}
 }
 
-// publishForwards hands the list to globalThis.kwasmForwards of the page.
+// publishForwards hands the list to globalThis.tabernetesForwards of the page.
 func publishForwards() {
-	cb := js.Global().Get("kwasmForwards")
+	cb := js.Global().Get("tabernetesForwards")
 	if cb.Type() != js.TypeFunction {
 		return
 	}

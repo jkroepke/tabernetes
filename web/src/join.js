@@ -4,7 +4,7 @@
 const B = (s) => `\x1b[1m${s}\x1b[0m`;
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
 
-// Instead of --privileged. See kwasm/README.md for why each flag is needed.
+// Instead of --privileged. See tabernetes/README.md for why each flag is needed.
 const NODE_FLAGS = "--pull always --memory 2g --pids-limit 4096 --security-opt seccomp=unconfined --security-opt systempaths=unconfined --security-opt apparmor=unconfined --device /dev/net/tun";
 
 async function deflate(str) {
@@ -56,7 +56,7 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
     status.replaceChildren(...nodes.map(({ info, pc }) => {
       const [text, color] = STATES[pc.connectionState] || [pc.connectionState, "#8b949e"];
       const el = document.createElement("span");
-      el.className = "kwasm-node";
+      el.className = "tabernetes-node";
       const dot = document.createElement("span");
       dot.textContent = "\u25CF ";
       dot.style.color = color;
@@ -93,14 +93,14 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
       }
       const pc = new RTCPeerConnection({ iceServers: stun ? [{ urls: stun }] : [] });
       pc.createDataChannel("ctl");
-      pc.ondatachannel = (e) => globalThis.kwasm.attachChannel(e.channel);
+      pc.ondatachannel = (e) => globalThis.tabernetes.attachChannel(e.channel);
       const open = (label) => new Promise((resolve, reject) => {
         const dc = pc.createDataChannel(label);
         const t = setTimeout(() => reject(new Error("data channel timeout")), 15000);
         dc.onopen = () => { clearTimeout(t); resolve(dc); };
         dc.onerror = (e) => { clearTimeout(t); reject(e.error || new Error("data channel error")); };
       });
-      const info = await globalThis.kwasm.prepareJoin(open);
+      const info = await globalThis.tabernetes.prepareJoin(open);
       await pc.setLocalDescription(await pc.createOffer());
       await gatheringComplete(pc, 3000);
       if (!active()) { pc.close(); return; } // Ctrl-C while preparing
@@ -114,13 +114,13 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
         if (pc.connectionState === "failed") pc.close();
       };
       pending = { pc, info };
-      globalThis.kwasmLastJoin = { token, port, name: info.name };
+      globalThis.tabernetesLastJoin = { token, port, name: info.name };
       nodes.push(pending);
       render();
 
       term.writeln(`Start a node on a machine with docker (Linux, macOS or Windows):`);
       term.writeln("");
-      term.writeln(B(`docker run --rm -it -p 127.0.0.1:${port}:${port}/udp --name kwasm-${info.name} \\`));
+      term.writeln(B(`docker run --rm -it -p 127.0.0.1:${port}:${port}/udp --name tabernetes-${info.name} \\`));
       term.writeln(B(`  ${NODE_FLAGS} \\`));
       term.writeln(B(`  ${image} \\`));
       term.writeln(B(`  ${token}`));
@@ -130,7 +130,7 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
       term.writeln(DIM(`  docker run ... -p ${port}:${port}/udp ... ${image} --advertise 192.168.x.y <token>`));
       term.writeln("");
       if (navigator.clipboard?.writeText) {
-        const cmd = `docker run --rm -it -p 127.0.0.1:${port}:${port}/udp --name kwasm-${info.name} ${NODE_FLAGS} ${image} ${token}`;
+        const cmd = `docker run --rm -it -p 127.0.0.1:${port}:${port}/udp --name tabernetes-${info.name} ${NODE_FLAGS} ${image} ${token}`;
         await navigator.clipboard.writeText(cmd).then(() => term.writeln(DIM("(the docker command was copied to your clipboard)")), () => {});
       }
       term.writeln(`The node prints an ${B("accept ...")} line. Paste it here, or press Ctrl-C and run ${B("accept ...")} later.`);

@@ -9,7 +9,7 @@
 //   - copies _overlay/ (js stubs and helpers) into the tree,
 //   - applies a few content patches,
 //   - vendors mvdan.cc/sh (the terminal's shell) at MVDAN_SH_VERSION and
-//   - copies kwasm/ (the main package) to cmd/kwasm.
+//   - copies tabernetes/ (the main package) to cmd/tabernetes.
 //
 // Every patch fails when its target is gone. A Kubernetes update shows exactly
 // what needs attention.
@@ -28,7 +28,7 @@ import (
 	"strings"
 )
 
-//go:embed all:_overlay all:kwasm
+//go:embed all:_overlay all:tabernetes
 var files embed.FS
 
 func main() {
@@ -63,7 +63,7 @@ func main() {
 		jsFromWindows(unix, windows)
 	}
 	// kubectl edit: no editor process in js. _overlay/ has a launcher that
-	// runs the editor in-process (the vi of cmd/kwasm).
+	// runs the editor in-process (the vi of cmd/tabernetes).
 	buildTag("staging/src/k8s.io/kubectl/pkg/cmd/util/editor/launcher_others.go", "(%s) && !js")
 
 	// The plain file system helpers work in js as well.
@@ -128,7 +128,7 @@ func main() {
 	} {
 		edit(f,
 			"\tw, err := fsnotify.NewWatcher()\n\tif err != nil {\n\t\treturn fmt.Errorf(\"error creating fsnotify watcher: %v\", err)\n\t}",
-			"\tw, err := fsnotify.NewWatcher()\n\tif err != nil {\n\t\treturn nil // kwasm: no fsnotify in js\n\t}",
+			"\tw, err := fsnotify.NewWatcher()\n\tif err != nil {\n\t\treturn nil // tabernetes: no fsnotify in js\n\t}",
 		)
 	}
 
@@ -138,13 +138,13 @@ func main() {
 		"expand", "fileutil", "internal", "interp", "pattern", "syntax")
 
 	// A background job ("k port-forward ... &") runs with the context of its
-	// command line, which ends with the line. The hook lets kwasm give each
-	// job its own context (kwasm/jobs.go).
+	// command line, which ends with the line. The hook lets tabernetes give each
+	// job its own context (tabernetes/jobs.go).
 	edit("vendor/mvdan.cc/sh/v3/interp/runner.go",
 		"\t\tgo func() {\n\t\t\tr2.Run(ctx, &st2)\n",
-		"\t\tctx, done := BackgroundContext(ctx, &st2) // kwasm\n\t\tgo func() {\n\t\t\tdefer done()\n\t\t\tr2.Run(ctx, &st2)\n",
+		"\t\tctx, done := BackgroundContext(ctx, &st2) // tabernetes\n\t\tgo func() {\n\t\t\tdefer done()\n\t\t\tr2.Run(ctx, &st2)\n",
 	)
-	write("vendor/mvdan.cc/sh/v3/interp/kwasm.go", `package interp
+	write("vendor/mvdan.cc/sh/v3/interp/tabernetes.go", `package interp
 
 import (
 	"context"
@@ -153,7 +153,7 @@ import (
 )
 
 // BackgroundContext returns the context of a background job and the func
-// called when the job ends. Added by kwasm (k8s/patch.go).
+// called when the job ends. Added by tabernetes (k8s/patch.go).
 var BackgroundContext = func(ctx context.Context, stmt *syntax.Stmt) (context.Context, func()) {
 	return ctx, func() {}
 }
@@ -167,10 +167,10 @@ var BackgroundContext = func(ctx context.Context, stmt *syntax.Stmt) (context.Co
 		"cmdutil.CheckErr(opts.RunPortForward())", "cmdutil.CheckErr(opts.RunPortForwardContext(cmd.Context()))",
 	)
 	// The status line under the terminal links every forwarded port
-	// (kwasm/forwards.go).
+	// (tabernetes/forwards.go).
 	edit("staging/src/k8s.io/kubectl/pkg/cmd/portforward/portforward.go",
 		"\treturn fw.ForwardPorts()\n}",
-		`	stopped := make(chan struct{}) // kwasm: report the ports while they listen
+		`	stopped := make(chan struct{}) // tabernetes: report the ports while they listen
 	defer close(stopped)
 	go func() {
 		select {
@@ -189,12 +189,12 @@ var BackgroundContext = func(ctx context.Context, stmt *syntax.Stmt) (context.Co
 	return fw.ForwardPorts()
 }`,
 	)
-	write("staging/src/k8s.io/kubectl/pkg/cmd/portforward/kwasm.go", `package portforward
+	write("staging/src/k8s.io/kubectl/pkg/cmd/portforward/tabernetes.go", `package portforward
 
 import "k8s.io/client-go/tools/portforward"
 
 // OnForward is called when the local ports listen and returns the func called
-// when they stop. Added by kwasm (k8s/patch.go).
+// when they stop. Added by tabernetes (k8s/patch.go).
 var OnForward = func(namespace, pod string, ports []portforward.ForwardedPort) func() {
 	return func() {}
 }
@@ -208,11 +208,11 @@ var OnForward = func(namespace, pod string, ports []portforward.ForwardedPort) f
 		"\tstop := context.AfterFunc(ctx, func() { l.Close() })\n\tdefer stop()\n\tif err := server.ServeOnListener(l); ctx.Err() == nil {\n\t\treturn err\n\t}\n\treturn nil\n",
 	)
 
-	// The kwasm main package.
-	if err := os.RemoveAll("cmd/kwasm"); err != nil {
+	// The tabernetes main package.
+	if err := os.RemoveAll("cmd/tabernetes"); err != nil {
 		fail("%v", err)
 	}
-	copyTree("kwasm", "cmd/kwasm")
+	copyTree("tabernetes", "cmd/tabernetes")
 }
 
 // vendorModule adds packages of a module that Kubernetes does not use to the
@@ -299,7 +299,7 @@ func fail(format string, args ...any) {
 	fmt.Fprintln(os.Stderr, "patch: "+msg)
 	if os.Getenv("GITHUB_ACTIONS") == "true" {
 		// An annotation puts the failing patch at the top of the run and the PR.
-		fmt.Printf("::error file=kwasm/k8s/patch.go,title=Kubernetes patch failed::%s\n", msg)
+		fmt.Printf("::error file=tabernetes/k8s/patch.go,title=Kubernetes patch failed::%s\n", msg)
 	}
 	os.Exit(1)
 }

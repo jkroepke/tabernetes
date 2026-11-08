@@ -1,22 +1,22 @@
-# kwasm
+# Tabernetes
 
-A real Kubernetes control plane in the browser. kube-apiserver,
+A real Kubernetes control plane in a browser tab. kube-apiserver,
 kube-controller-manager, kube-scheduler and kubectl are compiled with
 `GOOS=js GOARCH=wasm` into a single binary. The page at
-[/kubernetes/](https://jkroepke.de/kubernetes/) boots it in a terminal.
+[/tabernetes/](https://jkroepke.de/tabernetes/) boots it in a terminal.
 A real node can join with Docker. The node talks to the browser over WebRTC.
 
 ## How it works
 
 ```text
-browser tab (single wasm binary)                     docker run kwasm-node
+browser tab (single wasm binary)                     docker run tabernetes
 +---------------------------------------------+      +---------------------------+
 | kubectl  --->  kube-apiserver :6443         |      | kubelet, kube-proxy, pods |
 |                   |                         |      |        |                  |
 | controller-manager, scheduler               |      |   127.0.0.1:6443          |
 |                   |                         |      |   10.0.0.1:6443           |
 |          etcd shim :2379 (in memory)       |      |        |                  |
-|                                             |      |   kwasm-node agent        |
+|                                             |      |   tabernetes agent        |
 | <ip>:10250 ---------- WebRTC data channels -------------> kubelet :10250    |
 | 127.0.0.1:6443 <----- (one per TCP stream) <------------- 127.0.0.1:6443    |
 +---------------------------------------------+      +---------------------------+
@@ -25,7 +25,7 @@ browser tab (single wasm binary)                     docker run kwasm-node
 - Go's `js/wasm` port has an in-process fake network. `net.Listen` and
   `net.Dial` work between goroutines of the same binary. All components
   talk to each other over it, without any change to their code.
-- etcd is replaced by `k8s/kwasm/etcdshim`. It is a small in-memory
+- etcd is replaced by `k8s/tabernetes/etcdshim`. It is a small in-memory
   implementation of the etcd v3 gRPC API (KV, Txn, Watch, Lease). It
   implements only what kube-apiserver uses. It persists nothing.
 - The browser has no file system. `web/src/fs.js` is an in-memory file
@@ -34,7 +34,7 @@ browser tab (single wasm binary)                     docker run kwasm-node
   a shell interpreter in Go, compiled into the same binary. Pipes, variables,
   loops, `$(...)`, redirects and here-documents work. There are no processes,
   so every command is a function: kubectl runs in-process, a few coreutils
-  (`grep`, `head`, `wc`, `xargs`, ...) live in `k8s/kwasm/coreutils.go`, and
+  (`grep`, `head`, `wc`, `xargs`, ...) live in `k8s/tabernetes/coreutils.go`, and
   `join`, `logs` and `clear` are JavaScript. Files land in the in-memory file
   system, so `kubectl get cm x -o yaml > cm.yaml` works.
   Tab completes commands and files, and kubectl through its own `__complete`
@@ -50,15 +50,15 @@ browser tab (single wasm binary)                     docker run kwasm-node
   `kubectl proxy` included. On Windows and Linux, Ctrl-C copies instead while
   text is selected, and Ctrl-V pastes.
 - `proxy 8080` opens `localhost:8080` of the Wasm in a new browser tab. A
-  service worker under `/kwasm-proxy/` (`static/kwasm-proxy/sw.js`) hands
+  service worker under `/tabernetes-proxy/` (`static/tabernetes-proxy/sw.js`) hands
   every request of that tab to the terminal tab, which sends it to the
   in-process network. The tab works as long as the terminal tab is open;
   leaving the terminal page unregisters the worker. While
   `kubectl port-forward` runs, the status line under the terminal links each
-  of its local ports the same way (`k8s/kwasm/forwards.go`).
+  of its local ports the same way (`k8s/tabernetes/forwards.go`).
 - `free` shows the WebAssembly memory (wasm32 ends at 4 GiB, and the linear
   memory never shrinks), the Go heap and the number of goroutines.
-- `vi` (`k8s/kwasm/vi.go`) is a small vi for manifests. It runs in raw mode:
+- `vi` (`k8s/tabernetes/vi.go`) is a small vi for manifests. It runs in raw mode:
   while it runs, the terminal sends every key to it. `kubectl edit` opens it
   in-process, because js/Wasm cannot start an editor process.
 - `join` creates a bootstrap token and a WebRTC offer. Signaling is copy and
@@ -94,13 +94,13 @@ exactly what needs attention.
 
 ## Build
 
-The tasks live in `kwasm/mise.toml`. mise installs Go and Node.js.
+The tasks live in `tabernetes/mise.toml`. mise installs Go and Node.js.
 
 ```bash
-cd kwasm
-mise run build       # assets/kwasm/{kwasm.wasm.zst,kwasm.js,unzstd.js,xterm.css}
-mise run node-image  # ghcr.io/jkroepke/kwasm-node:latest for the local platform
-cd .. && hugo server # http://localhost:1313/kubernetes/
+cd tabernetes
+mise run build       # assets/tabernetes/{tabernetes.wasm.zst,tabernetes.js,unzstd.js,xterm.css}
+mise run node-image  # ghcr.io/jkroepke/tabernetes:latest for the local platform
+cd .. && hugo server # http://localhost:1313/tabernetes/
 ```
 
 The binary is around 290 MB, or 28 MB with zstd (gzip: 45 MB). GitHub Pages
@@ -110,7 +110,7 @@ zstd. The page fetches the `.zst` file and unpacks it with
 while it downloads. The browser compiles the WebAssembly while the bytes
 arrive, so download, unpacking and compiling overlap.
 
-Hugo fingerprints the files in `assets/kwasm/`, so the name of the binary
+Hugo fingerprints the files in `assets/tabernetes/`, so the name of the binary
 changes with its content. The page keeps the binary in the Cache Storage of
 the browser and the next visit downloads nothing. GitHub Pages itself sends
 only `max-age=600`.
@@ -123,7 +123,7 @@ only `max-age=600`.
 3. Run `mise run test` (etcd shim tests), then boot the page and run
    `join`.
 
-The node image is built by `.github/workflows/kwasm-node.yaml` with the same
+The node image is built by `.github/workflows/tabernetes-image.yaml` with the same
 version and pushed as `latest` only. The printed `docker run` uses
 `--pull always`, so a join always runs the current image.
 

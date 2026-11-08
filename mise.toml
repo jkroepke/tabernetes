@@ -1,9 +1,9 @@
-# kwasm: a Kubernetes control plane in the browser.
+# Tabernetes: a Kubernetes control plane in the browser.
 #
-#   mise run build       build the WebAssembly binary and the terminal into ../assets/kwasm/
+#   mise run build       build the WebAssembly binary and the terminal into ../assets/tabernetes/
 #   mise run web         rebuild only the terminal (needs .build/wasm_exec.js)
 #   mise run test        run the etcd shim tests
-#   mise run node-image  build the node image (kwasm-node) for the local platform
+#   mise run node-image  build the node image (tabernetes) for the local platform
 #
 # Updating Kubernetes means bumping KUBERNETES_VERSION, running `mise run build`
 # and fixing whatever k8s/patch.go complains about.
@@ -14,7 +14,7 @@ go = "1.27.3"
 [env]
 # renovate: datasource=github-tags depName=kubernetes/kubernetes
 KUBERNETES_VERSION = "v1.37.2"
-NODE_IMAGE = "ghcr.io/jkroepke/kwasm-node"
+NODE_IMAGE = "ghcr.io/jkroepke/tabernetes"
 # The shell of the terminal, vendored into the Kubernetes checkout by k8s/patch.go.
 # renovate: datasource=go depName=mvdan.cc/sh/v3
 MVDAN_SH_VERSION = "v3.14.1"
@@ -34,7 +34,7 @@ fi
 [tasks.patch]
 description = "Reset the Kubernetes checkout and apply k8s/patch.go"
 depends = ["checkout"]
-sources = ["mise.toml", "k8s/patch.go", "k8s/_overlay/**/*", "k8s/kwasm/**/*"]
+sources = ["mise.toml", "k8s/patch.go", "k8s/_overlay/**/*", "k8s/tabernetes/**/*"]
 outputs = [".build/kubernetes/.patched"]
 run = '''
 git -C .build/kubernetes checkout --quiet -- .
@@ -44,14 +44,14 @@ touch .build/kubernetes/.patched
 '''
 
 [tasks.wasm]
-description = "Build ../assets/kwasm/kwasm.wasm.zst"
+description = "Build ../assets/tabernetes/tabernetes.wasm.zst"
 depends = ["patch"]
 sources = [".build/kubernetes/.patched", "k8s/build.sh"]
-outputs = ["../assets/kwasm/kwasm.wasm.zst", ".build/wasm_exec.js"]
+outputs = ["../assets/tabernetes/tabernetes.wasm.zst", ".build/wasm_exec.js"]
 run = '''
-mkdir -p ../assets/kwasm
-k8s/build.sh .build/kubernetes .build/kwasm.wasm
-# wasm_exec.js must come from the same Go version that built kwasm.wasm.
+mkdir -p ../assets/tabernetes
+k8s/build.sh .build/kubernetes .build/tabernetes.wasm
+# wasm_exec.js must come from the same Go version that built tabernetes.wasm.
 cp "$(cd .build/kubernetes && go env GOROOT)/lib/wasm/wasm_exec.js" .build/wasm_exec.js
 # zstd -19 is about 40 % smaller than gzip -9. Node.js has zstd built in.
 # Independent frames of 32 MiB (0.6 % larger than one frame): the page unpacks
@@ -62,31 +62,31 @@ node -e '
   for (let i = 0; i < wasm.length; i += 32 << 20) frames.push(zlib.zstdCompressSync(wasm.subarray(i, i + (32 << 20)), { params: {
     [c.ZSTD_c_compressionLevel]: 19, [c.ZSTD_c_checksumFlag]: 1, [c.ZSTD_c_nbWorkers]: os.availableParallelism() } }));
   fs.writeFileSync(process.argv[2], Buffer.concat(frames));
-' .build/kwasm.wasm ../assets/kwasm/kwasm.wasm.zst
+' .build/tabernetes.wasm ../assets/tabernetes/tabernetes.wasm.zst
 '''
 
 [tasks.web]
-description = "Bundle the terminal into ../assets/kwasm/"
+description = "Bundle the terminal into ../assets/tabernetes/"
 wait_for = ["wasm"]
 run = '''
 if [ ! -f .build/wasm_exec.js ]; then mise run wasm; fi
-# Hugo fingerprints these (layouts/_shortcodes/kwasm.html), so the browser
+# Hugo fingerprints these (layouts/_shortcodes/tabernetes.html), so the browser
 # can cache them for good.
-mkdir -p ../assets/kwasm
-out="$(cd ../assets/kwasm && pwd)"
+mkdir -p ../assets/tabernetes
+out="$(cd ../assets/tabernetes && pwd)"
 cp .build/wasm_exec.js web/src/wasm_exec.js
 cd web
 npm ci --no-audit --no-fund
 npx esbuild src/index.js --bundle --minify --format=esm --target=es2022 \
-  --define:KWASM_NODE_IMAGE="\"$NODE_IMAGE:latest\"" \
-  --outfile="$out/kwasm.js"
+  --define:TABERNETES_IMAGE="\"$NODE_IMAGE:latest\"" \
+  --outfile="$out/tabernetes.js"
 # The zstd decoder runs in a worker, so that the page does not freeze.
 npx esbuild src/unzstd.js --bundle --minify --format=iife --target=es2022 --outfile="$out/unzstd.js"
 cp node_modules/@xterm/xterm/css/xterm.css "$out/xterm.css"
 '''
 
 [tasks.build]
-description = "Build everything into ../assets/kwasm/"
+description = "Build everything into ../assets/tabernetes/"
 depends = ["wasm", "web"]
 
 [tasks.test]
@@ -94,8 +94,8 @@ description = "Run the etcd shim tests and the shell tests (in node), vet the no
 depends = ["patch"]
 dir = "{{config_root}}/.build/kubernetes"
 run = """
-go test ./cmd/kwasm/etcdshim/
-GOOS=js GOARCH=wasm go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./cmd/kwasm/
+go test ./cmd/tabernetes/etcdshim/
+GOOS=js GOARCH=wasm go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./cmd/tabernetes/
 GOOS=linux go -C {{config_root}}/node/agent vet ./...
 """
 

@@ -29,7 +29,7 @@ var hopHeaders = map[string]bool{
 	"keep-alive": true, "te": true, "trailer": true, "transfer-encoding": true, "upgrade": true,
 }
 
-// proxyJS backs kwasm.proxy(port, method, path, headers, body): it returns
+// proxyJS backs tabernetes.proxy(port, method, path, headers, body): it returns
 // a Promise of {status, statusText, headers: [name, value][], body: Uint8Array}.
 func proxyJS(a []js.Value) js.Value {
 	port, method, path := a[0].Int(), a[1].String(), a[2].String()

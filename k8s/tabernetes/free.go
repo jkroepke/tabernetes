@@ -23,7 +23,7 @@ func free(_ context.Context, hc interp.HandlerContext, _ []string, _ interp.Exec
 	w := tabwriter.NewWriter(hc.Stdout, 0, 0, 3, ' ', tabwriter.AlignRight)
 	fmt.Fprintln(w, "\ttotal\tused\tfree\t")
 	// terminal.js exposes the WebAssembly.Memory of the instance.
-	if mem := js.Global().Get("kwasmMemory"); mem.Truthy() {
+	if mem := js.Global().Get("tabernetesMemory"); mem.Truthy() {
 		used := uint64(mem.Get("buffer").Get("byteLength").Float())
 		fmt.Fprintf(w, "wasm:\t%s\t%s\t%s\t\n", size(wasmLimit), size(used), size(wasmLimit-used))
 	}

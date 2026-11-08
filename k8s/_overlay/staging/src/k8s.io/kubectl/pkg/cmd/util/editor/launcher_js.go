@@ -9,7 +9,7 @@ import (
 )
 
 // InProcess runs the editor inside the process: js/wasm cannot start one.
-// kwasm sets it to its own vi. args is the editor command line, the file last.
+// tabernetes sets it to its own vi. args is the editor command line, the file last.
 var InProcess func(args []string) error
 
 func (e Editor) args(path string) []string {

@@ -1,4 +1,4 @@
-module github.com/jkroepke/blog/kwasm/node/agent
+module github.com/jkroepke/blog/tabernetes/node/agent
 
 go 1.27.3
 

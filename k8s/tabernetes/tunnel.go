@@ -128,13 +128,13 @@ func attachChannel(dc js.Value) {
 		case "api":
 			target = "127.0.0.1:6443"
 		default:
-			fmt.Fprintln(os.Stderr, "kwasm: unknown data channel", label)
+			fmt.Fprintln(os.Stderr, "tabernetes: unknown data channel", label)
 			conn.Close()
 			return
 		}
 		tcp, err := net.DialTimeout("tcp", target, 10*time.Second)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "kwasm: tunnel dial:", err)
+			fmt.Fprintln(os.Stderr, "tabernetes: tunnel dial:", err)
 			conn.Close()
 			return
 		}
@@ -182,7 +182,7 @@ stringData:
   expiration: %s
   usage-bootstrap-authentication: "true"
   usage-bootstrap-signing: "true"
-  auth-extra-groups: system:bootstrappers:kwasm:default-node-token
+  auth-extra-groups: system:bootstrappers:tabernetes:default-node-token
 `, id, id, secret, time.Now().Add(2*time.Hour).UTC().Format(time.RFC3339))
 	if code := runKubectl(context.Background(), []string{"apply", "-f", "-"}, strings.NewReader(manifest), os.Stderr, os.Stderr); code != 0 {
 		return nil, fmt.Errorf("creating bootstrap token failed (exit %d)", code)
@@ -218,7 +218,7 @@ func (jn *joinedNode) serve() {
 			defer cancel()
 			dc, err := awaitPromise(ctx, jn.open.Invoke("kubelet:10250"))
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "kwasm: opening kubelet channel:", err)
+				fmt.Fprintln(os.Stderr, "tabernetes: opening kubelet channel:", err)
 				tcp.Close()
 				return
 			}

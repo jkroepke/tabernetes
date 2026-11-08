@@ -1,6 +1,6 @@
 #!/bin/bash
 # build.sh <kubernetes checkout> <out.wasm>
-# Builds the kwasm binary from a checkout prepared by patch.go.
+# Builds the tabernetes binary from a checkout prepared by patch.go.
 set -euo pipefail
 K="$1"
 OUT="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
@@ -14,4 +14,4 @@ LD="-s -w"
 for pkg in k8s.io/component-base/version k8s.io/client-go/pkg/version; do
 	LD="$LD -X $pkg.gitVersion=$V -X $pkg.gitMajor=$MAJOR -X $pkg.gitMinor=$MINOR -X $pkg.gitCommit=$COMMIT -X $pkg.gitTreeState=clean -X $pkg.buildDate=$DATE"
 done
-GOOS=js GOARCH=wasm go build -trimpath -ldflags="$LD" -o "$OUT" ./cmd/kwasm
+GOOS=js GOARCH=wasm go build -trimpath -ldflags="$LD" -o "$OUT" ./cmd/tabernetes

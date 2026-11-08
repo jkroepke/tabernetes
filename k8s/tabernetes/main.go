@@ -1,4 +1,4 @@
-// kwasm runs a Kubernetes control plane (kube-apiserver, kube-controller-manager,
+// tabernetes runs a Kubernetes control plane (kube-apiserver, kube-controller-manager,
 // kube-scheduler and an in-memory etcd replacement) plus kubectl inside a
 // single Go binary built for GOOS=js.
 package main
@@ -26,11 +26,11 @@ import (
 	"k8s.io/kubernetes/cmd/kube-apiserver/app"
 	cmapp "k8s.io/kubernetes/cmd/kube-controller-manager/app"
 	schedapp "k8s.io/kubernetes/cmd/kube-scheduler/app"
-	"k8s.io/kubernetes/cmd/kwasm/etcdshim"
+	"k8s.io/kubernetes/cmd/tabernetes/etcdshim"
 )
 
 const (
-	dataDir      = "/tmp/kwasm"
+	dataDir      = "/tmp/tabernetes"
 	advertiseIP  = "10.0.0.1"
 	serviceCIDR  = "10.96.0.0/16"
 	clusterCIDR  = "10.244.0.0/16"
@@ -39,7 +39,7 @@ const (
 
 func must(err error) {
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "kwasm:", err)
+		fmt.Fprintln(os.Stderr, "tabernetes:", err)
 		panic(err)
 	}
 }
@@ -82,14 +82,14 @@ func boot() (*cluster, error) {
 	os.Setenv("HOME", "/root")
 
 	status("generating PKI")
-	ca := newPKI("ca", "kwasm-ca")
+	ca := newPKI("ca", "tabernetes-ca")
 	ca.issue("apiserver", "kube-apiserver", nil, true,
 		[]string{"localhost", "kubernetes", "kubernetes.default", "kubernetes.default.svc", "kubernetes.default.svc.cluster.local"},
 		[]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP(advertiseIP), net.ParseIP(kubernetesIP)})
 	ca.issue("apiserver-kubelet-client", "kube-apiserver-kubelet-client", []string{"system:masters"}, false, nil, nil)
 	// Aggregated API servers and the delegated authentication of the
 	// controller-manager and scheduler expect a request header CA.
-	newPKI("front-proxy-ca", "kwasm-front-proxy-ca").issue("front-proxy-client", "front-proxy-client", nil, false, nil, nil)
+	newPKI("front-proxy-ca", "tabernetes-front-proxy-ca").issue("front-proxy-client", "front-proxy-client", nil, false, nil, nil)
 	saKey := newKey()
 	must(os.WriteFile(p("sa.key"), keyPEM(saKey), 0o600))
 	pub, err := x509.MarshalPKIXPublicKey(&saKey.PublicKey)
@@ -261,8 +261,8 @@ func main() {
 	// heap first; the limit makes the GC work harder before it gets there.
 	debug.SetMemoryLimit(3 << 30)
 	api := js.Global().Get("Object").New()
-	js.Global().Set("kwasm", api)
-	if cb := js.Global().Get("kwasmStatus"); cb.Type() == js.TypeFunction {
+	js.Global().Set("tabernetes", api)
+	if cb := js.Global().Get("tabernetesStatus"); cb.Type() == js.TypeFunction {
 		status = func(s string) { cb.Invoke(s) }
 	}
 

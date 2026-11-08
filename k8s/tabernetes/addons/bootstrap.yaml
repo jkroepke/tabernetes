@@ -1,7 +1,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: kwasm:kubelet-bootstrap
+  name: tabernetes:kubelet-bootstrap
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -9,12 +9,12 @@ roleRef:
 subjects:
 - apiGroup: rbac.authorization.k8s.io
   kind: Group
-  name: system:bootstrappers:kwasm:default-node-token
+  name: system:bootstrappers:tabernetes:default-node-token
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: kwasm:node-autoapprove-bootstrap
+  name: tabernetes:node-autoapprove-bootstrap
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -22,12 +22,12 @@ roleRef:
 subjects:
 - apiGroup: rbac.authorization.k8s.io
   kind: Group
-  name: system:bootstrappers:kwasm:default-node-token
+  name: system:bootstrappers:tabernetes:default-node-token
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: kwasm:node-autoapprove-certificate-rotation
+  name: tabernetes:node-autoapprove-certificate-rotation
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole

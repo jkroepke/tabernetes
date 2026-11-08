@@ -1,4 +1,4 @@
-# kwasm-node: a Kubernetes node that joins a control plane running in a browser.
+# Tabernetes: a Kubernetes node that joins a control plane running in a browser.
 ARG GO_IMAGE=mirror.gcr.io/library/golang:1.27-trixie
 ARG BASE_IMAGE=mirror.gcr.io/library/debian:trixie-slim
 
@@ -8,7 +8,7 @@ WORKDIR /src
 COPY agent/go.mod agent/go.sum ./
 RUN go mod download
 COPY agent/ ./
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /kwasm-node .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /tabernetes .
 
 FROM ${BASE_IMAGE} AS download
 ARG DEBIAN_FRONTEND=noninteractive
@@ -75,10 +75,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=download /out/ /
 COPY --from=passt /out/ /
-COPY --from=agent /kwasm-node /usr/local/bin/kwasm-node
+COPY --from=agent /tabernetes /usr/local/bin/tabernetes
 # containerd calls runc through the agent when the node is not privileged
-RUN ln -s kwasm-node /usr/local/bin/kwasm-runc
+RUN ln -s tabernetes /usr/local/bin/tabernetes-runc
 COPY crictl.yaml /etc/crictl.yaml
 # containerd needs a real file system for its overlayfs snapshots
 VOLUME ["/var/lib/containerd"]
-ENTRYPOINT ["/usr/local/bin/kwasm-node"]
+ENTRYPOINT ["/usr/local/bin/tabernetes"]

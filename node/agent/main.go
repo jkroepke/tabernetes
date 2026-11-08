@@ -1,4 +1,4 @@
-// kwasm-node joins a Kubernetes node to a kwasm control plane running in a
+// tabernetes joins a Kubernetes node to a tabernetes control plane running in a
 // web browser. The connection to the browser is a WebRTC peer connection;
 // every TCP connection is carried by its own data channel.
 package main
@@ -84,7 +84,7 @@ func main() {
 	noKubelet := flag.Bool("no-kubelet", false, "only run the tunnel (for testing)")
 	advertise := flag.String("advertise", "127.0.0.1", "extra host ICE candidate addresses, comma separated (for docker -p port mappings), empty to disable")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: kwasm-node [flags] join <token>\n")
+		fmt.Fprintf(os.Stderr, "usage: tabernetes [flags] join <token>\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -367,14 +367,14 @@ func runNode(ctx context.Context, tok offerToken) error {
 		"/etc/kubernetes/bootstrap-kubelet.conf": fmt.Sprintf(`apiVersion: v1
 kind: Config
 clusters:
-- name: kwasm
+- name: tabernetes
   cluster:
     server: https://%s:6443
     certificate-authority: /etc/kubernetes/pki/ca.crt
 contexts:
-- name: kwasm
-  context: {cluster: kwasm, user: kubelet-bootstrap}
-current-context: kwasm
+- name: tabernetes
+  context: {cluster: tabernetes, user: kubelet-bootstrap}
+current-context: tabernetes
 users:
 - name: kubelet-bootstrap
   user: {token: %s}
@@ -431,7 +431,7 @@ failCgroupV1: false
 		containerdConfig += "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]\n" +
 			"  BinaryName = '" + runcWrapper + "'\n"
 	}
-	if err := writeFile("/etc/kwasm/containerd.toml", containerdConfig, 0o644); err != nil {
+	if err := writeFile("/etc/tabernetes/containerd.toml", containerdConfig, 0o644); err != nil {
 		return err
 	}
 	// The kubelet reads the system UUID from /etc/machine-id.
@@ -444,7 +444,7 @@ failCgroupV1: false
 			return err
 		}
 	}
-	go supervise(ctx, "containerd", "containerd", "--config=/etc/kwasm/containerd.toml")
+	go supervise(ctx, "containerd", "containerd", "--config=/etc/tabernetes/containerd.toml")
 	if err := waitForSocket(ctx, "/run/containerd/containerd.sock", 30*time.Second); err != nil {
 		return fmt.Errorf("containerd did not start, see /var/log/containerd.log: %w", err)
 	}
@@ -500,7 +500,7 @@ func supervise(ctx context.Context, name, bin string, args ...string) {
 			if logFile != nil {
 				fmt.Fprintln(logFile, line)
 			}
-			if os.Getenv("KWASM_VERBOSE") != "" || (strings.HasPrefix(line, "E") || strings.HasPrefix(line, "F")) && !isNoise(line) {
+			if os.Getenv("TABERNETES_VERBOSE") != "" || (strings.HasPrefix(line, "E") || strings.HasPrefix(line, "F")) && !isNoise(line) {
 				log.Printf("%s: %s", name, line)
 			}
 		}

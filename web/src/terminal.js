@@ -1,4 +1,4 @@
-// Browser terminal for kwasm: boots the control plane and runs a shell.
+// Browser terminal for Tabernetes: boots the control plane and runs a shell.
 // The shell (mvdan.cc/sh) and kubectl live in the wasm binary. This file
 // only does the line editing and the builtins that need the browser.
 import { Terminal } from "@xterm/xterm";
@@ -40,11 +40,11 @@ export async function startTerminal(el, opts) {
   new ResizeObserver(() => fit.fit()).observe(el);
 
   const logs = [];
-  globalThis.kwasmLogs = logs;
+  globalThis.tabernetesLogs = logs;
   // A crash trace is kept apart from the rotating log buffer, which would drop
   // its beginning while the runtime prints thousands of goroutines.
   const crash = [];
-  globalThis.kwasmCrash = crash;
+  globalThis.tabernetesCrash = crash;
   let crashing = false;
   installFS((fd, s) => {
     if (crashing || /^(panic:|fatal error:)/m.test(s)) {
@@ -62,7 +62,7 @@ export async function startTerminal(el, opts) {
     if (logs.length > 5000) logs.splice(0, logs.length - 5000);
   });
 
-  term.writeln("\x1b[1mkwasm\x1b[0m: a real Kubernetes control plane, compiled to WebAssembly, running in your browser.");
+  term.writeln("\x1b[1mTabernetes\x1b[0m: a real Kubernetes control plane, compiled to WebAssembly, running in your browser.");
   term.writeln(DIM("kube-apiserver, kube-controller-manager, kube-scheduler and kubectl are the unmodified upstream"));
   term.writeln(DIM("components. etcd is replaced by a tiny in-memory implementation. Nothing leaves your browser."));
   term.writeln("");
@@ -71,7 +71,7 @@ export async function startTerminal(el, opts) {
   // Download, decompression (in a worker) and compilation run at the same time.
   const t0 = performance.now();
   const since = () => ((performance.now() - t0) / 1000).toFixed(1).padStart(5);
-  globalThis.kwasmStatus = (s) => term.writeln(`${DIM(`[${since()}s]`)} ${s}`);
+  globalThis.tabernetesStatus = (s) => term.writeln(`${DIM(`[${since()}s]`)} ${s}`);
   const dl = await download(opts.wasmURL);
   const { body, cached } = dl;
   // The page knows the exact size of the file (data-size), the header only maybe.
@@ -100,31 +100,31 @@ export async function startTerminal(el, opts) {
   go.env = { HOME: "/root", USER: "root", PATH: "/usr/bin" };
   const instance = await instantiate(unpack(opts.wasmURL, counted, total, opts.workerURL), go.importObject);
   term.writeln("");
-  globalThis.kwasmStatus(cached ? "compiled WebAssembly from the browser cache" : "downloaded and compiled WebAssembly");
+  globalThis.tabernetesStatus(cached ? "compiled WebAssembly from the browser cache" : "downloaded and compiled WebAssembly");
   // The "free" command reads the size of the linear memory from here.
-  globalThis.kwasmMemory = instance.exports.mem;
+  globalThis.tabernetesMemory = instance.exports.mem;
   const exited = (why) => {
     term.writeln(`\r\n\x1b[31mthe control plane exited${why ? `: ${why}` : ""}\x1b[0m`);
     if (crash.length) {
       // The first lines name the cause and the crashing goroutine.
       term.writeln(crash.join("").split("\n").slice(0, 30).join("\n"));
-      term.writeln(DIM("The full trace is in kwasmCrash in the DevTools console."));
+      term.writeln(DIM("The full trace is in tabernetesCrash in the DevTools console."));
     }
   };
   go.run(instance).then(() => exited(), (e) => exited(e?.message ?? String(e)));
   try {
-    await globalThis.kwasm.ready;
+    await globalThis.tabernetes.ready;
   } catch (e) {
     term.writeln(`\r\n\x1b[31mthe cluster did not start: ${e.message}\x1b[0m`);
-    term.writeln(DIM("The control plane logs are in kwasmLogs in the DevTools console. Reload to try again."));
+    term.writeln(DIM("The control plane logs are in tabernetesLogs in the DevTools console. Reload to try again."));
     return { term };
   }
   term.writeln("");
   term.writeln(`Try ${"\x1b[1m"}k version${"\x1b[0m"}, ${"\x1b[1m"}join${"\x1b[0m"} or ${"\x1b[1m"}help${"\x1b[0m"}.`);
 
   // ---- shell ----
-  globalThis.kwasm.resize(term.cols, term.rows);
-  term.onResize(({ cols, rows }) => globalThis.kwasm.resize(cols, rows));
+  globalThis.tabernetes.resize(term.cols, term.rows);
+  term.onResize(({ cols, rows }) => globalThis.tabernetes.resize(cols, rows));
   const history = [];
   let hpos = 0, line = "", cursor = 0, busy = false, pending = "";
   let search = null; // { query, at, failed, saved: [line, cursor] }
@@ -141,7 +141,7 @@ export async function startTerminal(el, opts) {
         }
         return [...out, row];
       };
-      const { tools, builtins: shell } = globalThis.kwasm.commands();
+      const { tools, builtins: shell } = globalThis.tabernetes.commands();
       const terminal = Object.keys(builtins).filter((n) => n !== "help").sort();
       write([
         "A POSIX shell (mvdan.cc/sh) inside the wasm binary: pipes, variables, loops,",
@@ -228,12 +228,12 @@ export async function startTerminal(el, opts) {
   }]));
 
   // exec runs a command line in the shell and resolves to its exit status.
-  const exec = (src) => globalThis.kwasm.shell(src, (s) => term.write(s), shellBuiltins);
+  const exec = (src) => globalThis.tabernetes.shell(src, (s) => term.write(s), shellBuiltins);
 
   const prompt = () => {
     if (search) return `(${search.failed ? "failed " : ""}reverse-i-search)\`${search.query}': `;
     if (pending) return "> ";
-    const dir = globalThis.kwasm.cwd().replace(/^\/root(?=\/|$)/, "~");
+    const dir = globalThis.tabernetes.cwd().replace(/^\/root(?=\/|$)/, "~");
     return `\x1b[1;34mjkroepke.de\x1b[0m:\x1b[1;32m${dir}\x1b[0m$ `;
   };
   // redraw renders prompt and line, also when the line wraps over several rows.
@@ -259,7 +259,7 @@ export async function startTerminal(el, opts) {
     hpos = history.length;
     const src = pending ? pending + "\n" + input : input;
     // Open quotes, here-documents, loops without "done": read more lines.
-    if (globalThis.kwasm.incomplete(src)) {
+    if (globalThis.tabernetes.incomplete(src)) {
       pending = src;
       redraw();
       return;
@@ -268,7 +268,7 @@ export async function startTerminal(el, opts) {
     if (src.trim()) {
       busy = true;
       run++;
-      try { await exec(src); } catch (e) { term.writeln(`kwasm: ${e.message}`); }
+      try { await exec(src); } catch (e) { term.writeln(`tabernetes: ${e.message}`); }
       busy = false;
       // Output without a final newline: start the prompt on a new line.
       await new Promise((r) => term.write("", r));
@@ -286,10 +286,10 @@ export async function startTerminal(el, opts) {
     if (completing) { queued += data; return; }
     if (!busy) return feed(data);
     // A full screen program (vi, kubectl edit) gets every key.
-    if (globalThis.kwasm.rawMode()) return globalThis.kwasm.input(data);
+    if (globalThis.tabernetes.rawMode()) return globalThis.tabernetes.input(data);
     if (data === "\x03") {
       run++;
-      globalThis.kwasm.cancel();
+      globalThis.tabernetes.cancel();
       term.write("^C\r\n");
     }
   });
@@ -366,7 +366,7 @@ export async function startTerminal(el, opts) {
   async function complete() {
     completing = true;
     try {
-      const { word, items, noSpace } = await globalThis.kwasm.complete(line.slice(0, cursor), Object.keys(shellBuiltins));
+      const { word, items, noSpace } = await globalThis.tabernetes.complete(line.slice(0, cursor), Object.keys(shellBuiltins));
       if (!items.length) return term.write("\x07");
       let insert = items[0];
       if (items.length === 1) insert += noSpace ? "" : " ";
@@ -455,7 +455,11 @@ const escape = (s) => /^\x1b(?:\[[0-9;?]*[@-~]|O.|[^]?)/.exec(s)[0];
 // always current. GitHub Pages sends max-age=600 and nothing longer.
 async function download(url) {
   let cache = null;
-  try { cache = await caches.open("kwasm"); } catch { /* no Cache Storage (http, private mode) */ }
+  try {
+    cache = await caches.open("tabernetes");
+    // The project was called kwasm before. Free the binary it cached.
+    caches.delete("kwasm").catch(() => {});
+  } catch { /* no Cache Storage (http, private mode) */ }
   const hit = await cache?.match(url).catch(() => null);
   if (hit) return { body: hit.body, total: plainLength(hit), cached: true };
   const resp = await fetch(url);
@@ -465,7 +469,7 @@ async function download(url) {
     cache.put(url, resp.clone())
       .then(() => cache.keys())
       .then((keys) => Promise.all(keys.filter((k) => k.url !== href).map((k) => cache.delete(k))))
-      .catch((e) => console.warn("kwasm: caching the binary failed:", e));
+      .catch((e) => console.warn("tabernetes: caching the binary failed:", e));
   }
   return { body: resp.body, total: plainLength(resp), cached: false };
 }
@@ -481,7 +485,7 @@ function plainLength(resp) {
 // GitHub Pages sends no Content-Encoding for the binary, so the page unpacks
 // it. DecompressionStream has no zstd (Chromium 153), so fzstd does it in
 // JavaScript. The file is a row of independent zstd frames of 32 MB each
-// (kwasm/mise.toml). Workers unpack each frame as soon as it is downloaded,
+// (tabernetes/mise.toml). Workers unpack each frame as soon as it is downloaded,
 // several at once, and the unpacked bytes go on to the compiler in order.
 function unpack(url, stream, size, workerURL) {
   const path = new URL(url, location.href).pathname;

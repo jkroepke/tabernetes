@@ -18,7 +18,7 @@ import (
 	"syscall"
 )
 
-const usernsEnv = "KWASM_USERNS"
+const usernsEnv = "TABERNETES_USERNS"
 
 // inUserNS is true in the agent that runs in its own user namespace.
 var inUserNS = os.Getenv(usernsEnv) != ""

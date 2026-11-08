@@ -1,11 +1,11 @@
-// Service worker behind the "proxy <port>" command of the kwasm terminal.
+// Service worker behind the "proxy <port>" command of the Tabernetes terminal.
 //
-// A tab on /kwasm-proxy/<port>/... shows what listens on localhost:<port>
+// A tab on /tabernetes-proxy/<port>/... shows what listens on localhost:<port>
 // inside the WebAssembly of the terminal tab, typically kubectl
 // port-forward. A web page cannot open a TCP port, so this worker hands each
 // request to the terminal tab, which runs it against its in-process network
 // and posts the response back.
-const scope = new URL(self.registration.scope).pathname; // "/kwasm-proxy/"
+const scope = new URL(self.registration.scope).pathname; // "/tabernetes-proxy/"
 const TIMEOUT = 60_000;
 
 self.addEventListener("install", () => self.skipWaiting());
@@ -15,7 +15,7 @@ self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
 // stopped and started again, so this is only the first guess.
 let host = null;
 self.addEventListener("message", (e) => {
-  if (e.data?.type === "kwasm-host") host = e.source.id;
+  if (e.data?.type === "tabernetes-host") host = e.source.id;
 });
 
 // portOf returns the port of a path below the scope, or 0.
@@ -30,7 +30,7 @@ self.addEventListener("fetch", (e) => {
   const port = portOf(url.pathname);
   if (port) {
     const rest = url.pathname.slice(scope.length + String(port).length);
-    // Relative links need the trailing slash: /kwasm-proxy/80 -> /kwasm-proxy/80/
+    // Relative links need the trailing slash: /tabernetes-proxy/80 -> /tabernetes-proxy/80/
     if (!rest) return e.respondWith(Response.redirect(`${url.pathname}/${url.search}`, 302));
     return e.respondWith(forward(e.request, port, rest + url.search));
   }
@@ -46,7 +46,7 @@ self.addEventListener("fetch", (e) => {
 
 async function forward(req, port, path) {
   const body = req.method === "GET" || req.method === "HEAD" ? null : await req.arrayBuffer();
-  const msg = { type: "kwasm-proxy", port, method: req.method, path, headers: [...req.headers], body };
+  const msg = { type: "tabernetes-proxy", port, method: req.method, path, headers: [...req.headers], body };
   let r;
   try {
     r = await ask(msg);
@@ -68,7 +68,7 @@ async function forward(req, port, path) {
 }
 
 // ask sends the request to the terminal tab. Without a known one, every
-// window of the site gets it and the first kwasm terminal answers.
+// window of the site gets it and the first Tabernetes terminal answers.
 async function ask(msg) {
   let tabs = [];
   const known = host && (await self.clients.get(host));
@@ -80,7 +80,7 @@ async function ask(msg) {
   if (!tabs.length) {
     // The terminal tab is gone without unregistering (crash, closed browser).
     self.registration.unregister();
-    throw new Error("the kwasm terminal tab is closed");
+    throw new Error("the Tabernetes terminal tab is closed");
   }
   const replies = tabs.map((tab) => new Promise((resolve) => {
     const { port1, port2 } = new MessageChannel();
@@ -91,7 +91,7 @@ async function ask(msg) {
     tab.postMessage(msg, [port2]);
   }));
   const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error(
-    "no answer from the kwasm terminal tab (is the cluster running?)")), TIMEOUT));
+    "no answer from the Tabernetes terminal tab (is the cluster running?)")), TIMEOUT));
   return Promise.race([...replies, timeout]);
 }
 

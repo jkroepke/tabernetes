@@ -1,19 +1,19 @@
 // proxy <port> opens what listens on localhost:<port> of the in-browser
 // cluster (kubectl port-forward) in a new tab. A service worker
-// (static/kwasm-proxy/sw.js) catches the requests of that tab and posts them
+// (static/tabernetes-proxy/sw.js) catches the requests of that tab and posts them
 // here; Go runs them against its in-process network.
 const B = (s) => `\x1b[1m${s}\x1b[0m`;
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
 
-export function proxyBuiltins({ worker = "/kwasm-proxy/sw.js", scope = "/kwasm-proxy/", status } = {}) {
+export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/tabernetes-proxy/", status } = {}) {
   const sw = navigator.serviceWorker;
   if (sw) {
     sw.addEventListener("message", async (e) => {
-      if (e.data?.type !== "kwasm-proxy") return;
+      if (e.data?.type !== "tabernetes-proxy") return;
       const [reply] = e.ports;
       const { port, method, path, headers, body } = e.data;
       try {
-        const r = await globalThis.kwasm.proxy(port, method, path, headers, body ? new Uint8Array(body) : null);
+        const r = await globalThis.tabernetes.proxy(port, method, path, headers, body ? new Uint8Array(body) : null);
         reply.postMessage(r, [r.body.buffer]);
       } catch (err) {
         reply.postMessage({ error: err.message });
@@ -46,7 +46,7 @@ export function proxyBuiltins({ worker = "/kwasm-proxy/sw.js", scope = "/kwasm-p
   async function openTab(port) {
     const tab = window.open("about:blank", "_blank");
     try {
-      (await activeWorker()).postMessage({ type: "kwasm-host" });
+      (await activeWorker()).postMessage({ type: "tabernetes-host" });
     } catch (err) {
       tab?.close();
       throw err;
@@ -56,32 +56,32 @@ export function proxyBuiltins({ worker = "/kwasm-proxy/sw.js", scope = "/kwasm-p
   }
 
   // The status line links every port of "kubectl port-forward" while it
-  // listens. Go calls this when the list changes (kwasm/forwards.go).
-  globalThis.kwasmForwards = (list) => {
+  // listens. Go calls this when the list changes (tabernetes/forwards.go).
+  globalThis.tabernetesForwards = (list) => {
     if (!status) return;
     status.replaceChildren(...list.map(({ port, target }) => {
       const label = `\u21C4 localhost:${port} \u2192 ${target}`;
       if (!sw) {
         const el = document.createElement("span");
-        el.className = "kwasm-port";
+        el.className = "tabernetes-port";
         el.textContent = label;
         return el;
       }
       const a = document.createElement("a");
-      a.className = "kwasm-port";
+      a.className = "tabernetes-port";
       a.href = urlOf(port);
       a.target = "_blank";
       a.textContent = label;
       a.title = `Open localhost:${port} of this tab in a new tab (kubectl port-forward to ${target})`;
       a.addEventListener("click", (e) => {
         e.preventDefault();
-        openTab(port).catch((err) => console.error("kwasm proxy:", err));
+        openTab(port).catch((err) => console.error("tabernetes proxy:", err));
       });
       return a;
     }));
     // A middle click opens the link without the click handler: have the
     // worker ready for it.
-    if (list.length && sw) activeWorker().then((w) => w.postMessage({ type: "kwasm-host" })).catch(() => {});
+    if (list.length && sw) activeWorker().then((w) => w.postMessage({ type: "tabernetes-host" })).catch(() => {});
   };
 
   return {

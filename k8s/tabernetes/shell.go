@@ -79,7 +79,7 @@ func (s *shell) run(src string, out js.Value, builtins js.Value) int {
 	w := jsWriter{out}
 	f, err := syntax.NewParser().Parse(strings.NewReader(src), "")
 	if err != nil {
-		fmt.Fprintf(w, "kwasm: %v\n", err)
+		fmt.Fprintf(w, "tabernetes: %v\n", err)
 		return 2
 	}
 	s.mu.Lock()
@@ -99,7 +99,7 @@ func (s *shell) run(src string, out js.Value, builtins js.Value) int {
 		code = int(st)
 	} else if err != nil {
 		if ctx.Err() == nil {
-			fmt.Fprintf(w, "kwasm: %v\n", err)
+			fmt.Fprintf(w, "tabernetes: %v\n", err)
 		}
 		code = 1
 	}
@@ -146,14 +146,14 @@ func (s *shell) stop() {
 
 // call renames the bare "help" so it reaches the terminal help instead of the
 // bash builtin. "help <builtin>" still goes to the builtin. jobs and kill are
-// builtins mvdan.cc/sh does not implement, kwasm does (jobs.go). history is
+// builtins mvdan.cc/sh does not implement, tabernetes does (jobs.go). history is
 // one, too: the terminal keeps the command lines.
 func (s *shell) call(ctx context.Context, args []string) ([]string, error) {
 	switch {
 	case len(args) == 1 && args[0] == "help":
-		return []string{"kwasm-help"}, nil
+		return []string{"tabernetes-help"}, nil
 	case len(args) > 0 && (args[0] == "jobs" || args[0] == "kill" || args[0] == "history"):
-		return append([]string{"kwasm-" + args[0]}, args[1:]...), nil
+		return append([]string{"tabernetes-" + args[0]}, args[1:]...), nil
 	}
 	return args, nil
 }
@@ -165,13 +165,13 @@ func (s *shell) exec(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		hc.Stdout, hc.Stderr = ctxWriter{ctx, hc.Stdout}, ctxWriter{ctx, hc.Stderr}
 		name := args[0]
 		switch {
-		case name == "kwasm-jobs":
+		case name == "tabernetes-jobs":
 			return jobsCmd(hc)
-		case name == "kwasm-kill":
+		case name == "tabernetes-kill":
 			return killCmd(hc, args[1:])
-		case name == "kwasm-help":
+		case name == "tabernetes-help":
 			return s.callJS(ctx, hc, "help", args[1:])
-		case name == "kwasm-history":
+		case name == "tabernetes-history":
 			return s.callJS(ctx, hc, "history", args[1:])
 		case name == "kubectl" || name == "k":
 			return s.kubectl(ctx, hc, args[1:])
@@ -190,7 +190,7 @@ func (s *shell) exec(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		case s.jsBuiltins.Type() == js.TypeObject && s.jsBuiltins.Get(name).Type() == js.TypeFunction:
 			return s.callJS(ctx, hc, name, args[1:])
 		}
-		fmt.Fprintf(hc.Stderr, "kwasm: %s: command not found (try \"help\")\n", args[0])
+		fmt.Fprintf(hc.Stderr, "tabernetes: %s: command not found (try \"help\")\n", args[0])
 		return interp.ExitStatus(127)
 	}
 	return self

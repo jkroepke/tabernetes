@@ -68,7 +68,7 @@ func commandNames(prefix string, builtins []string) []string {
 	}
 	var out []string
 	for _, n := range names {
-		if strings.HasPrefix(n, prefix) && !strings.HasPrefix(n, "kwasm-") {
+		if strings.HasPrefix(n, prefix) && !strings.HasPrefix(n, "tabernetes-") {
 			out = append(out, n)
 		}
 	}
