@@ -523,6 +523,9 @@ var noise = []string{
 	"Failed to get node when trying to set owner ref to the node lease",
 	"/run/flannel/subnet.env",             // pods start before flannel is ready on this node
 	"Stopped receiving OOM notifications", // /dev/kmsg is /dev/null without --privileged
+	// Every 5 minutes: in the user namespace the kubelet may not read
+	// /proc/1/ns/pid of the agent, so it skips its own OOM score.
+	"failed to find pid namespace of init process",
 	// The kubelet sends events before its client certificate exists.
 	`User \"system:anonymous\" cannot create resource \"events\"`,
 }
