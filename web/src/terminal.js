@@ -54,7 +54,10 @@ export async function startTerminal(el, opts) {
   const t0 = performance.now();
   const since = () => ((performance.now() - t0) / 1000).toFixed(1).padStart(5);
   globalThis.kwasmStatus = (s) => term.writeln(`${DIM(`[${since()}s]`)} ${s}`);
-  const { body, total, cached } = await download(opts.wasmURL);
+  const dl = await download(opts.wasmURL);
+  const { body, cached } = dl;
+  // The page knows the exact size of the file (data-size), the header only maybe.
+  const total = opts.wasmSize || dl.total;
   let loaded = 0;
   // The line must fit into one row: once it wraps, \r only returns to the
   // start of the last row and every update adds a new line.
@@ -71,7 +74,7 @@ export async function startTerminal(el, opts) {
   const counted = body.pipeThrough(new TransformStream({
     transform(chunk, ctl) {
       loaded += chunk.length;
-      term.write(progress(loaded, total || opts.wasmSize));
+      term.write(progress(loaded, total));
       ctl.enqueue(chunk);
     },
   }));
@@ -380,7 +383,7 @@ async function download(url) {
   let cache = null;
   try { cache = await caches.open("kwasm"); } catch { /* no Cache Storage (http, private mode) */ }
   const hit = await cache?.match(url).catch(() => null);
-  if (hit) return { body: hit.body, total: Number(hit.headers.get("content-length")), cached: true };
+  if (hit) return { body: hit.body, total: plainLength(hit), cached: true };
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`download failed: ${resp.status}`);
   if (cache) {
@@ -390,7 +393,15 @@ async function download(url) {
       .then((keys) => Promise.all(keys.filter((k) => k.url !== href).map((k) => cache.delete(k))))
       .catch((e) => console.warn("kwasm: caching the binary failed:", e));
   }
-  return { body: resp.body, total: Number(resp.headers.get("content-length")), cached: false };
+  return { body: resp.body, total: plainLength(resp), cached: false };
+}
+
+// plainLength is the Content-Length when it counts the bytes the body stream
+// yields. With a Content-Encoding (a CDN may gzip the file on the way), it
+// counts the encoded bytes and the progress would end above 100 %.
+function plainLength(resp) {
+  const enc = resp.headers.get("content-encoding");
+  return enc && enc !== "identity" ? 0 : Number(resp.headers.get("content-length")) || 0;
 }
 
 // GitHub Pages sends no Content-Encoding for the binary, so the page unpacks
