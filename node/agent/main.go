@@ -399,9 +399,8 @@ evictionHard:
   nodefs.inodesFree: "1%"
   imagefs.available: "1%"
 imageGCHighThresholdPercent: 100
-# One image at a time: fewer parallel registry connections behind pasta,
-# where downloads now and then stall (see image_pull_progress_timeout).
-serializeImagePulls: true
+# flannel, kube-proxy, CoreDNS and pause are pulled on every join: in parallel.
+serializeImagePulls: false
 localStorageCapacityIsolation: false
 failCgroupV1: false
 `,
@@ -415,8 +414,9 @@ failCgroupV1: false
 		}
 	}
 	// Now and then a registry download stops in the middle and never sends
-	// another byte (seen behind pasta on WSL2). containerd cancels a pull
-	// without progress, and the next try opens new connections and works.
+	// another byte (seen on WSL2 with Docker Desktop, with and without
+	// pasta). containerd cancels a pull without progress, and the next try
+	// opens new connections and works.
 	// Do that after 20 seconds instead of the default five minutes. Shorter
 	// would also cancel healthy downloads that wait for a few TCP retransmits,
 	// and each failed pull costs a growing kubelet back-off.
@@ -453,17 +453,11 @@ failCgroupV1: false
 			return err
 		}
 	}
-	var containerdEnv []string
-	if inUserNS {
-		if proxy := startPullProxy(ctx); proxy != "" {
-			containerdEnv = []string{"HTTPS_PROXY=" + proxy}
-		}
-	}
-	go supervise(ctx, "containerd", containerdEnv, "containerd", "--config=/etc/tabernetes/containerd.toml")
+	go supervise(ctx, "containerd", "containerd", "--config=/etc/tabernetes/containerd.toml")
 	if err := waitForSocket(ctx, "/run/containerd/containerd.sock", 30*time.Second); err != nil {
 		return fmt.Errorf("containerd did not start, see /var/log/containerd.log: %w", err)
 	}
-	go supervise(ctx, "kubelet", nil, "kubelet",
+	go supervise(ctx, "kubelet", "kubelet",
 		"--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf",
 		"--kubeconfig=/var/lib/kubelet/kubeconfig",
 		"--config=/var/lib/kubelet/config.yaml",
@@ -493,15 +487,13 @@ func waitForSocket(ctx context.Context, path string, timeout time.Duration) erro
 	}
 }
 
-// supervise runs a process with extra environment variables, prefixes its
-// output and restarts it when it dies.
-func supervise(ctx context.Context, name string, env []string, bin string, args ...string) {
+// supervise runs a process, prefixes its output and restarts it when it dies.
+func supervise(ctx context.Context, name, bin string, args ...string) {
 	if p, err := exec.LookPath(bin); err == nil {
 		bin = p
 	}
 	for ctx.Err() == nil {
 		cmd := exec.CommandContext(ctx, bin, args...)
-		cmd.Env = append(os.Environ(), env...)
 		out, _ := cmd.StdoutPipe()
 		cmd.Stderr = cmd.Stdout
 		if err := cmd.Start(); err != nil {

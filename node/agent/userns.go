@@ -4,8 +4,7 @@ package main
 // --cap-add SYS_ADMIN), the agent runs itself again in new user, mount,
 // network, cgroup, UTS and IPC namespaces. In there it is root with all capabilities,
 // but only over its own namespaces. pasta connects the new network namespace
-// to the container's network and forwards the WebRTC UDP port. Image pulls
-// skip pasta (pullproxy.go).
+// to the container's network and forwards the WebRTC UDP port.
 
 import (
 	"errors"
@@ -50,11 +49,7 @@ func runInUserNS(udpPort int) int {
 	cmd := exec.Command("/proc/self/exe", os.Args[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = append(os.Environ(), usernsEnv+"=1")
-	dial, err := newOutsideDialer() // see pullproxy.go
-	if err != nil {
-		log.Fatal(err)
-	}
-	cmd.ExtraFiles = []*os.File{r, dial} // fd 3: closed when the network is ready, fd 4: dialFD
+	cmd.ExtraFiles = []*os.File{r} // fd 3: closed when the network is ready
 	// uid and gid 0-65535 stay the same, so files keep their owners. Root in
 	// there has capabilities only over the new namespaces.
 	ids := []syscall.SysProcIDMap{{ContainerID: 0, HostID: 0, Size: 65536}}
@@ -71,7 +66,6 @@ func runInUserNS(udpPort int) int {
 		log.Fatalf("user namespace: %v (needs --security-opt seccomp=unconfined)", err)
 	}
 	r.Close()
-	dial.Close()
 
 	udp := "none"
 	if udpPort > 0 {
@@ -114,7 +108,6 @@ func setupUserNS() error {
 	ready := os.NewFile(3, "ready")
 	_, _ = ready.Read(make([]byte, 1)) // EOF when pasta is done
 	ready.Close()
-	syscall.CloseOnExec(dialFD) // only for startPullProxy
 
 	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make / private: %w", err)
