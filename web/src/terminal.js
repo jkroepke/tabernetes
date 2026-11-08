@@ -19,6 +19,24 @@ export async function startTerminal(el, opts) {
   term.loadAddon(fit);
   term.open(el);
   fit.fit();
+  // Windows and Linux copy and paste with Ctrl, which xterm.js sends to the
+  // shell as ^C and ^V. Like Windows Terminal: Ctrl-C copies while text is
+  // selected and cancels otherwise, Ctrl-V (and Ctrl-Shift-C/V) leave the
+  // clipboard to the browser. macOS has Cmd-C and Cmd-V for that.
+  if (!/Mac|iPhone|iPad/.test(navigator.platform)) {
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== "keydown" || !e.ctrlKey || e.altKey || e.metaKey) return true;
+      const key = e.key.toLowerCase();
+      if (key === "c" && (e.shiftKey || term.hasSelection())) {
+        if (term.hasSelection()) navigator.clipboard?.writeText(term.getSelection()).catch(() => {});
+        term.clearSelection();
+        e.preventDefault();
+        return false;
+      }
+      // The browser then fires a paste event, which xterm.js reads.
+      return key !== "v";
+    });
+  }
   new ResizeObserver(() => fit.fit()).observe(el);
 
   const logs = [];

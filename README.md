@@ -45,7 +45,8 @@ browser tab (single wasm binary)                     docker run kwasm-node
   `k port-forward deploy/web 8080:80 &` and `wget -qO- localhost:8080` work.
 - `cmd &` runs in the background, `jobs` lists the jobs, `kill %1` stops one.
   Ctrl-C stops the foreground command, `kubectl port-forward` and
-  `kubectl proxy` included.
+  `kubectl proxy` included. On Windows and Linux, Ctrl-C copies instead while
+  text is selected, and Ctrl-V pastes.
 - `proxy 8080` opens `localhost:8080` of the Wasm in a new browser tab. A
   service worker under `/kwasm-proxy/` (`static/kwasm-proxy/sw.js`) hands
   every request of that tab to the terminal tab, which sends it to the
