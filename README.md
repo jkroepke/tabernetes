@@ -50,7 +50,9 @@ browser tab (single wasm binary)                     docker run kwasm-node
   service worker under `/kwasm-proxy/` (`static/kwasm-proxy/sw.js`) hands
   every request of that tab to the terminal tab, which sends it to the
   in-process network. The tab works as long as the terminal tab is open;
-  leaving the terminal page unregisters the worker.
+  leaving the terminal page unregisters the worker. While
+  `kubectl port-forward` runs, the status line under the terminal links each
+  of its local ports the same way (`k8s/kwasm/forwards.go`).
 - `free` shows the WebAssembly memory (wasm32 ends at 4 GiB, and the linear
   memory never shrinks), the Go heap and the number of goroutines.
 - `vi` (`k8s/kwasm/vi.go`) is a small vi for manifests. It runs in raw mode:

@@ -166,6 +166,39 @@ var BackgroundContext = func(ctx context.Context, stmt *syntax.Stmt) (context.Co
 	edit("staging/src/k8s.io/kubectl/pkg/cmd/portforward/portforward.go",
 		"cmdutil.CheckErr(opts.RunPortForward())", "cmdutil.CheckErr(opts.RunPortForwardContext(cmd.Context()))",
 	)
+	// The status line under the terminal links every forwarded port
+	// (kwasm/forwards.go).
+	edit("staging/src/k8s.io/kubectl/pkg/cmd/portforward/portforward.go",
+		"\treturn fw.ForwardPorts()\n}",
+		`	stopped := make(chan struct{}) // kwasm: report the ports while they listen
+	defer close(stopped)
+	go func() {
+		select {
+		case <-opts.ReadyChannel:
+		case <-stopped:
+			return
+		}
+		ports, err := fw.GetPorts()
+		if err != nil {
+			return
+		}
+		done := OnForward(opts.Namespace, opts.PodName, ports)
+		<-stopped
+		done()
+	}()
+	return fw.ForwardPorts()
+}`,
+	)
+	write("staging/src/k8s.io/kubectl/pkg/cmd/portforward/kwasm.go", `package portforward
+
+import "k8s.io/client-go/tools/portforward"
+
+// OnForward is called when the local ports listen and returns the func called
+// when they stop. Added by kwasm (k8s/patch.go).
+var OnForward = func(namespace, pod string, ports []portforward.ForwardedPort) func() {
+	return func() {}
+}
+`)
 	edit("staging/src/k8s.io/kubectl/pkg/cmd/proxy/proxy.go",
 		"import (\n", "import (\n\t\"context\"\n",
 		"cmdutil.CheckErr(o.RunProxy())", "cmdutil.CheckErr(o.runProxyContext(cmd.Context()))",

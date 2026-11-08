@@ -5,7 +5,7 @@
 const B = (s) => `\x1b[1m${s}\x1b[0m`;
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
 
-export function proxyBuiltins({ worker = "/kwasm-proxy/sw.js", scope = "/kwasm-proxy/" } = {}) {
+export function proxyBuiltins({ worker = "/kwasm-proxy/sw.js", scope = "/kwasm-proxy/", status } = {}) {
   const sw = navigator.serviceWorker;
   if (sw) {
     sw.addEventListener("message", async (e) => {
@@ -38,6 +38,52 @@ export function proxyBuiltins({ worker = "/kwasm-proxy/sw.js", scope = "/kwasm-p
     return reg.active;
   }
 
+  const urlOf = (port) => new URL(`${scope}${port}/`, location.href).href;
+
+  // openTab opens localhost:<port> in a new tab. window.open needs the click
+  // or key press that started it: open the tab first, the worker is ready
+  // before the tab sends its request.
+  async function openTab(port) {
+    const tab = window.open("about:blank", "_blank");
+    try {
+      (await activeWorker()).postMessage({ type: "kwasm-host" });
+    } catch (err) {
+      tab?.close();
+      throw err;
+    }
+    if (tab) tab.location.href = urlOf(port);
+    return tab;
+  }
+
+  // The status line links every port of "kubectl port-forward" while it
+  // listens. Go calls this when the list changes (kwasm/forwards.go).
+  globalThis.kwasmForwards = (list) => {
+    if (!status) return;
+    status.replaceChildren(...list.map(({ port, target }) => {
+      const label = `\u21C4 localhost:${port} \u2192 ${target}`;
+      if (!sw) {
+        const el = document.createElement("span");
+        el.className = "kwasm-port";
+        el.textContent = label;
+        return el;
+      }
+      const a = document.createElement("a");
+      a.className = "kwasm-port";
+      a.href = urlOf(port);
+      a.target = "_blank";
+      a.textContent = label;
+      a.title = `Open localhost:${port} of this tab in a new tab (kubectl port-forward to ${target})`;
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        openTab(port).catch((err) => console.error("kwasm proxy:", err));
+      });
+      return a;
+    }));
+    // A middle click opens the link without the click handler: have the
+    // worker ready for it.
+    if (list.length && sw) activeWorker().then((w) => w.postMessage({ type: "kwasm-host" })).catch(() => {});
+  };
+
   return {
     async proxy(args, { term }) {
       const port = Number(args[0]);
@@ -52,18 +98,14 @@ export function proxyBuiltins({ worker = "/kwasm-proxy/sw.js", scope = "/kwasm-p
         term.writeln("proxy: this browser offers no service workers here (private mode?)");
         return 1;
       }
-      // window.open needs the key press that started the command: open the
-      // tab first, the worker is ready before the tab sends its request.
-      const url = new URL(`${scope}${port}/`, location.href).href;
-      const tab = window.open("about:blank", "_blank");
+      const url = urlOf(port);
+      let tab;
       try {
-        (await activeWorker()).postMessage({ type: "kwasm-host" });
+        tab = await openTab(port);
       } catch (err) {
-        tab?.close();
         term.writeln(`proxy: ${err.message}`);
         return 1;
       }
-      if (tab) tab.location.href = url;
       term.writeln(`${tab ? "Opened" : "Open"} ${url}`);
       term.writeln(DIM(`It shows localhost:${port} of this tab and works while this tab is open.`));
       return 0;

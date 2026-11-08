@@ -4,6 +4,11 @@ import { joinBuiltins } from "./join.js";
 import { proxyBuiltins } from "./proxy.js";
 
 const el = document.getElementById("kwasm");
+// The status line under the terminal: the nodes, then the forwarded ports.
+const status = document.getElementById("kwasm-status");
+const nodes = document.createElement("span");
+const ports = document.createElement("span");
+status?.append(nodes, ports);
 startTerminal(el, {
   wasmURL: el.dataset.wasm,
   workerURL: el.dataset.worker,
@@ -12,9 +17,9 @@ startTerminal(el, {
     ...joinBuiltins({
       image: el.dataset.image || KWASM_NODE_IMAGE,
       stun: el.dataset.stun ?? undefined,
-      status: document.getElementById("kwasm-status"),
+      status: status && nodes,
     }),
-    ...proxyBuiltins(),
+    ...proxyBuiltins({ status: status && ports }),
   },
 }).then((t) => (globalThis.kwasmTerminal = t)).catch((e) => {
   el.textContent = "kwasm failed to start: " + e;
