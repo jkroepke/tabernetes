@@ -453,11 +453,17 @@ failCgroupV1: false
 			return err
 		}
 	}
-	go supervise(ctx, "containerd", "containerd", "--config=/etc/tabernetes/containerd.toml")
+	var containerdEnv []string
+	if inUserNS {
+		if proxy := startPullProxy(ctx); proxy != "" {
+			containerdEnv = []string{"HTTPS_PROXY=" + proxy}
+		}
+	}
+	go supervise(ctx, "containerd", containerdEnv, "containerd", "--config=/etc/tabernetes/containerd.toml")
 	if err := waitForSocket(ctx, "/run/containerd/containerd.sock", 30*time.Second); err != nil {
 		return fmt.Errorf("containerd did not start, see /var/log/containerd.log: %w", err)
 	}
-	go supervise(ctx, "kubelet", "kubelet",
+	go supervise(ctx, "kubelet", nil, "kubelet",
 		"--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf",
 		"--kubeconfig=/var/lib/kubelet/kubeconfig",
 		"--config=/var/lib/kubelet/config.yaml",
@@ -487,13 +493,15 @@ func waitForSocket(ctx context.Context, path string, timeout time.Duration) erro
 	}
 }
 
-// supervise runs a process, prefixes its output and restarts it when it dies.
-func supervise(ctx context.Context, name, bin string, args ...string) {
+// supervise runs a process with extra environment variables, prefixes its
+// output and restarts it when it dies.
+func supervise(ctx context.Context, name string, env []string, bin string, args ...string) {
 	if p, err := exec.LookPath(bin); err == nil {
 		bin = p
 	}
 	for ctx.Err() == nil {
 		cmd := exec.CommandContext(ctx, bin, args...)
+		cmd.Env = append(os.Environ(), env...)
 		out, _ := cmd.StdoutPipe()
 		cmd.Stderr = cmd.Stdout
 		if err := cmd.Start(); err != nil {

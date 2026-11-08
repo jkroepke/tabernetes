@@ -149,6 +149,10 @@ with all capabilities, but only over these namespaces:
 - pasta copies the container's address into the new network namespace, NATs
   outgoing traffic and forwards the WebRTC UDP port. WebRTC, flannel and
   kube-proxy work as before.
+- Image pulls skip pasta. containerd uses a CONNECT proxy of the agent on
+  127.0.0.1 (`agent/pullproxy.go`), and the agent outside dials the registry in
+  the container's network and hands the socket in. Behind pasta, downloads on
+  WSL2 sometimes stopped in the middle.
 - A new `cgroup2` mount gives the kubelet a writable cgroup tree.
 - The kubelet runs with the feature gate `KubeletInUserNamespace`.
   containerd runs with `restrict_oom_score_adj` and without AppArmor.
