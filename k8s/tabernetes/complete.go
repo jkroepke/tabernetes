@@ -57,7 +57,7 @@ func (s *shell) complete(line string, builtins []string) completion {
 }
 
 func commandNames(prefix string, builtins []string) []string {
-	names := append([]string{"kubectl", "k"}, builtins...)
+	names := append([]string{"kubectl", "k", "doom"}, builtins...)
 	for name := range coreutils {
 		names = append(names, name)
 	}

@@ -175,6 +175,8 @@ func (s *shell) exec(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 			return s.callJS(ctx, hc, "history", args[1:])
 		case name == "kubectl" || name == "k":
 			return s.kubectl(ctx, hc, args[1:])
+		case name == "doom":
+			return doomCmd(ctx, hc, args[1:], self)
 		case interp.IsBuiltin(name):
 			// reached through xargs, for example "xargs echo"
 			if err := hc.Builtin(ctx, args); err != nil {

@@ -2,6 +2,7 @@ import "./wasm_exec.js";
 import { startTerminal } from "./terminal.js";
 import { joinBuiltins } from "./join.js";
 import { proxyBuiltins } from "./proxy.js";
+import { vncBuiltins } from "./vnc.js";
 
 const el = document.getElementById("tabernetes");
 // The status line under the terminal: the nodes, then the forwarded ports.
@@ -20,6 +21,7 @@ startTerminal(el, {
       status: status && nodes,
     }),
     ...proxyBuiltins({ status: status && ports }),
+    ...vncBuiltins({ box: el.parentElement }),
   },
 }).then((t) => (globalThis.tabernetesTerminal = t)).catch((e) => {
   el.textContent = "Tabernetes failed to start: " + e;

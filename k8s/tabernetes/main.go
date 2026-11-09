@@ -318,6 +318,8 @@ func main() {
 
 	// proxy(port, method, path, headers, body): Promise<{status, statusText, headers, body}>, see proxy.go
 	api.Set("proxy", js.FuncOf(func(this js.Value, a []js.Value) any { return proxyJS(a) }))
+	// tabernetes.dial(port, onData, onClose) for the VNC viewer, see dial.go.
+	api.Set("dial", js.FuncOf(func(this js.Value, a []js.Value) any { return dialJS(a) }))
 
 	// prepareJoin(open: (label: string) => Promise<RTCDataChannel>): Promise<{name, ip, token, ca, caHash}>
 	api.Set("prepareJoin", js.FuncOf(func(this js.Value, a []js.Value) any {

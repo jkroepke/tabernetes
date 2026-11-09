@@ -1,0 +1,82 @@
+# KubeDoom (https://github.com/storax/kubedoom): every pod of the default
+# namespace is a monster. Shoot it and KubeDoom deletes the pod. Applied by the
+# doom command (doom.go).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubedoom
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubedoom
+  namespace: kubedoom
+---
+# Upstream binds cluster-admin. Listing and deleting pods in default is enough.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubedoom
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubedoom
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubedoom
+subjects:
+- kind: ServiceAccount
+  name: kubedoom
+  namespace: kubedoom
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubedoom
+  namespace: kubedoom
+  labels: {app: kubedoom}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: kubedoom}
+  template:
+    metadata:
+      labels: {app: kubedoom}
+    spec:
+      serviceAccountName: kubedoom
+      containers:
+      - name: kubedoom
+        image: ghcr.io/storax/kubedoom:0.6.0
+        env:
+        - {name: NAMESPACE, value: default}
+        ports:
+        - {name: vnc, containerPort: 5900}
+---
+# Something to shoot. pause comes with the node image, so the monsters start
+# right away, and the Deployment brings back every one you kill.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monsters
+  namespace: default
+  labels: {app: monsters}
+spec:
+  replicas: 5
+  selector:
+    matchLabels: {app: monsters}
+  template:
+    metadata:
+      labels: {app: monsters}
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+      - name: monster
+        image: registry.k8s.io/pause:3.10.2
