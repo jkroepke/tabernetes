@@ -78,23 +78,30 @@ browser tab (single wasm binary)                     docker run tabernetes
   over MessagePorts. When that tab closes, the node agent exits, and the
   worker deletes its node. Without SharedWorker or Web Locks (Chrome on Android),
   the tab runs the control plane itself, as before.
-- `llm [model]` runs a language model on the GPU of the tab. The tab node
-  (`k8s/tabernetes/tabnode.go`) has no
-  container runtime; a small kubelet in the Wasm registers the node `tab-1`
-  (lease, status, taint `tabernetes.dev/tab`, `kubernetes.io/os=browser`, so
-  the DaemonSets stay away, and the extended resource `tabernetes.dev/webgpu`),
-  runs the pods bound to it and serves logs, exec and port-forward on
-  `10.0.1.1:10250` with the streaming code of the upstream kubelet
-  (`k8s.io/cri-streaming`). An image `webllm:<model>` is a
-  [WebLLM](https://webllm.mlc.ai) model ID (`k8s/tabernetes/webllm.go`): a
+- `llm [model]` deploys a language model to the GPU of a tab: it applies the
+  Deployment `llm` and returns, as `kubectl create deployment` would. The
+  scheduler prefers the tab that ran `llm`; when that tab closes, the pod
+  moves to another tab with WebGPU. The tab node (`k8s/tabernetes/tabnode.go`)
+  has no container runtime; a small kubelet in the Wasm registers the node
+  `tab-1` (lease, status, taint `tabernetes.dev/tab`,
+  `kubernetes.io/os=browser`, so the DaemonSets stay away, and the extended
+  resource `tabernetes.dev/webgpu`), runs the pods bound to it and serves
+  logs, exec and port-forward on `10.0.1.1:10250` with the streaming code of
+  the upstream kubelet (`k8s.io/cri-streaming`). An image `webllm:<model>` is
+  a [WebLLM](https://webllm.mlc.ai) model ID (`k8s/tabernetes/webllm.go`): a
   worker (`web/src/gpuworker.js`) loads the weights from Hugging Face, which
   allows CORS, and keeps them in the Cache Storage. Container registries do
-  not send CORS headers, so the tab cannot pull images. The pod serves the
-  OpenAI chat API on port 8000, and `kubectl exec llm -- chat [question]`
-  answers on the terminal. `llm` chats through `kubectl exec -i`; without a
-  tty, it edits the lines itself and sends Ctrl-C as `\x03`. It needs WebGPU
-  (Chrome or Edge); without `shader-f16` it takes the `q4f32` variant of the
-  default model, Qwen2.5 1.5B.
+  not send CORS headers, so the tab cannot pull images. The download of the
+  weights is the image pull, with the events of the kubelet (`Pulling`,
+  `Pulled` with the size, or `already present on machine` from the cache, then
+  `Created` and `Started`); a failed download is `ErrImagePull` and
+  `ImagePullBackOff`. The pod serves the OpenAI chat API on port 8000, and
+  `kubectl exec deploy/llm -- chat [question]` answers on the terminal. The
+  shell has no tty: for `kubectl exec -i` (and `-it`) on the terminal, it
+  edits the lines itself and sends Ctrl-C as `\x03`
+  (`k8s/tabernetes/exec.go`). `llm` needs WebGPU (Chrome or Edge); without
+  `shader-f16` it takes the `q4f32` variant of the default model, Qwen2.5
+  1.5B.
 - `free` shows the WebAssembly memory (wasm32 ends at 4 GiB, and the linear
   memory never shrinks), the Go heap and the number of goroutines.
 - `vi` (`k8s/tabernetes/vi.go`) is a small vi for manifests. It runs in raw mode:

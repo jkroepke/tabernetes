@@ -100,6 +100,7 @@ type tabNode struct {
 	cs      kubernetes.Interface
 	gpu     *gpuInfo
 	rec     record.EventRecorder
+	events  chan tabEvent
 	ca      *pki
 	podCIDR *net.IPNet
 
@@ -149,12 +150,14 @@ func newTabNode(ctx context.Context) (*tabNode, error) {
 	b := record.NewBroadcaster(record.WithContext(context.Background()))
 	b.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: cs.CoreV1().Events("")})
 	n := &tabNode{
-		cs:   cs,
-		gpu:  gpu,
-		rec:  b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "kubelet", Host: tabNodeName}),
-		ca:   current.ca,
-		pods: map[types.UID]*tabPod{},
+		cs:     cs,
+		gpu:    gpu,
+		rec:    b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "kubelet", Host: tabNodeName}),
+		ca:     current.ca,
+		pods:   map[types.UID]*tabPod{},
+		events: make(chan tabEvent, 256),
 	}
+	go n.recordEvents()
 	if err := n.serveKubelet(); err != nil {
 		return nil, err
 	}
@@ -476,3 +479,32 @@ func (b *logBuffer) since(i int) ([]logLine, int, <-chan struct{}) {
 }
 
 var _ io.Writer = (*logBuffer)(nil)
+
+type tabEvent struct {
+	ref                  *corev1.ObjectReference
+	typ, reason, message string
+}
+
+// event records an event of the node. It never blocks: a JS callback may
+// call it.
+func (n *tabNode) event(ref *corev1.ObjectReference, typ, reason, message string) {
+	select {
+	case n.events <- tabEvent{ref, typ, reason, message}:
+	default:
+	}
+}
+
+// recordEvents hands the events to the recorder, one per millisecond. The
+// recorder names an event after the time in nanoseconds, and the clock of
+// js/wasm counts milliseconds: two events in the same millisecond would get
+// the same name, and the second one would be lost.
+func (n *tabNode) recordEvents() {
+	var last time.Time
+	for e := range n.events {
+		for !time.Now().Truncate(time.Millisecond).After(last) {
+			time.Sleep(time.Millisecond)
+		}
+		n.rec.Event(e.ref, e.typ, e.reason, e.message)
+		last = time.Now().Truncate(time.Millisecond)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,21 +49,43 @@ func newWebLLM(tp *tabPod, model string) (workload, error) {
 
 func (m *webLLM) imageID() string { return "webllm://" + m.model }
 
-func (m *webLLM) start(ctx context.Context, log io.Writer) error {
+// fetchedMB matches the progress of WebLLM while it downloads the weights.
+var fetchedMB = regexp.MustCompile(`^Fetching param cache\[\d+/\d+\]: (\d+)MB fetched`)
+
+func (m *webLLM) start(ctx context.Context, log io.Writer, pull *imagePull) error {
 	gpu := js.Global().Get("tabernetesGPU")
 	if gpu.Type() != js.TypeObject {
 		return errors.New("this page has no GPU support")
 	}
+	// The weights are the image: downloading them is the pull, and the
+	// container starts with the shaders. The log begins there.
+	var size int64
 	progress := js.FuncOf(func(_ js.Value, a []js.Value) any {
-		fmt.Fprintln(log, a[0].String())
+		text := a[0].String()
+		switch {
+		case strings.HasPrefix(text, "Fetching param cache"):
+			pull.fetching()
+			if mb := fetchedMB.FindStringSubmatch(text); mb != nil {
+				n, _ := strconv.ParseInt(mb[1], 10, 64)
+				size = n << 20
+			}
+			return nil
+		case strings.HasPrefix(text, "Loading model from cache"):
+			return nil
+		}
+		if !pull.wasPulled() {
+			pull.done(size)
+			fmt.Fprintf(log, "loading %s with WebLLM on %s\n", m.model, m.tp.n.gpu)
+		}
+		fmt.Fprintln(log, text)
 		return nil
 	})
 	m.funcs = append(m.funcs, progress)
-	fmt.Fprintf(log, "loading %s with WebLLM on %s\n", m.model, m.tp.n.gpu)
 	m.h = gpu.Call("start", m.model, progress)
 	if _, err := awaitPromise(ctx, m.h.Get("ready")); err != nil {
 		return err
 	}
+	pull.done(size)
 	ln, err := net.Listen("tcp", net.JoinHostPort(m.tp.ip, strconv.Itoa(webllmPort)))
 	if err != nil {
 		return err

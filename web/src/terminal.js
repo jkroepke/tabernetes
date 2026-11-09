@@ -191,7 +191,7 @@ export async function startTerminal(el, opts) {
         "  proxy <port>             open localhost:<port> (kubectl port-forward) in a new tab",
         "  vnc <port> [password]    show the VNC server on localhost:<port> on top of the terminal",
         "  doom                     KubeDoom on the node: shoot the pods of the default namespace",
-        "  llm [model]              the tab joins as a node and runs a language model on its GPU (WebGPU)",
+        "  llm [model]              deploys a language model to the GPU of a tab (WebGPU)",
         "  logs [n]                 the last n lines of the control plane logs",
         "  history [n] | -c         the commands of this tab (Ctrl-R searches them)",
         "  clear                    clear the screen",

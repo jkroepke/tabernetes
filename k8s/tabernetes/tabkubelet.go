@@ -77,6 +77,14 @@ func (n *tabNode) serveLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	follow, timestamps := q.Get("follow") == "true", q.Get("timestamps") == "true"
 	lines, next, more := tp.logs.since(0)
+	tp.mu.Lock()
+	waiting := tp.status.State.Waiting
+	tp.mu.Unlock()
+	if waiting != nil && next == 0 {
+		// as the kubelet says it while the image is pulled
+		http.Error(w, fmt.Sprintf("container %q in pod %q is waiting to start: %s", tp.container.Name, tp.name, waiting.Reason), http.StatusBadRequest)
+		return
+	}
 	if s := q.Get("tailLines"); s != "" {
 		if t, err := strconv.Atoi(s); err == nil && t >= 0 && t < len(lines) {
 			lines = lines[len(lines)-t:]

@@ -20,9 +20,9 @@ import (
 
 // workload is what runs in place of a container on the tab node.
 type workload interface {
-	// start loads the workload and returns once it runs. It writes its
-	// progress to log (kubectl logs).
-	start(ctx context.Context, log io.Writer) error
+	// start loads the workload and returns once it runs. It reports the
+	// download to pull, and writes to log (kubectl logs) once that is done.
+	start(ctx context.Context, log io.Writer, pull *imagePull) error
 	// exec runs a command of the workload (kubectl exec).
 	exec(ctx context.Context, cmd []string, in io.Reader, out, errOut io.Writer) error
 	// dial connects to a port of the pod (kubectl port-forward).
@@ -104,7 +104,7 @@ func (n *tabNode) newPod(pod *corev1.Pod) *tabPod {
 }
 
 func (tp *tabPod) event(typ, reason, msg string) {
-	tp.n.rec.Event(tp.ref, typ, reason, msg)
+	tp.n.event(tp.ref, typ, reason, msg)
 }
 
 // run starts the workload and restarts it after a failure, with the same
@@ -124,15 +124,30 @@ func (tp *tabPod) run() {
 			tp.setWaiting("ErrImagePull", err.Error())
 			return
 		}
-		tp.event(corev1.EventTypeNormal, "Pulling", fmt.Sprintf("Loading %q onto the GPU", tp.container.Image))
-		t0 := time.Now()
-		err = w.start(ctx, tp.logs)
+		pull := &imagePull{tp: tp, t0: time.Now()}
+		err = w.start(ctx, tp.logs, pull)
 		if ctx.Err() != nil {
 			w.stop()
 			return
 		}
 		if err != nil {
 			w.stop()
+			if !pull.wasPulled() {
+				// the download failed: the kubelet calls that a failed pull
+				image := tp.container.Image
+				tp.event(corev1.EventTypeWarning, "Failed", fmt.Sprintf("Failed to pull image %q: %v", image, err))
+				tp.event(corev1.EventTypeWarning, "Failed", "Error: ErrImagePull")
+				tp.setWaiting("ErrImagePull", err.Error())
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				tp.event(corev1.EventTypeNormal, "BackOff", fmt.Sprintf("Back-off pulling image %q", image))
+				tp.setWaiting("ImagePullBackOff", fmt.Sprintf("Back-off pulling image %q: ErrImagePull: %v", image, err))
+				backoff = min(backoff*2, backoffMax)
+				continue
+			}
 			fmt.Fprintln(tp.logs, "error:", err)
 			tp.event(corev1.EventTypeWarning, "Failed", err.Error())
 			tp.setTerminated(err)
@@ -150,12 +165,59 @@ func (tp *tabPod) run() {
 			backoff = min(backoff*2, backoffMax)
 			continue
 		}
-		tp.event(corev1.EventTypeNormal, "Pulled", fmt.Sprintf("Successfully loaded %q in %s", tp.container.Image, time.Since(t0).Round(time.Millisecond)))
-		tp.event(corev1.EventTypeNormal, "Created", "Created container: "+tp.container.Name)
+		pull.done(0)
 		tp.event(corev1.EventTypeNormal, "Started", "Started container "+tp.container.Name)
 		tp.setRunning(w)
 		return
 	}
+}
+
+// imagePull tells the events of a pod what the kubelet would say about an
+// image pull, for a workload that downloads what it runs: the model of
+// webllm comes from Hugging Face, or from the browser cache.
+type imagePull struct {
+	tp      *tabPod
+	t0      time.Time
+	mu      sync.Mutex
+	pulling bool // the download started
+	pulled  bool // the download is done, the container is created
+}
+
+// fetching says that the workload downloads, not that it reads its cache.
+func (p *imagePull) fetching() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pulling || p.pulled {
+		return
+	}
+	p.pulling = true
+	p.tp.event(corev1.EventTypeNormal, "Pulling", fmt.Sprintf("Pulling image %q", p.tp.container.Image))
+}
+
+// done says that the download is complete, with its size if known. Without
+// a download, the image was already there.
+func (p *imagePull) done(size int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pulled {
+		return
+	}
+	p.pulled = true
+	image := p.tp.container.Image
+	if p.pulling {
+		d := time.Since(p.t0).Truncate(time.Millisecond)
+		p.tp.event(corev1.EventTypeNormal, "Pulled", fmt.Sprintf("Successfully pulled image %q in %v (%v including waiting). Image size: %d bytes.", image, d, d, size))
+	} else {
+		p.tp.event(corev1.EventTypeNormal, "Pulled", fmt.Sprintf("Container image %q already present on machine and can be accessed by the pod", image))
+	}
+	p.tp.event(corev1.EventTypeNormal, "Created", "Created container: "+p.tp.container.Name)
+}
+
+// wasPulled reports whether the download was done.
+func (p *imagePull) wasPulled() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pulled
 }
 
 // stop ends the workload. With a reason, it tells the pod's events.
