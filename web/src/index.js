@@ -4,6 +4,7 @@ import { joinBuiltins } from "./join.js";
 import { proxyBuiltins } from "./proxy.js";
 import { vncBuiltins } from "./vnc.js";
 import { gpuAPI } from "./gpu.js";
+import { connectCluster } from "./tabs.js";
 
 const el = document.getElementById("tabernetes");
 // llm: the tab node runs language models with WebGPU (k8s/tabernetes/webllm.go).
@@ -13,7 +14,13 @@ const status = document.getElementById("tabernetes-status");
 const nodes = document.createElement("span");
 const ports = document.createElement("span");
 status?.append(nodes, ports);
+// The control plane runs in a shared worker, so that every tab of the page
+// is a node of the same cluster and any of them may close.
+const cluster = el.dataset.cluster
+  ? await connectCluster(el.dataset.cluster).catch((e) => { console.warn("tabernetes:", e); return null; })
+  : null;
 startTerminal(el, {
+  cluster,
   wasmURL: el.dataset.wasm,
   workerURL: el.dataset.worker,
   wasmSize: Number(el.dataset.size) || 0,
@@ -22,6 +29,7 @@ startTerminal(el, {
       image: el.dataset.image || TABERNETES_IMAGE,
       stun: el.dataset.stun ?? undefined,
       status: status && nodes,
+      cluster,
     }),
     ...proxyBuiltins({ status: status && ports }),
     ...vncBuiltins({ box: el.parentElement }),

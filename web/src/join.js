@@ -42,7 +42,7 @@ const STATES = {
 
 // joinBuiltins returns the join and accept commands. status is an element
 // that shows every node and the state of its WebRTC connection.
-export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", status }) {
+export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", status, cluster }) {
   const nodes = [];
   let pending = null;
   let seq = 0;
@@ -93,14 +93,19 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
       }
       const pc = new RTCPeerConnection({ iceServers: stun ? [{ urls: stun }] : [] });
       pc.createDataChannel("ctl");
-      pc.ondatachannel = (e) => globalThis.tabernetes.attachChannel(e.channel);
+      // With the control plane in the shared worker, the data channels go on there.
+      pc.ondatachannel = (e) => cluster ? cluster.bridge(e.channel) : globalThis.tabernetes.attachChannel(e.channel);
       const open = (label) => new Promise((resolve, reject) => {
         const dc = pc.createDataChannel(label);
         const t = setTimeout(() => reject(new Error("data channel timeout")), 15000);
         dc.onopen = () => { clearTimeout(t); resolve(dc); };
         dc.onerror = (e) => { clearTimeout(t); reject(e.error || new Error("data channel error")); };
       });
-      const info = await globalThis.tabernetes.prepareJoin(open);
+      let info;
+      if (cluster) {
+        info = await cluster.rpc("prepareJoin");
+        cluster.dataChannels.set(info.name, open);
+      } else info = await globalThis.tabernetes.prepareJoin(open);
       await pc.setLocalDescription(await pc.createOffer());
       await gatheringComplete(pc, 3000);
       if (!active()) { pc.close(); return; } // Ctrl-C while preparing

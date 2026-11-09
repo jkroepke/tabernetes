@@ -117,18 +117,116 @@ func splice(a, b io.ReadWriteCloser) {
 	go func() { io.Copy(b, a); once.Do(closeBoth) }()
 }
 
+// portConn adapts a MessagePort to an io.ReadWriteCloser. It carries the
+// connections between the tabs and the control plane in the SharedWorker
+// (tabs.go): every message is an ArrayBuffer of data, null ends the
+// connection. The buffers are transferred, not copied.
+type portConn struct {
+	port   js.Value
+	mu     sync.Mutex
+	cond   *sync.Cond
+	buf    []byte
+	closed bool
+	onMsg  js.Func
+}
+
+func newPortConn(port js.Value) *portConn {
+	c := &portConn{port: port}
+	c.cond = sync.NewCond(&c.mu)
+	c.onMsg = js.FuncOf(func(this js.Value, a []js.Value) any {
+		data := a[0].Get("data")
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if data.Type() != js.TypeObject {
+			c.closed = true
+		} else {
+			arr := js.Global().Get(uint8ArrayCtr).New(data)
+			n := len(c.buf)
+			c.buf = append(c.buf, make([]byte, arr.Get("length").Int())...)
+			js.CopyBytesToGo(c.buf[n:], arr)
+		}
+		c.cond.Broadcast()
+		return nil
+	})
+	port.Set("onmessage", c.onMsg) // starts the port
+	return c
+}
+
+func (c *portConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for len(c.buf) == 0 && !c.closed {
+		c.cond.Wait()
+	}
+	if len(c.buf) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, c.buf)
+	c.buf = c.buf[n:]
+	if len(c.buf) == 0 {
+		c.buf = nil
+	}
+	return n, nil
+}
+
+func (c *portConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return 0, io.ErrClosedPipe
+	}
+	arr := js.Global().Get(uint8ArrayCtr).New(len(p))
+	js.CopyBytesToJS(arr, p)
+	buf := arr.Get("buffer")
+	c.port.Call("postMessage", buf, []any{buf})
+	return len(p), nil
+}
+
+func (c *portConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed && c.onMsg.IsUndefined() {
+		return nil
+	}
+	c.closed = true
+	c.cond.Broadcast()
+	c.port.Call("postMessage", js.Null())
+	c.port.Call("close")
+	// No more messages arrive on a closed port.
+	c.port.Set("onmessage", js.Null())
+	c.onMsg.Release()
+	c.onMsg = js.Func{}
+	return nil
+}
+
+// newJSConn wraps what JS hands over for a connection: an RTCDataChannel
+// (join) or a MessagePort (tabs.go).
+func newJSConn(v js.Value) io.ReadWriteCloser {
+	if v.Get("bufferedAmount").Type() == js.TypeNumber {
+		return newDCConn(v)
+	}
+	return newPortConn(v)
+}
+
 // attachChannel is called from JS for every data channel the node agent opens.
-// Label "api" tunnels to the kube-apiserver.
 func attachChannel(dc js.Value) {
-	label := dc.Get("label").String()
-	conn := newDCConn(dc)
+	attach(newDCConn(dc), dc.Get("label").String())
+}
+
+// attach connects a connection that the other side opened to its target:
+// "api" tunnels to the kube-apiserver, "kubelet" to the kubelet API of this
+// tab (tabkubelet.go).
+func attach(conn io.ReadWriteCloser, label string) {
 	go func() {
 		var target string
 		switch label {
 		case "api":
 			target = "127.0.0.1:6443"
+		case "kubelet", "kubelet:10250":
+			target = tabNodeIP + ":10250"
 		default:
-			fmt.Fprintln(os.Stderr, "tabernetes: unknown data channel", label)
+			fmt.Fprintln(os.Stderr, "tabernetes: unknown connection", label)
 			conn.Close()
 			return
 		}
@@ -145,7 +243,7 @@ func attachChannel(dc js.Value) {
 type joinedNode struct {
 	name string
 	ip   string
-	open js.Value // JS function(label) => Promise<RTCDataChannel>
+	open js.Value // JS function(label) => Promise<RTCDataChannel or MessagePort>
 	ln   net.Listener
 }
 
@@ -222,7 +320,7 @@ func (jn *joinedNode) serve() {
 				tcp.Close()
 				return
 			}
-			splice(newDCConn(dc), tcp)
+			splice(newJSConn(dc), tcp)
 		}()
 	}
 }

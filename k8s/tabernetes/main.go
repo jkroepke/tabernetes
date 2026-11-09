@@ -270,10 +270,25 @@ func main() {
 		status = func(s string) { cb.Invoke(s) }
 	}
 
+	// tabernetesRole "tab": the control plane runs in a SharedWorker, this
+	// tab joins it (tabs.go). Otherwise this instance boots the control plane,
+	// in a tab of its own or in the worker.
+	if r := js.Global().Get("tabernetesRole"); r.Type() == js.TypeString {
+		role = r.String()
+	}
 	var c *cluster
 	ready := promise(func() (any, error) {
 		var err error
-		c, err = boot()
+		if role == "tab" {
+			c, err = follow(js.Global().Get("tabernetesCluster"))
+		} else {
+			c, err = boot()
+			// a tab that runs the control plane itself is a node too; the
+			// SharedWorker has no document and is none
+			if err == nil && js.Global().Get("document").Truthy() {
+				registerTab()
+			}
+		}
 		return nil, err
 	})
 	api.Set("ready", ready)
@@ -332,12 +347,38 @@ func main() {
 			if c == nil {
 				return nil, fmt.Errorf("cluster is not ready yet")
 			}
+			if role == "tab" {
+				return nil, fmt.Errorf("the control plane in the shared worker prepares joins")
+			}
 			return c.prepareJoin(open)
 		})
 	}))
 	// attachChannel(dc: RTCDataChannel) for channels opened by a node agent.
 	api.Set("attachChannel", js.FuncOf(func(this js.Value, a []js.Value) any {
 		attachChannel(a[0])
+		return nil
+	}))
+	// attachPort(port: MessagePort, label: string) for connections that the
+	// other side of a tab and the shared worker opened (tabs.go).
+	api.Set("attachPort", js.FuncOf(func(this js.Value, a []js.Value) any {
+		attach(newPortConn(a[0]), a[1].String())
+		return nil
+	}))
+	// prepareTab(open: (label: string) => Promise<MessagePort>): Promise<{name, ip, token, files}>
+	// adds a tab to the control plane in the shared worker.
+	api.Set("prepareTab", js.FuncOf(func(this js.Value, a []js.Value) any {
+		open := a[0]
+		return promise(func() (any, error) {
+			if c == nil || role == "tab" {
+				return nil, fmt.Errorf("no control plane here")
+			}
+			return c.prepareTab(open)
+		})
+	}))
+	// dropNode(name: string) removes a node of a closed tab (tabs.go).
+	api.Set("dropNode", js.FuncOf(func(this js.Value, a []js.Value) any {
+		name := a[0].String()
+		go dropNode(name)
 		return nil
 	}))
 

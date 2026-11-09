@@ -4,6 +4,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { installFS } from "./fs.js";
+import { zstdFrames, instantiate } from "./wasm.js";
 
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
 
@@ -72,10 +73,31 @@ export async function startTerminal(el, opts) {
   const t0 = performance.now();
   const since = () => ((performance.now() - t0) / 1000).toFixed(1).padStart(5);
   globalThis.tabernetesStatus = (s) => term.writeln(`${DIM(`[${since()}s]`)} ${s}`);
+  // With a shared worker, the control plane runs there and this tab joins it
+  // as a node (tabs.js). The worker reports how far it is.
+  const cluster = opts.cluster;
+  if (cluster) {
+    // Another tab started the control plane: its boot steps are old news.
+    if (cluster.state === "ready") globalThis.tabernetesStatus("the control plane runs in a shared worker that another tab started");
+    else for (const s of cluster.status) globalThis.tabernetesStatus(s);
+    cluster.on("status", ({ text }) => globalThis.tabernetesStatus(text));
+    cluster.on("failed", ({ error }) => term.writeln(`\r\n\x1b[31mthe control plane did not start: ${error}\x1b[0m`));
+    cluster.on("exited", ({ why, crash }) => {
+      term.writeln(`\r\n\x1b[31mthe control plane exited${why ? `: ${why}` : ""}\x1b[0m`);
+      if (crash) term.writeln(crash);
+    });
+  }
   const dl = await download(opts.wasmURL);
-  const { body, cached } = dl;
+  let { body } = dl;
+  const { cached } = dl;
   // The page knows the exact size of the file (data-size), the header only maybe.
   const total = opts.wasmSize || dl.total;
+  if (cluster?.needBinary) {
+    // The first tab: the worker compiles the same download for the control plane.
+    const [mine, theirs] = body.tee();
+    body = mine;
+    cluster.sendBinary(theirs, total);
+  }
   let loaded = 0;
   // The line must fit into one row: once it wraps, \r only returns to the
   // start of the last row and every update adds a new line.
@@ -104,13 +126,25 @@ export async function startTerminal(el, opts) {
   // The "free" command reads the size of the linear memory from here.
   globalThis.tabernetesMemory = instance.exports.mem;
   const exited = (why) => {
-    term.writeln(`\r\n\x1b[31mthe control plane exited${why ? `: ${why}` : ""}\x1b[0m`);
+    term.writeln(`\r\n\x1b[31m${cluster ? "this tab" : "the control plane"} exited${why ? `: ${why}` : ""}\x1b[0m`);
     if (crash.length) {
       // The first lines name the cause and the crashing goroutine.
       term.writeln(crash.join("").split("\n").slice(0, 30).join("\n"));
       term.writeln(DIM("The full trace is in tabernetesCrash in the DevTools console."));
     }
   };
+  if (cluster) {
+    // This tab: shell, kubectl and the kubelet of its node (k8s/tabernetes/tabs.go).
+    let info;
+    try {
+      info = await cluster.rpc("joinTab");
+    } catch (e) {
+      term.writeln(`\r\n\x1b[31mthe cluster did not start: ${e.message}\x1b[0m`);
+      return { term };
+    }
+    globalThis.tabernetesRole = "tab";
+    globalThis.tabernetesCluster = { info, open: (label) => cluster.open(label) };
+  }
   go.run(instance).then(() => exited(), (e) => exited(e?.message ?? String(e)));
   try {
     await globalThis.tabernetes.ready;
@@ -518,54 +552,4 @@ function unpack(url, stream, size, workerURL) {
       }
     },
   });
-}
-
-// zstdFrames yields each zstd frame of the stream once all of it is there.
-async function* zstdFrames(stream, size) {
-  let buf = new Uint8Array(size || 32 << 20), len = 0, start = 0;
-  const r = stream.getReader();
-  for (;;) {
-    const { value, done } = await r.read();
-    if (value) {
-      if (len + value.length > buf.length) {
-        const b = new Uint8Array(Math.max(2 * buf.length, len + value.length));
-        b.set(buf.subarray(0, len));
-        buf = b;
-      }
-      buf.set(value, len);
-      len += value.length;
-    }
-    for (let end; (end = frameEnd(buf.subarray(start, len))); start += end) yield buf.slice(start, start + end);
-    if (done) {
-      if (start < len) throw new Error("zstd: the download is truncated");
-      return;
-    }
-  }
-}
-
-// frameEnd returns the length of the zstd frame at the start of b, or 0 when
-// b does not hold all of it yet. See RFC 8878, section 3.1.1.
-function frameEnd(b) {
-  if (b.length < 6) return 0;
-  if (((b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24) >>> 0) !== 0xfd2fb528) throw new Error("zstd: bad frame magic");
-  const fhd = b[4], single = (fhd >> 5) & 1;
-  let p = 5 + (single ? 0 : 1) + [0, 1, 2, 4][fhd & 3] + [single, 2, 4, 8][fhd >> 6];
-  for (let last = 0; !last;) {
-    if (p + 3 > b.length) return 0;
-    const h = b[p] | b[p + 1] << 8 | b[p + 2] << 16;
-    last = h & 1;
-    p += 3 + (((h >> 1) & 3) === 1 ? 1 : h >>> 3); // an RLE block has one byte
-  }
-  p += fhd & 4 ? 4 : 0; // checksum
-  return p <= b.length ? p : 0;
-}
-
-// instantiate compiles while the bytes still arrive.
-async function instantiate(stream, imports) {
-  if (WebAssembly.instantiateStreaming) {
-    const resp = new Response(stream, { headers: { "Content-Type": "application/wasm" } });
-    return (await WebAssembly.instantiateStreaming(resp, imports)).instance;
-  }
-  const bytes = await new Response(stream).arrayBuffer();
-  return (await WebAssembly.instantiate(bytes, imports)).instance;
 }

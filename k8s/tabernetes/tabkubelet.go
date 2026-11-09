@@ -18,7 +18,8 @@ import (
 
 // The kubelet API of the tab node, as far as kubectl uses it: logs, exec and
 // port-forward. The apiserver reaches it on tabNodeIP:10250 in the in-process
-// network. It does not check the client: only the apiserver gets there.
+// network, or from the shared worker through a MessagePort (tabs.go). It does
+// not check the client: only the apiserver gets there.
 
 const (
 	streamIdleTimeout     = 4 * time.Hour

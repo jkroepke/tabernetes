@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall/js"
@@ -31,22 +32,29 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-// The tab node: the browser tab joins its own cluster as the node "tab-1". It
-// has no container runtime. Its kubelet (this file, tabkubelet.go) runs the
-// pods whose image names something that runs in the browser: webllm:<model>
-// loads a language model onto the GPU with WebGPU (webllm.go). The page
-// provides the GPU side as globalThis.tabernetesGPU (web/src/gpu.js).
+// The tab node: the browser tab joins the cluster as the node "tab-1", or
+// tab-<n> next to other tabs (tabs.go). It has no container runtime. Its
+// kubelet (this file, tabkubelet.go) runs the pods whose image names
+// something that runs in the browser: webllm:<model> loads a language model
+// onto the GPU with WebGPU (webllm.go). The page provides the GPU side as globalThis.tabernetesGPU (web/src/gpu.js).
 //
 // The node has the taint tabernetes.dev/tab, so that ordinary pods stay away,
 // and kubernetes.io/os=browser, so that the DaemonSets (which select linux)
 // do, too.
 
+// The name and the address of this tab as a node. With the control plane in
+// a SharedWorker (tabs.go), every tab of the page is a node: tab-1, tab-2 and
+// so on, with 10.0.1.<n>. Joined nodes have 10.0.0.2 to .250 (tunnel.go).
+var (
+	tabNodeName = "tab-1"
+	tabNodeIP   = "10.0.1.1"
+	// leaseByCluster is set when the control plane renews the lease of this
+	// node for as long as the tab holds its Web Lock (tabs.go). Timers of a
+	// hidden tab may fire only once a minute, too late for a lease.
+	leaseByCluster bool
+)
+
 const (
-	// Later, more tabs of the same browser may join as tab-2, tab-3 and so on
-	// (BroadcastChannel, Web Locks), with 10.0.1.<n>. Joined nodes have
-	// 10.0.0.2 to .250 (tunnel.go).
-	tabNodeName    = "tab-1"
-	tabNodeIP      = "10.0.1.1"
 	tabTaint       = "tabernetes.dev/tab"
 	webgpuResource = "tabernetes.dev/webgpu"
 	// The kubelet reports the node status every 10 s. The lease is the
@@ -106,7 +114,7 @@ var (
 	tabErr  error
 )
 
-// startTabNode registers the tab as a node, once. It fails without WebGPU.
+// startTabNode registers the tab as a node, once.
 func startTabNode(ctx context.Context) (*tabNode, error) {
 	tabOnce.Do(func() { tab, tabErr = newTabNode(ctx) })
 	if tabErr != nil {
@@ -122,12 +130,12 @@ func newTabNode(ctx context.Context) (*tabNode, error) {
 	if current == nil {
 		return nil, errors.New("the cluster is not ready yet")
 	}
+	// Without WebGPU, the tab is a node without the resource
+	// tabernetes.dev/webgpu: it runs nothing, but it is there.
 	gpu, err := gpuAdapter(ctx)
 	if err != nil {
-		return nil, err
-	}
-	if gpu == nil {
-		return nil, errors.New("this browser has no WebGPU adapter (Chrome or Edge on a machine with a GPU has one)")
+		fmt.Fprintln(os.Stderr, "tab node: no GPU:", err)
+		gpu = nil
 	}
 	cfg, err := clientcmd.BuildConfigFromFlags("", p("admin.kubeconfig"))
 	if err != nil {
@@ -168,7 +176,12 @@ func (n *tabNode) node() *corev1.Node {
 		corev1.ResourceCPU:    *resource.NewQuantity(int64(max(cpus, 1)), resource.DecimalSI),
 		corev1.ResourceMemory: *resource.NewQuantity(int64(mem)<<30, resource.BinarySI),
 		corev1.ResourcePods:   *resource.NewQuantity(8, resource.DecimalSI),
-		webgpuResource:        *resource.NewQuantity(1, resource.DecimalSI),
+		webgpuResource:        *resource.NewQuantity(0, resource.DecimalSI),
+	}
+	runtime := "webgpu://none"
+	if n.gpu != nil {
+		capacity[webgpuResource] = *resource.NewQuantity(1, resource.DecimalSI)
+		runtime = "webgpu://" + n.gpu.String()
 	}
 	now := metav1.Now()
 	cond := func(t corev1.NodeConditionType, s corev1.ConditionStatus, reason, msg string) corev1.NodeCondition {
@@ -182,7 +195,7 @@ func (n *tabNode) node() *corev1.Node {
 				"kubernetes.io/os":                 "browser",
 				"kubernetes.io/arch":               "wasm",
 				"node.kubernetes.io/instance-type": "browser-tab",
-				webgpuResource:                     "true",
+				webgpuResource:                     strconv.FormatBool(n.gpu != nil),
 			},
 		},
 		Spec: corev1.NodeSpec{
@@ -208,7 +221,7 @@ func (n *tabNode) node() *corev1.Node {
 				BootID:                  randToken(32),
 				KernelVersion:           "-",
 				OSImage:                 browserName(),
-				ContainerRuntimeVersion: "webgpu://" + n.gpu.String(),
+				ContainerRuntimeVersion: runtime,
 				KubeletVersion:          version.Get().GitVersion,
 				OperatingSystem:         "browser",
 				Architecture:            "wasm",
@@ -290,33 +303,11 @@ func (n *tabNode) updateStatus(ctx context.Context) error {
 // open. A hidden tab gets fewer timers, the whole cluster slows down with it.
 func (n *tabNode) heartbeat() {
 	ctx := context.Background()
-	leases := n.cs.CoordinationV1().Leases(corev1.NamespaceNodeLease)
 	for i := 0; ; i++ {
-		now := metav1.NewMicroTime(time.Now())
-		l, err := leases.Get(ctx, tabNodeName, metav1.GetOptions{})
-		switch {
-		case apierrors.IsNotFound(err):
-			node, nerr := n.cs.CoreV1().Nodes().Get(ctx, tabNodeName, metav1.GetOptions{})
-			if nerr == nil {
-				_, err = leases.Create(ctx, &coordinationv1.Lease{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:            tabNodeName,
-						Namespace:       corev1.NamespaceNodeLease,
-						OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: tabNodeName, UID: node.UID}},
-					},
-					Spec: coordinationv1.LeaseSpec{
-						HolderIdentity:       ptr.To(tabNodeName),
-						LeaseDurationSeconds: ptr.To(int32(tabLeaseDuration)),
-						RenewTime:            &now,
-					},
-				}, metav1.CreateOptions{})
+		if !leaseByCluster {
+			if err := renewLease(ctx, n.cs, tabNodeName); err != nil {
+				fmt.Fprintln(os.Stderr, "tab node: lease:", err)
 			}
-		case err == nil:
-			l.Spec.RenewTime = &now
-			_, err = leases.Update(ctx, l, metav1.UpdateOptions{})
-		}
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "tab node: lease:", err)
 		}
 		if i%6 == 5 {
 			if err := n.updateStatus(ctx); err != nil {
@@ -325,6 +316,38 @@ func (n *tabNode) heartbeat() {
 		}
 		time.Sleep(tabHeartbeat)
 	}
+}
+
+// renewLease renews the lease of a tab node, or creates it.
+func renewLease(ctx context.Context, cs kubernetes.Interface, name string) error {
+	leases := cs.CoordinationV1().Leases(corev1.NamespaceNodeLease)
+	now := metav1.NewMicroTime(time.Now())
+	l, err := leases.Get(ctx, name, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		node, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		_, err = leases.Create(ctx, &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            name,
+				Namespace:       corev1.NamespaceNodeLease,
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: name, UID: node.UID}},
+			},
+			Spec: coordinationv1.LeaseSpec{
+				HolderIdentity:       ptr.To(name),
+				LeaseDurationSeconds: ptr.To(int32(tabLeaseDuration)),
+				RenewTime:            &now,
+			},
+		}, metav1.CreateOptions{})
+		return err
+	case err != nil:
+		return err
+	}
+	l.Spec.RenewTime = &now
+	_, err = leases.Update(ctx, l, metav1.UpdateOptions{})
+	return err
 }
 
 // watchPods runs the pods the scheduler binds to the tab.

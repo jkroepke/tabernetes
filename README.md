@@ -63,8 +63,23 @@ browser tab (single wasm binary)                     docker run tabernetes
   [KubeDoom](https://github.com/storax/kubedoom) on the node with a Deployment
   of five pause pods (`k8s/tabernetes/doom/kubedoom.yaml`), and every pod of
   the default namespace is a monster. Shoot one, and KubeDoom deletes the pod.
-- `llm [model]` makes the browser tab a node of its own cluster and runs a
-  language model on its GPU. The tab node (`k8s/tabernetes/tabnode.go`) has no
+- Every tab is a node. The control plane runs in a SharedWorker
+  (`web/src/cluster.js`, `k8s/tabernetes/tabs.go`) that all tabs of the page
+  share, and it lives as long as one of them is open: open a second tab, and
+  it joins as `tab-2`; close the first one, and the cluster keeps running.
+  The first tab hands its download to the worker, which compiles a second
+  instance of the binary for the control plane. Each tab runs the binary for
+  its shell, kubectl and kubelet, and every connection between a tab and the
+  worker is a MessagePort of its own. A tab holds a Web Lock while it is open;
+  the worker waits for that lock, so it learns when a tab closes, deletes its
+  node and renews the node leases in between (timers of a hidden tab may fire
+  only once a minute). WebRTC does not exist in workers: the data channels of
+  a node from `join` stay in the tab that ran `join`, and go on to the worker
+  over MessagePorts. When that tab closes, the node agent exits, and the
+  worker deletes its node. Without SharedWorker or Web Locks (Chrome on Android),
+  the tab runs the control plane itself, as before.
+- `llm [model]` runs a language model on the GPU of the tab. The tab node
+  (`k8s/tabernetes/tabnode.go`) has no
   container runtime; a small kubelet in the Wasm registers the node `tab-1`
   (lease, status, taint `tabernetes.dev/tab`, `kubernetes.io/os=browser`, so
   the DaemonSets stay away, and the extended resource `tabernetes.dev/webgpu`),

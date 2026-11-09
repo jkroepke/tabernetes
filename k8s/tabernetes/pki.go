@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
@@ -129,4 +130,21 @@ users:
 
 func pemBlock(typ string, der []byte) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: typ, Bytes: der})
+}
+
+// loadPKI reads a CA that another tab created (tabs.go).
+func loadPKI(certFile, keyFile string) (*pki, error) {
+	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	key, ok := pair.PrivateKey.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("%s: not a signing key", keyFile)
+	}
+	cert, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return nil, err
+	}
+	return &pki{caCert: cert, caKey: key, caPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})}, nil
 }

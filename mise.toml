@@ -84,6 +84,9 @@ npx esbuild src/index.js --bundle --minify --format=esm --target=es2022 \
 npx esbuild src/unzstd.js --bundle --minify --format=iife --target=es2022 --outfile="$out/unzstd.js"
 # WebLLM for llm (tab node) runs in a worker of its own, loaded only by llm.
 npx esbuild src/gpuworker.js --bundle --minify --format=iife --target=es2022 --outfile="$out/gpuworker.js"
+# The control plane runs in a shared worker, so that all tabs of the page join
+# one cluster (k8s/tabernetes/tabs.go).
+npx esbuild src/cluster.js --bundle --minify --format=iife --target=es2022 --outfile="$out/cluster.js"
 cp node_modules/@xterm/xterm/css/xterm.css "$out/xterm.css"
 '''
 
