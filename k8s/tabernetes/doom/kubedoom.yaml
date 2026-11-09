@@ -59,6 +59,11 @@ spec:
         - {name: NAMESPACE, value: default}
         ports:
         - {name: vnc, containerPort: 5900}
+        # x11vnc listens a few seconds after the container started. Ready only
+        # then, so that "rollout status" in doom waits for it.
+        readinessProbe:
+          tcpSocket: {port: vnc}
+          periodSeconds: 1
 ---
 # Something to shoot. pause comes with the node image, so the monsters start
 # right away, and the Deployment brings back every one you kill.
