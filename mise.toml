@@ -82,6 +82,8 @@ npx esbuild src/index.js --bundle --minify --format=esm --target=es2022 \
   --outfile="$out/tabernetes.js"
 # The zstd decoder runs in a worker, so that the page does not freeze.
 npx esbuild src/unzstd.js --bundle --minify --format=iife --target=es2022 --outfile="$out/unzstd.js"
+# WebLLM for llm (tab node) runs in a worker of its own, loaded only by llm.
+npx esbuild src/gpuworker.js --bundle --minify --format=iife --target=es2022 --outfile="$out/gpuworker.js"
 cp node_modules/@xterm/xterm/css/xterm.css "$out/xterm.css"
 '''
 

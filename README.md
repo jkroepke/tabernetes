@@ -63,6 +63,23 @@ browser tab (single wasm binary)                     docker run tabernetes
   [KubeDoom](https://github.com/storax/kubedoom) on the node with a Deployment
   of five pause pods (`k8s/tabernetes/doom/kubedoom.yaml`), and every pod of
   the default namespace is a monster. Shoot one, and KubeDoom deletes the pod.
+- `llm [model]` makes the browser tab a node of its own cluster and runs a
+  language model on its GPU. The tab node (`k8s/tabernetes/tabnode.go`) has no
+  container runtime; a small kubelet in the Wasm registers the node `tab-1`
+  (lease, status, taint `tabernetes.dev/tab`, `kubernetes.io/os=browser`, so
+  the DaemonSets stay away, and the extended resource `tabernetes.dev/webgpu`),
+  runs the pods bound to it and serves logs, exec and port-forward on
+  `10.0.1.1:10250` with the streaming code of the upstream kubelet
+  (`k8s.io/cri-streaming`). An image `webllm:<model>` is a
+  [WebLLM](https://webllm.mlc.ai) model ID (`k8s/tabernetes/webllm.go`): a
+  worker (`web/src/gpuworker.js`) loads the weights from Hugging Face, which
+  allows CORS, and keeps them in the Cache Storage. Container registries do
+  not send CORS headers, so the tab cannot pull images. The pod serves the
+  OpenAI chat API on port 8000, and `kubectl exec llm -- chat [question]`
+  answers on the terminal. `llm` chats through `kubectl exec -i`; without a
+  tty, it edits the lines itself and sends Ctrl-C as `\x03`. It needs WebGPU
+  (Chrome or Edge); without `shader-f16` it takes the `q4f32` variant of the
+  default model, Qwen2.5 1.5B.
 - `free` shows the WebAssembly memory (wasm32 ends at 4 GiB, and the linear
   memory never shrinks), the Go heap and the number of goroutines.
 - `vi` (`k8s/tabernetes/vi.go`) is a small vi for manifests. It runs in raw mode:

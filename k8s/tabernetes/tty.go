@@ -87,13 +87,22 @@ func (t *terminal) size() (cols, rows int) {
 // enterRaw switches to raw mode and the alternate screen. The returned
 // function switches back.
 func (t *terminal) enterRaw() func() {
+	io.WriteString(t, "\x1b[?1049h\x1b[H\x1b[2J")
+	leave := t.enterLine()
+	return func() {
+		io.WriteString(t, "\x1b[?1049l")
+		leave()
+	}
+}
+
+// enterLine switches to raw mode on the normal screen, for a program that
+// edits lines itself (llm). The returned function switches back.
+func (t *terminal) enterLine() func() {
 	for len(t.keys) > 0 {
 		<-t.keys
 	}
 	t.raw.Store(true)
-	io.WriteString(t, "\x1b[?1049h\x1b[H\x1b[2J")
 	return func() {
-		io.WriteString(t, "\x1b[?1049l")
 		t.mu.Lock()
 		t.raw.Store(false)
 		held := t.held

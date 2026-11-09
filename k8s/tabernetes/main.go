@@ -72,6 +72,9 @@ type cluster struct {
 	adminToken string
 }
 
+// current is the cluster once it booted.
+var current *cluster
+
 func boot() (*cluster, error) {
 	// All components share one process and therefore one klog instance.
 	logsapi.ReapplyHandling = logsapi.ReapplyHandlingIgnoreUnchanged
@@ -194,6 +197,7 @@ func boot() (*cluster, error) {
 		return nil, fmt.Errorf("installing addons: %w", err)
 	}
 	status("ready")
+	current = c
 	return c, nil
 }
 

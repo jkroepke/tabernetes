@@ -25,7 +25,7 @@ func doomCmd(ctx context.Context, hc interp.HandlerContext, args []string, exec 
 		return interp.ExitStatus(2)
 	}
 	var nodes strings.Builder
-	if code := runKubectl(ctx, []string{"get", "nodes", "-o", "name"}, nil, &nodes, hc.Stderr); code != 0 {
+	if code := runKubectl(ctx, []string{"get", "nodes", "-l", "kubernetes.io/os=linux", "-o", "name"}, nil, &nodes, hc.Stderr); code != 0 {
 		return exitCode(code)
 	}
 	if strings.TrimSpace(nodes.String()) == "" {

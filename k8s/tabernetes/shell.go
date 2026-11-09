@@ -177,6 +177,8 @@ func (s *shell) exec(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 			return s.kubectl(ctx, hc, args[1:])
 		case name == "doom":
 			return doomCmd(ctx, hc, args[1:], self)
+		case name == "llm":
+			return llmCmd(ctx, hc, args[1:])
 		case interp.IsBuiltin(name):
 			// reached through xargs, for example "xargs echo"
 			if err := hc.Builtin(ctx, args); err != nil {
