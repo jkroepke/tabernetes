@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -30,7 +31,23 @@ type workload interface {
 	stop()
 	// imageID tells kubectl describe what runs.
 	imageID() string
+	// runtime names what runs it, for the container ID.
+	runtime() string
 }
+
+// exiter is a workload that ends by itself, as a container process does.
+type exiter interface {
+	// wait returns the exit code once the workload has ended.
+	wait() <-chan int
+}
+
+// startError is a container that did not start, as runc reports it.
+type startError struct {
+	code int
+	msg  string
+}
+
+func (e *startError) Error() string { return e.msg }
 
 // newWorkload picks the workload for the image of c.
 func newWorkload(tp *tabPod, c *corev1.Container) (workload, error) {
@@ -38,6 +55,9 @@ func newWorkload(tp *tabPod, c *corev1.Container) (workload, error) {
 	switch name {
 	case "webllm", "tabernetes.dev/webllm":
 		return newWebLLM(tp, tag)
+	}
+	if hasVM() {
+		return newV86(tp, c)
 	}
 	return nil, fmt.Errorf("the tab node runs no containers, only images that run in the browser: webllm:<model> (not %q)", c.Image)
 }
@@ -148,28 +168,86 @@ func (tp *tabPod) run() {
 				backoff = min(backoff*2, backoffMax)
 				continue
 			}
-			fmt.Fprintln(tp.logs, "error:", err)
-			tp.event(corev1.EventTypeWarning, "Failed", err.Error())
-			tp.setTerminated(err)
-			if tp.restartPolicy == corev1.RestartPolicyNever {
+			code, reason := 1, "Error"
+			if se, ok := errors.AsType[*startError](err); ok {
+				// the kubelet tells the error of runc only in the events
+				code, reason = se.code, "StartError"
+				tp.event(corev1.EventTypeWarning, "Failed", "Error: "+err.Error())
+			} else {
+				fmt.Fprintln(tp.logs, "error:", err)
+				tp.event(corev1.EventTypeWarning, "Failed", err.Error())
+			}
+			restart := tp.restarts(code)
+			tp.setTerminated(code, reason, err.Error(), restart)
+			if !restart || !tp.backOff(&backoff) {
 				return
 			}
-			msg := fmt.Sprintf("back-off %s restarting failed container=%s pod=%s_%s(%s)", backoff, tp.container.Name, tp.name, tp.namespace, tp.uid)
-			tp.event(corev1.EventTypeWarning, "BackOff", "Back-off restarting failed container "+tp.container.Name+" in pod "+tp.name+"_"+tp.namespace+"("+string(tp.uid)+")")
-			tp.setWaiting("CrashLoopBackOff", msg)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(backoff):
-			}
-			backoff = min(backoff*2, backoffMax)
 			continue
 		}
 		pull.done(0)
 		tp.event(corev1.EventTypeNormal, "Started", "Started container "+tp.container.Name)
 		tp.setRunning(w)
-		return
+		e, ok := w.(exiter)
+		if !ok {
+			return
+		}
+		started := time.Now()
+		var code int
+		select {
+		case <-ctx.Done():
+			return
+		case code = <-e.wait():
+		}
+		tp.mu.Lock()
+		if tp.w == w {
+			tp.w = nil
+		}
+		tp.mu.Unlock()
+		w.stop()
+		reason := "Completed"
+		if code != 0 {
+			reason = "Error"
+		}
+		restart := tp.restarts(code)
+		tp.setTerminated(code, reason, "", restart)
+		if !restart {
+			return
+		}
+		// the kubelet forgets the back-off of a container that ran for 10 minutes
+		if time.Since(started) > 10*time.Minute {
+			backoff = backoffStart
+		}
+		if !tp.backOff(&backoff) {
+			return
+		}
 	}
+}
+
+// restarts tells whether the restart policy starts the container again
+// after it exited with code.
+func (tp *tabPod) restarts(code int) bool {
+	switch tp.restartPolicy {
+	case corev1.RestartPolicyNever:
+		return false
+	case corev1.RestartPolicyOnFailure:
+		return code != 0
+	}
+	return true
+}
+
+// backOff waits before the container starts again, as CrashLoopBackOff. It
+// returns false if the pod is gone meanwhile.
+func (tp *tabPod) backOff(backoff *time.Duration) bool {
+	msg := fmt.Sprintf("back-off %s restarting failed container=%s pod=%s_%s(%s)", *backoff, tp.container.Name, tp.name, tp.namespace, tp.uid)
+	tp.event(corev1.EventTypeWarning, "BackOff", "Back-off restarting failed container "+tp.container.Name+" in pod "+tp.name+"_"+tp.namespace+"("+string(tp.uid)+")")
+	tp.setWaiting("CrashLoopBackOff", msg)
+	select {
+	case <-tp.ctx.Done():
+		return false
+	case <-time.After(*backoff):
+	}
+	*backoff = min(*backoff*2, backoffMax)
+	return true
 }
 
 // imagePull tells the events of a pod what the kubelet would say about an
@@ -249,20 +327,25 @@ func (tp *tabPod) setWaiting(reason, msg string) {
 	tp.update()
 }
 
-func (tp *tabPod) setTerminated(err error) {
+// setTerminated records that the container ended. Unless it restarts, the
+// pod is done.
+func (tp *tabPod) setTerminated(code int, reason, msg string, restart bool) {
 	tp.mu.Lock()
 	now := metav1.Now()
-	t := &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error", Message: err.Error(), StartedAt: now, FinishedAt: now}
+	t := &corev1.ContainerStateTerminated{ExitCode: int32(code), Reason: reason, Message: msg, StartedAt: now, FinishedAt: now}
 	if r := tp.status.State.Running; r != nil {
 		t.StartedAt = r.StartedAt
 	}
 	tp.status.State = corev1.ContainerState{Terminated: t}
 	tp.status.Ready, tp.status.Started = false, ptr.To(false)
-	if tp.restartPolicy == corev1.RestartPolicyNever {
-		tp.phase = corev1.PodFailed
-	} else {
+	switch {
+	case restart:
 		tp.status.LastTerminationState = corev1.ContainerState{Terminated: t}
 		tp.status.RestartCount++
+	case code == 0:
+		tp.phase = corev1.PodSucceeded
+	default:
+		tp.phase = corev1.PodFailed
 	}
 	tp.mu.Unlock()
 	tp.update()
@@ -275,7 +358,7 @@ func (tp *tabPod) setRunning(w workload) {
 	tp.status.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}}
 	tp.status.Ready, tp.status.Started = true, ptr.To(true)
 	tp.status.ImageID = w.imageID()
-	tp.status.ContainerID = "webgpu://" + strings.ReplaceAll(string(tp.uid), "-", "")
+	tp.status.ContainerID = w.runtime() + "://" + strings.ReplaceAll(string(tp.uid), "-", "")
 	tp.mu.Unlock()
 	tp.update()
 }

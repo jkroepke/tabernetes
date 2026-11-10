@@ -33,15 +33,18 @@ import (
 )
 
 // The tab node: the browser tab joins the cluster as the node "tab-1", or
-// tab-<n> next to other tabs (tabs.go). It has no container runtime. Its
-// kubelet (this file, tabkubelet.go) runs the pods whose image names
-// something that runs in the browser: webllm:<model> loads a language model
-// onto the GPU with WebGPU (webllm.go). The page provides the GPU side as globalThis.tabernetesGPU (web/src/gpu.js).
+// tab-<n> next to other tabs (tabs.go). Its kubelet (this file,
+// tabkubelet.go) runs webllm:<model> as a language model on the GPU with
+// WebGPU (webllm.go; the page provides globalThis.tabernetesGPU,
+// web/src/gpu.js), and every other image as a container: the linux/386
+// variant of the image boots in v86, an x86 emulator (v86.go; the page
+// provides globalThis.tabernetesVM, web/src/vm.js).
 //
-// The node has the taint tabernetes.dev/tab, so that ordinary pods stay away,
-// and kubernetes.io/os=browser, so that the DaemonSets (which select linux)
-// do, too. Its role label node-role.kubernetes.io/browser shows as ROLES
-// browser in kubectl get nodes.
+// The node has the taint tabernetes.dev/tab with PreferNoSchedule: a pod
+// goes to a node from join if there is one, and to the tab if not. Its label
+// kubernetes.io/os=browser keeps the DaemonSets (which select linux) away.
+// Its role label node-role.kubernetes.io/browser shows as ROLES browser in
+// kubectl get nodes.
 
 // The name and the address of this tab as a node. With the control plane in
 // a SharedWorker (tabs.go), every tab of the page is a node: tab-1, tab-2 and
@@ -182,10 +185,15 @@ func (n *tabNode) node() *corev1.Node {
 		corev1.ResourcePods:   *resource.NewQuantity(8, resource.DecimalSI),
 		webgpuResource:        *resource.NewQuantity(0, resource.DecimalSI),
 	}
-	runtime := "webgpu://none"
+	runtime := vmRuntime()
 	if n.gpu != nil {
 		capacity[webgpuResource] = *resource.NewQuantity(1, resource.DecimalSI)
-		runtime = "webgpu://" + n.gpu.String()
+		if runtime == "" {
+			runtime = "webgpu://" + n.gpu.String()
+		}
+	}
+	if runtime == "" {
+		runtime = "webgpu://none"
 	}
 	now := metav1.Now()
 	cond := func(t corev1.NodeConditionType, s corev1.ConditionStatus, reason, msg string) corev1.NodeCondition {
@@ -204,7 +212,7 @@ func (n *tabNode) node() *corev1.Node {
 			},
 		},
 		Spec: corev1.NodeSpec{
-			Taints: []corev1.Taint{{Key: tabTaint, Value: "browser", Effect: corev1.TaintEffectNoSchedule}},
+			Taints: []corev1.Taint{{Key: tabTaint, Value: "browser", Effect: corev1.TaintEffectPreferNoSchedule}},
 		},
 		Status: corev1.NodeStatus{
 			Capacity:    capacity,

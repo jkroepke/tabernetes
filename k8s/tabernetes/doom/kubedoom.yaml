@@ -51,6 +51,8 @@ spec:
     metadata:
       labels: {app: kubedoom}
     spec:
+      # the tab nodes run images only for linux/386, and slowly
+      nodeSelector: {kubernetes.io/os: linux}
       serviceAccountName: kubedoom
       containers:
       - name: kubedoom
@@ -81,6 +83,7 @@ spec:
     metadata:
       labels: {app: monsters}
     spec:
+      nodeSelector: {kubernetes.io/os: linux}
       terminationGracePeriodSeconds: 0
       containers:
       - name: monster

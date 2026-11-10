@@ -51,6 +51,8 @@ func newWebLLM(tp *tabPod, model string) (workload, error) {
 
 func (m *webLLM) imageID() string { return "webllm://" + m.model }
 
+func (m *webLLM) runtime() string { return "webgpu" }
+
 // fetchedMB matches the progress of WebLLM while it downloads the weights.
 var fetchedMB = regexp.MustCompile(`^Fetching param cache\[\d+/\d+\]: (\d+)MB fetched`)
 

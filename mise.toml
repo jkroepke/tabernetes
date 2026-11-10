@@ -2,6 +2,7 @@
 #
 #   mise run build       build the WebAssembly binary and the terminal into ../assets/tabernetes/
 #   mise run web         rebuild only the terminal (needs .build/wasm_exec.js)
+#   mise run vm          build the VM for container images on tab nodes (needs docker)
 #   mise run test        run the etcd shim tests
 #   mise run node-image  build the node image (tabernetes) for the local platform
 #
@@ -65,8 +66,22 @@ node -e '
 ' .build/tabernetes.wasm ../assets/tabernetes/tabernetes.wasm.zst
 '''
 
+[tasks.vm]
+description = "Build the kernel, init and BIOS that v86 boots into ../assets/tabernetes/vm/"
+run = '''
+# docker builds them (vm/Dockerfile) only when vm/ changed.
+out=../assets/tabernetes/vm
+sum="$(find vm -type f | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | cut -d" " -f1)"
+if [ "$(cat "$out/.sum" 2>/dev/null)" != "$sum" ]; then
+  rm -rf "$out"
+  docker build --output "type=local,dest=$out" vm
+  echo "$sum" > "$out/.sum"
+fi
+'''
+
 [tasks.web]
 description = "Bundle the terminal into ../assets/tabernetes/"
+depends = ["vm"]
 wait_for = ["wasm"]
 run = '''
 if [ ! -f .build/wasm_exec.js ]; then mise run wasm; fi
@@ -79,6 +94,7 @@ cd web
 npm ci --no-audit --no-fund
 npx esbuild src/index.js --bundle --minify --format=esm --target=es2022 \
   --define:TABERNETES_IMAGE="\"$NODE_IMAGE:latest\"" \
+  --define:V86_VERSION="\"$(node -p 'require("./node_modules/v86/package.json").version')\"" \
   --outfile="$out/tabernetes.js"
 # The zstd decoder runs in a worker, so that the page does not freeze.
 npx esbuild src/unzstd.js --bundle --minify --format=iife --target=es2022 --outfile="$out/unzstd.js"
@@ -87,6 +103,12 @@ npx esbuild src/gpuworker.js --bundle --minify --format=iife --target=es2022 --o
 # The control plane runs in a shared worker, so that all tabs of the page join
 # one cluster (k8s/tabernetes/tabs.go).
 npx esbuild src/cluster.js --bundle --minify --format=iife --target=es2022 --outfile="$out/cluster.js"
+# Container images on the tab node run in v86, an x86 emulator, one worker per
+# pod. v86 imports node modules only when it runs in Node.js.
+npx esbuild src/vmworker.js --bundle --minify --format=iife --target=es2022 \
+  --external:crypto --external:node:crypto --external:fs --external:node:fs/promises --external:perf_hooks \
+  --outfile="$out/vmworker.js"
+cp node_modules/v86/build/v86.wasm "$out/v86.wasm"
 cp node_modules/@xterm/xterm/css/xterm.css "$out/xterm.css"
 '''
 
@@ -102,6 +124,7 @@ run = """
 go test ./cmd/tabernetes/etcdshim/
 GOOS=js GOARCH=wasm go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./cmd/tabernetes/
 GOOS=linux go -C {{config_root}}/node/agent vet ./...
+GOOS=linux GOARCH=386 go -C {{config_root}}/vm vet ./...
 """
 
 [tasks.node-image]

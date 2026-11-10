@@ -87,16 +87,15 @@ browser tab (single wasm binary)                     docker run tabernetes
   Deployment `llm` and returns, as `kubectl create deployment` would. The
   scheduler prefers the tab that ran `llm`; when that tab closes, the pod
   moves to another tab with WebGPU. The tab node (`k8s/tabernetes/tabnode.go`)
-  has no container runtime; a small kubelet in the Wasm registers the node
-  `tab-1` (lease, status, taint `tabernetes.dev/tab`,
-  `kubernetes.io/os=browser`, so the DaemonSets stay away, and the extended
-  resource `tabernetes.dev/webgpu`), runs the pods bound to it and serves
+  is a small kubelet in the Wasm: it registers the node `tab-1` (lease,
+  status, taint `tabernetes.dev/tab` with `PreferNoSchedule`, so a node from
+  `join` comes first, `kubernetes.io/os=browser`, so the DaemonSets stay away,
+  and the extended resource `tabernetes.dev/webgpu`), runs the pods bound to it and serves
   logs, exec and port-forward on `10.0.1.1:10250` with the streaming code of
   the upstream kubelet (`k8s.io/cri-streaming`). An image `webllm:<model>` is
   a [WebLLM](https://webllm.mlc.ai) model ID (`k8s/tabernetes/webllm.go`): a
   worker (`web/src/gpuworker.js`) loads the weights from Hugging Face, which
-  allows CORS, and keeps them in the Cache Storage. Container registries do
-  not send CORS headers, so the tab cannot pull images. The download of the
+  allows CORS, and keeps them in the Cache Storage. The download of the
   weights is the image pull, with the events of the kubelet (`Pulling`,
   `Pulled` with the size, or `already present on machine` from the cache, then
   `Created` and `Started`); a failed download is `ErrImagePull` and
@@ -107,6 +106,29 @@ browser tab (single wasm binary)                     docker run tabernetes
   (`k8s/tabernetes/exec.go`). `llm` needs WebGPU (Chrome or Edge); without
   `shader-f16` it takes the `q4f32` variant of the default model, Qwen2.5
   1.5B.
+- Every other image runs as a container on the tab node, in
+  [v86](https://github.com/copy/v86), an x86 emulator that compiles x86 code
+  to WebAssembly (`k8s/tabernetes/v86.go`). Each pod gets a worker
+  (`web/src/vm.js`, `web/src/vmworker.js`) that pulls the `linux/386` variant
+  of the image, verifies the blobs and keeps them in the Cache Storage. Docker
+  Hub sends no CORS headers, so the page pulls through a pull-through mirror
+  of Docker Hub that does (`data-registry` in the shortcode; a `registry:3`
+  with `REGISTRY_PROXY_REMOTEURL` and a CORS middleware in front). The worker
+  applies the layers with their whiteouts and writes them as an initramfs
+  (`web/src/rootfs.js`), next to `/.tabernetes/init` and the container as
+  `/.tabernetes/config.json`. The kernel is Linux 6.8 from Ubuntu for i386,
+  `tinyconfig` plus `vm/kernel.config` (serial console, virtio-net, initrd),
+  built with clang in `vm/Dockerfile` (`mise run vm`, needs Docker). PID 1
+  (`vm/init`) does what runc does: it mounts `/proc`, `/sys` and `/dev`,
+  writes `/etc/hosts` and `/etc/resolv.conf`, sets the hostname and starts
+  the entrypoint with the environment, working directory and user of the
+  image and the pod. The first serial port is the log of the container; the
+  second one tells the kubelet `started`, `exit <code>`, or why the
+  entrypoint did not start (`StartError`, exit code 128). The exit code goes
+  through the restart policy (`Completed`, `Error`, `CrashLoopBackOff`).
+  `kubectl port-forward` reaches the pod through the virtio network card of
+  the VM. `kubectl exec` is not supported. nginx:alpine runs after about 5
+  seconds.
 - `free` shows the WebAssembly memory (wasm32 ends at 4 GiB, and the linear
   memory never shrinks), the Go heap and the number of goroutines.
 - `vi` (`k8s/tabernetes/vi.go`) is a small vi for manifests. It runs in raw mode:
