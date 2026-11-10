@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"net"
 	"net/http"
@@ -310,10 +312,22 @@ func (m *webLLM) exec(ctx context.Context, cmd []string, in io.Reader, out, errO
 	}
 }
 
+//go:embed chat.html
+var chatHTML string
+
+// chatPage is the chat of GET / in a browser, on top of the API.
+var chatPage = template.Must(template.New("chat").Parse(chatHTML))
+
 // handler serves the OpenAI chat API, as far as WebLLM has it.
 func (m *webLLM) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		// A browser gets a chat page, curl and wget the API.
+		if strings.Contains(r.Header.Get("Accept"), "text/html") {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			chatPage.Execute(w, struct{ Model string }{m.model})
+			return
+		}
 		fmt.Fprintf(w, "%s on WebGPU (WebLLM). OpenAI API:\n  GET /v1/models\n  POST /v1/chat/completions\n", m.model)
 	})
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {

@@ -40,7 +40,8 @@ import (
 //
 // The node has the taint tabernetes.dev/tab, so that ordinary pods stay away,
 // and kubernetes.io/os=browser, so that the DaemonSets (which select linux)
-// do, too.
+// do, too. Its role label node-role.kubernetes.io/browser shows as ROLES
+// browser in kubectl get nodes.
 
 // The name and the address of this tab as a node. With the control plane in
 // a SharedWorker (tabs.go), every tab of the page is a node: tab-1, tab-2 and
@@ -195,6 +196,7 @@ func (n *tabNode) node() *corev1.Node {
 			Name: tabNodeName,
 			Labels: map[string]string{
 				"kubernetes.io/hostname":           tabNodeName,
+				"node-role.kubernetes.io/browser":  "",
 				"kubernetes.io/os":                 "browser",
 				"kubernetes.io/arch":               "wasm",
 				"node.kubernetes.io/instance-type": "browser-tab",

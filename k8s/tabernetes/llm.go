@@ -96,6 +96,6 @@ func llmCmd(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	fmt.Fprintln(hc.Stdout, "A tab with WebGPU pulls the model like an image, about 1 GB the first time.")
 	fmt.Fprintln(hc.Stdout, "Watch it with kubectl get pods -w or kubectl describe pod -l app=llm, then:")
 	fmt.Fprintln(hc.Stdout, "  kubectl exec -it deploy/llm -- chat")
-	fmt.Fprintln(hc.Stdout, "  kubectl port-forward deploy/llm 8000, and proxy 8000 or wget for the OpenAI API")
+	fmt.Fprintln(hc.Stdout, "  kubectl port-forward deploy/llm 8000, then proxy 8000 for a chat page or wget for the OpenAI API")
 	return nil
 }
