@@ -34,9 +34,9 @@ import (
 
 // The tab node: the browser tab joins the cluster as the node "tab-1", or
 // tab-<n> next to other tabs (tabs.go). Its kubelet (this file,
-// tabkubelet.go) runs webllm:<model> as a language model on the GPU with
-// WebGPU (webllm.go; the page provides globalThis.tabernetesGPU,
-// web/src/gpu.js), and every other image as a container: the linux/386
+// tabkubelet.go) runs huggingface.co/mlc-ai/<model> as a language model on
+// the GPU with WebGPU (webllm.go; the page provides
+// globalThis.tabernetesGPU, web/src/gpu.js), and every other image as a container: the linux/386
 // variant of the image boots in v86, an x86 emulator (v86.go; the page
 // provides globalThis.tabernetesVM, web/src/vm.js).
 //

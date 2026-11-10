@@ -769,7 +769,8 @@ func xargs(ctx context.Context, hc interp.HandlerContext, args []string, exec in
 // wget downloads with the fetch() of the browser (net/http on js/wasm), so
 // only servers that send CORS headers work, raw.githubusercontent.com does.
 // localhost stays in the wasm: kubectl port-forward 8080:80 & then
-// wget -qO- localhost:8080 reaches the pod.
+// wget -qO- localhost:8080 reaches the pod. A pod IP or a ClusterIP goes
+// through the port-forward of the apiserver (podnet.go): wget 10.244.0.2.
 func wget(ctx context.Context, hc interp.HandlerContext, args []string, _ interp.ExecHandlerFunc) error {
 	flags, urls := splitWgetArgs(args)
 	o, _, err := opts("wget", flags, "qvO:", map[string]string{"quiet": "q", "verbose": "v", "output-document": "O"})
@@ -825,11 +826,16 @@ func splitWgetArgs(args []string) (flags, urls []string) {
 }
 
 // wgetURL parses a url of the command line. Without a scheme it is http for
-// localhost (kubectl port-forward) and https for everything else.
+// localhost (kubectl port-forward) and IP addresses (pods), and https for
+// everything else.
 func wgetURL(raw string) (*url.URL, error) {
 	if !strings.Contains(raw, "://") {
 		scheme := "https://"
-		if h, _, _ := strings.Cut(raw, "/"); h == "localhost" || strings.HasPrefix(h, "localhost:") || h == "127.0.0.1" || strings.HasPrefix(h, "127.0.0.1:") {
+		h, _, _ := strings.Cut(raw, "/")
+		if host, _, err := net.SplitHostPort(h); err == nil {
+			h = host
+		}
+		if h == "localhost" || net.ParseIP(strings.Trim(h, "[]")) != nil {
 			scheme = "http://"
 		}
 		raw = scheme + raw
@@ -844,6 +850,9 @@ func wgetURL(raw string) (*url.URL, error) {
 // No keep-alive: a pooled connection would keep answering for a server that
 // has stopped since.
 var localClient = &http.Client{Transport: &http.Transport{DialContext: dialLocal, DisableKeepAlives: true}}
+
+// clusterClient reaches pods and Services through the apiserver (podnet.go).
+var clusterClient = &http.Client{Transport: &http.Transport{DialContext: dialCluster, DisableKeepAlives: true}}
 
 // dialLocal dials in the in-process network of the wasm. It has no resolver,
 // so localhost becomes 127.0.0.1.
@@ -864,9 +873,11 @@ func download(ctx context.Context, hc interp.HandlerContext, u, name string, qui
 		// localhost is the in-process network of the wasm, where kubectl
 		// port-forward listens. A Transport with a dialer skips fetch().
 		client = localClient
+	} else if inClusterNet(h) {
+		client = clusterClient
 	}
 	resp, err := client.Do(req)
-	if err != nil && client == localClient {
+	if err != nil && client != http.DefaultClient {
 		return fail(hc, 4, "wget: %s: %v", u, err)
 	}
 	if err != nil {

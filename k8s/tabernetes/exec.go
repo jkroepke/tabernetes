@@ -8,12 +8,12 @@ import (
 	"time"
 )
 
-// kubectl exec -i (and -it) on the terminal. The shell has no terminal
-// device: commands get complete lines from the browser and stdin is empty.
-// For exec with stdin, the terminal goes into line mode instead, edits each
-// line itself and sends it to the pod when Enter is pressed. Ctrl-C goes to
-// the pod as \x03, as a tty would send it, and ends stdin; so does Ctrl-D on
-// an empty line.
+// kubectl exec -i without -t on the terminal (-t: ttyexec.go). The shell has
+// no terminal device: commands get complete lines from the browser and stdin
+// is empty. For exec with stdin, the terminal goes into line mode instead,
+// edits each line itself and sends it to the pod when Enter is pressed.
+// Ctrl-C goes to the pod as \x03 and ends stdin; so does Ctrl-D on an empty
+// line.
 
 // terminalStdin is the stdin of a command line that reads nothing else: no
 // pipe, no redirect.
@@ -35,7 +35,7 @@ func fromTerminal(r io.Reader) bool {
 }
 
 // interactiveExec returns the arguments for kubectl exec in line mode when
-// args are "exec" with -i. It drops -t: the shell has no tty to hand over.
+// args are "exec" with -i.
 func interactiveExec(args []string) ([]string, bool) {
 	if len(args) == 0 || args[0] != "exec" {
 		return nil, false

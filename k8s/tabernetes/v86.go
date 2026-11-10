@@ -96,6 +96,9 @@ func (v *v86VM) start(ctx context.Context, log io.Writer, pull *imagePull) error
 			"args":       args,
 			"env":        env,
 			"workingDir": c.WorkingDir,
+			"stdin":      c.Stdin,
+			"stdinOnce":  c.StdinOnce,
+			"tty":        c.TTY,
 		},
 	}
 
@@ -175,10 +178,6 @@ func (v *v86VM) stop() {
 			f.Release()
 		}
 	})
-}
-
-func (v *v86VM) exec(ctx context.Context, cmd []string, in io.Reader, out, errOut io.Writer) error {
-	return errors.New("kubectl exec is not supported for pods that run in v86 (yet); kubectl logs shows the console")
 }
 
 // dial opens a TCP connection to port of the pod, through the network card

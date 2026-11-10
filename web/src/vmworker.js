@@ -170,7 +170,8 @@ async function start(m) {
     return;
   }
   const init = new Uint8Array(await (await fetch(m.initURL)).arrayBuffer());
-  const conf = { ...spec, hostname: m.hostname, ip: m.ip, gateway: m.gateway };
+  const c = m.container;
+  const conf = { ...spec, hostname: m.hostname, ip: m.ip, gateway: m.gateway, stdin: !!c.stdin, stdinOnce: !!c.stdinOnce, tty: !!c.tty };
   const initrd = buildRootfs(img.layers, {
     ".tabernetes/init": { mode: modes.S_IFREG | 0o755, data: init },
     ".tabernetes/config.json": { mode: modes.S_IFREG | 0o644, data: new TextEncoder().encode(JSON.stringify(conf)) },

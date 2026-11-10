@@ -9,7 +9,8 @@
 // container. The kernel has set up eth0 (ip= on its command line). The
 // console (ttyS0) is stdout and stderr of the container; the second serial
 // port (ttyS1) tells the page "started", "exit <code>" and, if the
-// entrypoint did not start, "error <message>" before that.
+// entrypoint did not start, "error <message>" before that. kubectl exec and
+// attach come in over the network (exec.go).
 package main
 
 import (
@@ -19,7 +20,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -35,6 +35,10 @@ type config struct {
 	Hostname string   `json:"hostname"`
 	IP       string   `json:"ip"`
 	Gateway  string   `json:"gateway"`
+	// stdin, stdinOnce and tty of the container (kubectl run -it)
+	Stdin     bool `json:"stdin"`
+	StdinOnce bool `json:"stdinOnce"`
+	TTY       bool `json:"tty"`
 }
 
 var control *os.File
@@ -79,6 +83,9 @@ func run() (int, error) {
 			return 0, fmt.Errorf("mount %s: %w", m.dir, err)
 		}
 	}
+	// programs open /dev/ptmx, the pairs are in the instance of /dev/pts
+	os.Remove("/dev/ptmx")
+	os.Symlink("pts/ptmx", "/dev/ptmx")
 	// /dev was mounted after the open above
 	if control == nil {
 		control, _ = os.OpenFile("/dev/ttyS1", os.O_WRONLY, 0)
@@ -139,40 +146,27 @@ func run() (int, error) {
 	if err != nil {
 		return 128, err
 	}
-	cmd := &exec.Cmd{
-		Path:   path,
-		Args:   c.Args,
-		Env:    env,
-		Dir:    c.Cwd,
-		Stdout: console,
-		Stderr: console,
-		SysProcAttr: &syscall.SysProcAttr{
-			Setsid:     true,
-			Credential: cred,
-		},
+	dir := c.Cwd
+	if dir == "" {
+		dir = "/"
 	}
-	if cmd.Dir == "" {
-		cmd.Dir = "/"
-	}
-	if err := cmd.Start(); err != nil {
+	ctr := &process{env: env, dir: dir, cred: cred}
+	go reaper()
+	main, err := ctr.startMain(path, c, console)
+	if err != nil {
 		return 128, err
 	}
+	go serveExec(ctr)
 	report("started")
-	// PID 1 reaps every orphan until the container process exits.
-	for {
-		var ws syscall.WaitStatus
-		pid, err := syscall.Wait4(-1, &ws, 0, nil)
-		if err != nil && !errors.Is(err, syscall.EINTR) {
-			return 128, err
-		}
-		if pid != cmd.Process.Pid {
-			continue
-		}
-		if ws.Signaled() {
-			return 128 + int(ws.Signal()), nil
-		}
-		return ws.ExitStatus(), nil
+	return exitCode(<-main), nil
+}
+
+// exitCode is the exit code of a process as a shell reports it.
+func exitCode(ws syscall.WaitStatus) int {
+	if ws.Signaled() {
+		return 128 + int(ws.Signal())
 	}
+	return ws.ExitStatus()
 }
 
 func hasEnv(env []string, key string) bool {

@@ -139,6 +139,8 @@ func TestWgetURL(t *testing.T) {
 		"127.0.0.1:80":             "http://127.0.0.1:80",
 		"http://localhost:8080":    "http://localhost:8080",
 		"jkroepke.de":              "https://jkroepke.de",
+		"10.244.0.2":               "http://10.244.0.2",
+		"10.96.12.7:8080/x":        "http://10.96.12.7:8080/x",
 		"localhost.example.com:80": "https://localhost.example.com:80",
 		"raw.githubusercontent.com/kubernetes/website/main/README.md": "https://raw.githubusercontent.com/kubernetes/website/main/README.md",
 	} {

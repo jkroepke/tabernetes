@@ -206,6 +206,9 @@ func (s *shell) kubectl(ctx context.Context, hc interp.HandlerContext, args []st
 		fmt.Fprintf(hc.Stderr, "kubectl: %v\n", err)
 		return interp.ExitStatus(1)
 	}
+	if fromTerminal(hc.Stdin) && wantsTTY(args) {
+		return kubectlTTY(ctx, hc, args)
+	}
 	if a, ok := interactiveExec(args); ok && fromTerminal(hc.Stdin) {
 		return exitCode(execLines(ctx, a))
 	}

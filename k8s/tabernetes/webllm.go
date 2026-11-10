@@ -21,13 +21,15 @@ import (
 	utilexec "k8s.io/utils/exec"
 )
 
-// webllm:<model> runs a language model with WebLLM (https://webllm.mlc.ai)
-// on the GPU of the browser. The model is a WebLLM model id, its weights come
-// from Hugging Face and stay in the Cache Storage of the browser. The pod
+// The image huggingface.co/mlc-ai/<model> runs a language model with WebLLM
+// (https://webllm.mlc.ai) on the GPU of the browser. The model is a WebLLM
+// model id, and that repository on Hugging Face has its weights: the tab
+// pulls them from there and keeps them in the Cache Storage of the browser. The pod
 // serves the OpenAI chat API on port 8000, and "chat" answers on kubectl exec.
 
 const (
 	webllmPort    = 8000
+	webllmRepo    = "huggingface.co/mlc-ai/"
 	defaultModel  = "Qwen2.5-1.5B-Instruct-q4f16_1-MLC"
 	webllmPrompts = "You are a helpful assistant. You run in a browser tab, on the GPU through WebGPU, " +
 		"as a pod on a Kubernetes node that is the browser tab itself. Answer briefly."
@@ -49,7 +51,19 @@ func newWebLLM(tp *tabPod, model string) (workload, error) {
 	return &webLLM{tp: tp, model: model}, nil
 }
 
-func (m *webLLM) imageID() string { return "webllm://" + m.model }
+// webllmModel returns the model of a WebLLM image:
+// huggingface.co/mlc-ai/<model>, or webllm:<model> as before.
+func webllmModel(image string) (string, bool) {
+	if model, ok := strings.CutPrefix(image, webllmRepo); ok && model != "" {
+		return model, true
+	}
+	if name, tag, _ := strings.Cut(image, ":"); name == "webllm" || name == "tabernetes.dev/webllm" {
+		return tag, true
+	}
+	return "", false
+}
+
+func (m *webLLM) imageID() string { return webllmRepo + m.model }
 
 func (m *webLLM) runtime() string { return "webgpu" }
 

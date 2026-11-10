@@ -43,6 +43,10 @@ browser tab (single wasm binary)                     docker run tabernetes
   servers that allow CORS, for example `raw.githubusercontent.com`.
   `localhost` and `127.0.0.1` stay in the in-process network of the Wasm, so
   `k port-forward deploy/web 8080:80 &` and `wget -qO- localhost:8080` work.
+  The terminal is not in the pod network, but `wget 10.244.0.2` still
+  reaches a pod: a pod IP or a ClusterIP goes through the port-forward of the
+  apiserver to the pod, or to a ready endpoint of the Service
+  (`k8s/tabernetes/podnet.go`).
 - `history` lists the command lines of the tab, and Ctrl-R searches them
   backwards like Bash. The history ends with the tab.
 - `cmd &` runs in the background, `jobs` lists the jobs, `kill %1` stops one.
@@ -92,18 +96,16 @@ browser tab (single wasm binary)                     docker run tabernetes
   `join` comes first, `kubernetes.io/os=browser`, so the DaemonSets stay away,
   and the extended resource `tabernetes.dev/webgpu`), runs the pods bound to it and serves
   logs, exec and port-forward on `10.0.1.1:10250` with the streaming code of
-  the upstream kubelet (`k8s.io/cri-streaming`). An image `webllm:<model>` is
-  a [WebLLM](https://webllm.mlc.ai) model ID (`k8s/tabernetes/webllm.go`): a
-  worker (`web/src/gpuworker.js`) loads the weights from Hugging Face, which
+  the upstream kubelet (`k8s.io/cri-streaming`). An image
+  `huggingface.co/mlc-ai/<model>` is a [WebLLM](https://webllm.mlc.ai) model
+  ID (`k8s/tabernetes/webllm.go`): a worker (`web/src/gpuworker.js`) loads the
+  weights from that repository on Hugging Face, which
   allows CORS, and keeps them in the Cache Storage. The download of the
   weights is the image pull, with the events of the kubelet (`Pulling`,
   `Pulled` with the size, or `already present on machine` from the cache, then
   `Created` and `Started`); a failed download is `ErrImagePull` and
   `ImagePullBackOff`. The pod serves the OpenAI chat API on port 8000, and
-  `kubectl exec deploy/llm -- chat [question]` answers on the terminal. The
-  shell has no tty: for `kubectl exec -i` (and `-it`) on the terminal, it
-  edits the lines itself and sends Ctrl-C as `\x03`
-  (`k8s/tabernetes/exec.go`). `llm` needs WebGPU (Chrome or Edge); without
+  `kubectl exec deploy/llm -- chat [question]` answers on the terminal. `llm` needs WebGPU (Chrome or Edge); without
   `shader-f16` it takes the `q4f32` variant of the default model, Qwen2.5
   1.5B.
 - Every other image runs as a container on the tab node, in
@@ -127,8 +129,18 @@ browser tab (single wasm binary)                     docker run tabernetes
   entrypoint did not start (`StartError`, exit code 128). The exit code goes
   through the restart policy (`Completed`, `Error`, `CrashLoopBackOff`).
   `kubectl port-forward` reaches the pod through the virtio network card of
-  the VM. `kubectl exec` is not supported. nginx:alpine runs after about 5
-  seconds.
+  the VM. So does the kubelet for `kubectl exec` and `attach`: init listens
+  on port 60250 and starts the command in the container, with a pty for
+  `-t` (`vm/init/exec.go`, `k8s/tabernetes/v86exec.go`). With `stdin` and
+  `tty` in the pod (`kubectl run -it`), the entrypoint gets a pty, too, and
+  `kubectl attach` connects to it. nginx:alpine runs after about 5 seconds.
+- The terminal has no tty device, but kubectl gets one: the js variant of
+  `github.com/moby/term` (`k8s/_overlay/`) reports the terminal of the page
+  as a tty, so `kubectl exec -it`, `attach -it` and `run -it --rm` go to raw
+  mode and send every key to the container (`k8s/tabernetes/ttyexec.go`). A
+  workload without a tty of its own (llm) gets the line editing of a tty in
+  canonical mode from the kubelet. `kubectl exec -i` without `-t` edits the
+  lines on the terminal and sends Ctrl-C as `\x03` (`k8s/tabernetes/exec.go`).
 - `free` shows the WebAssembly memory (wasm32 ends at 4 GiB, and the linear
   memory never shrinks), the Go heap and the number of goroutines.
 - `vi` (`k8s/tabernetes/vi.go`) is a small vi for manifests. It runs in raw mode:

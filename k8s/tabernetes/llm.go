@@ -12,7 +12,8 @@ import (
 
 // llm runs a language model on the GPU of a tab as the Deployment "llm":
 // it applies the manifest, like kubectl create deployment, and that is all.
-// The tab node (tabnode.go) pulls the image webllm:<model> (webllm.go), and
+// The tab node (tabnode.go) pulls the image huggingface.co/mlc-ai/<model>
+// (webllm.go), and
 // kubectl exec -it deploy/llm -- chat talks to it.
 
 const llmManifest = `apiVersion: apps/v1
@@ -46,7 +47,7 @@ spec:
       - {key: tabernetes.dev/tab, operator: Exists}
       containers:
       - name: llm
-        image: webllm:%s
+        image: huggingface.co/mlc-ai/%s
         ports:
         - {name: http, containerPort: 8000}
         resources:
@@ -77,9 +78,7 @@ func llmCmd(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	} else if d, err := n.cs.AppsV1().Deployments(corev1.NamespaceDefault).Get(ctx, "llm", metav1.GetOptions{}); err == nil {
 		// keep the model of the deployment
 		if c := d.Spec.Template.Spec.Containers; len(c) == 1 {
-			if name, tag, ok := strings.Cut(c[0].Image, ":"); ok && name == "webllm" {
-				model = tag
-			}
+			model, _ = webllmModel(c[0].Image)
 		}
 	}
 	if model == "" {

@@ -51,15 +51,13 @@ func (e *startError) Error() string { return e.msg }
 
 // newWorkload picks the workload for the image of c.
 func newWorkload(tp *tabPod, c *corev1.Container) (workload, error) {
-	name, tag, _ := strings.Cut(c.Image, ":")
-	switch name {
-	case "webllm", "tabernetes.dev/webllm":
-		return newWebLLM(tp, tag)
+	if model, ok := webllmModel(c.Image); ok {
+		return newWebLLM(tp, model)
 	}
 	if hasVM() {
 		return newV86(tp, c)
 	}
-	return nil, fmt.Errorf("the tab node runs no containers, only images that run in the browser: webllm:<model> (not %q)", c.Image)
+	return nil, fmt.Errorf("the tab node runs no containers, only images that run in the browser: "+webllmRepo+"<model> (not %q)", c.Image)
 }
 
 const (
