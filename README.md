@@ -66,18 +66,23 @@ browser tab (single wasm binary)                     docker run tabernetes
 - Every tab is a node. The control plane runs in a SharedWorker
   (`web/src/cluster.js`, `k8s/tabernetes/tabs.go`) that all tabs of the page
   share, and it lives as long as one of them is open: open a second tab, and
-  it joins as `tab-2`; close the first one, and the cluster keeps running.
-  The first tab hands its download to the worker, which compiles a second
-  instance of the binary for the control plane. Each tab runs the binary for
-  its shell, kubectl and kubelet, and every connection between a tab and the
-  worker is a MessagePort of its own. A tab holds a Web Lock while it is open;
-  the worker waits for that lock, so it learns when a tab closes, deletes its
-  node and renews the node leases in between (timers of a hidden tab may fire
-  only once a minute). WebRTC does not exist in workers: the data channels of
-  a node from `join` stay in the tab that ran `join`, and go on to the worker
-  over MessagePorts. When that tab closes, the node agent exits, and the
-  worker deletes its node. Without SharedWorker or Web Locks (Chrome on Android),
-  the tab runs the control plane itself, as before.
+  it joins as `tab-2`; close the first one, and the cluster keeps running. The
+  first tab hands its download to the worker, which compiles a second instance
+  of the binary for the control plane. Each tab runs the binary for its shell,
+  kubectl and kubelet, and every connection between a tab and the worker is a
+  MessagePort of its own. A tab holds a Web Lock while it is open; the worker
+  waits for that lock, so it learns when a tab closes, deletes its node and
+  renews the node leases in between (timers of a hidden tab may fire only once
+  a minute). WebRTC does not exist in workers, so the tabs hold the
+  connections to a node from `join`: every tab connects to every such node,
+  and the data channels go on to the worker over MessagePorts. Only the first
+  connection needs copy and paste. Every further tab sends its offer through
+  the worker and a tab that is already connected (a data channel `signal`),
+  and the node agent answers on a new peer connection on the same UDP port.
+  The node lives as long as one of these tabs is open; once none is left, the
+  worker deletes the node, and the agent exits 30 seconds later. Without
+  SharedWorker or Web Locks (Chrome on Android), the tab runs the control
+  plane itself, as before.
 - `llm [model]` deploys a language model to the GPU of a tab: it applies the
   Deployment `llm` and returns, as `kubectl create deployment` would. The
   scheduler prefers the tab that ran `llm`; when that tab closes, the pod

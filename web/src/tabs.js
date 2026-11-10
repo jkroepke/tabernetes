@@ -12,8 +12,8 @@ export async function connectCluster(url) {
   const worker = new SharedWorker(url, { name: "tabernetes" });
   const port = worker.port;
   const calls = new Map();
-  const listeners = { status: [], failed: [], exited: [] };
-  const dataChannels = new Map(); // node name -> open(label) of join.js
+  const listeners = { status: [], failed: [], exited: [], mesh: [] };
+  const dataChannels = new Map(); // docker node name -> open(label) of join.js
   let seq = 0;
   let hello;
   const greeted = new Promise((resolve, reject) => {
@@ -25,7 +25,7 @@ export async function connectCluster(url) {
   port.onmessage = ({ data }) => {
     switch (data.type) {
       case "hello": hello(data); break;
-      case "status": case "failed": case "exited":
+      case "status": case "failed": case "exited": case "mesh":
         listeners[data.type].forEach((fn) => fn(data));
         break;
       case "rpc": {

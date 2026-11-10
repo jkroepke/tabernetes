@@ -9,6 +9,9 @@ import { zstdFrames, instantiate } from "./wasm.js";
 import { decompress } from "fzstd";
 
 const tabs = new Map(); // tab id -> MessagePort
+// The docker nodes from join: every tab connects to each of them over WebRTC
+// (web/src/join.js), and the node lives as long as one of these connections.
+const peers = new Map(); // node name -> Set of tab ids with a connected peer
 const statusLines = [];
 let binary = null; // a tab hands over the binary once
 let state = "new"; // new, booting, ready, failed, exited
@@ -80,6 +83,49 @@ function open(id, label, extra = {}) {
   return Promise.resolve(ch.port1);
 }
 
+// openNode opens a data channel to a docker node through one of the tabs that
+// are connected to it, or else through the tab that ran join.
+function openNode(name, label, fallback) {
+  const id = [...(peers.get(name) || [])].find((id) => tabs.has(id)) ?? fallback;
+  return open(id, label, { dc: name });
+}
+
+// signal hands the offer of a tab to a docker node and returns its answer,
+// through a data channel "signal" of a tab that is connected to the node.
+async function signal(from, name, sdp) {
+  for (const id of peers.get(name) || []) {
+    if (id === from || !tabs.has(id)) continue;
+    try {
+      const port = await open(id, "signal", { dc: name });
+      return await new Promise((resolve, reject) => {
+        const t = setTimeout(() => { port.close(); reject(new Error("the node does not answer")); }, 20000);
+        port.onmessage = ({ data }) => {
+          clearTimeout(t);
+          port.postMessage(null);
+          port.close();
+          if (data == null) reject(new Error("the node closed the signal channel"));
+          else resolve(JSON.parse(new TextDecoder().decode(data)).sdp);
+        };
+        const b = new TextEncoder().encode(JSON.stringify({ sdp })).buffer;
+        port.postMessage(b, [b]);
+      });
+    } catch { /* the next tab */ }
+  }
+  throw new Error(`no tab is connected to ${name}`);
+}
+
+// leave forgets the peers of a closed tab. A docker node without a connected
+// tab is gone: its agent ends.
+function leave(id, joined) {
+  for (const [name, ids] of peers) {
+    if (ids.delete(id) && !ids.size) {
+      peers.delete(name);
+      globalThis.tabernetes?.dropNode(name);
+    }
+  }
+  for (const name of joined) if (!peers.has(name)) globalThis.tabernetes?.dropNode(name);
+}
+
 const methods = {
   // joinTab adds the tab as a node and removes it once the tab is closed.
   async joinTab(id) {
@@ -88,15 +134,34 @@ const methods = {
     tabs.get(id)?.nodes.push(info.name);
     return info;
   },
-  // prepareJoin is "join" (docker) in a tab: the WebRTC connection lives in
-  // that tab.
+  // prepareJoin is "join" (docker) in a tab: the WebRTC connections live in
+  // the tabs, one per tab.
   async prepareJoin(id) {
     await ready;
     let name = "";
-    const info = await globalThis.tabernetes.prepareJoin((label) => open(id, label, { dc: name }));
+    const info = await globalThis.tabernetes.prepareJoin((label) => openNode(name, label, id));
     name = info.name;
-    tabs.get(id)?.nodes.push(name);
+    tabs.get(id)?.joined.push(name);
     return info;
+  },
+  // meshUp: the tab is connected to the docker node name. The other tabs
+  // connect to it too.
+  meshUp(id, name) {
+    if (!peers.has(name)) peers.set(name, new Set());
+    peers.get(name).add(id);
+    for (const [other, port] of tabs) if (other !== id) port.postMessage({ type: "mesh", name });
+  },
+  // meshDown: the connection of the tab to the node failed.
+  meshDown(id, name) {
+    peers.get(name)?.delete(id);
+  },
+  // meshNodes: the docker nodes a new tab connects to.
+  meshNodes() {
+    return [...peers].filter(([, ids]) => ids.size).map(([name]) => name);
+  },
+  // meshOffer: the offer of the tab to the node, the answer comes back.
+  meshOffer(id, name, sdp) {
+    return signal(id, name, sdp);
   },
 };
 
@@ -108,12 +173,14 @@ self.onconnect = (e) => {
       case "hello": {
         id = data.id;
         port.nodes = [];
+        port.joined = [];
         tabs.set(id, port);
         // The tab holds this lock while it is open.
         navigator.locks.request(data.lock, () => {
           tabs.delete(id);
-          // Its node, and the nodes from join: their WebRTC connections ended with it.
+          // Its node, and the docker nodes that no other tab is connected to.
           for (const name of port.nodes) globalThis.tabernetes?.dropNode(name);
+          leave(id, port.joined);
         });
         const needBinary = binary === null;
         if (needBinary) binary = id;

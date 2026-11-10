@@ -115,26 +115,24 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	pc, err := newPeer(tok, *stun, *advertise)
+	m, err := newMesh(ctx, cancel, tok, *stun, *advertise)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer pc.Close()
-	pc.OnDataChannel(onDataChannel)
-
+	defer m.close()
+	pc, err := m.newPeer()
+	if err != nil {
+		log.Fatal(err)
+	}
 	connected := make(chan struct{})
 	var once sync.Once
-	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("webrtc: connection %s", s)
-		switch s {
-		case webrtc.PeerConnectionStateConnected:
-			once.Do(func() { close(connected) })
-		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
-			cancel()
-		}
-	})
+	m.add(pc, func() { once.Do(func() { close(connected) }) })
 
-	answer, err := answerOffer(ctx, pc, tok.SDP)
+	sdp, err := answerOffer(ctx, pc, tok.SDP)
+	if err != nil {
+		log.Fatal(err)
+	}
+	answer, err := encode(answerToken{V: 1, SDP: sdp})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -156,14 +154,13 @@ func main() {
 			}
 		}
 	}
-	t := &tunnel{pc: pc}
 	for _, addr := range []string{"127.0.0.1:6443", apiserverIP + ":6443"} {
 		l, err := net.Listen("tcp", addr)
 		if err != nil {
 			log.Printf("listen %s: %v", addr, err)
 			continue
 		}
-		go t.serve(ctx, l)
+		go m.serve(ctx, l)
 	}
 
 	if !*noKubelet {
@@ -174,7 +171,25 @@ func main() {
 	<-ctx.Done()
 }
 
-func newPeer(tok offerToken, stun, advertise string) (*webrtc.PeerConnection, error) {
+// mesh is the set of WebRTC peer connections to the browser: one to every
+// tab of the page. The first one comes from the token. Every further tab
+// sends its offer through a peer that is already connected (a data channel
+// "signal"), so the node lives on as long as one of the tabs is open. The
+// agent ends once no peer is left.
+type mesh struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	api    *webrtc.API
+	cfg    webrtc.Configuration
+	mux    ice.UDPMux
+
+	mu    sync.Mutex
+	peers map[*webrtc.PeerConnection]bool // connected
+	next  int
+}
+
+func newMesh(ctx context.Context, cancel context.CancelFunc, tok offerToken, stun, advertise string) (*mesh, error) {
+	m := &mesh{ctx: ctx, cancel: cancel, peers: map[*webrtc.PeerConnection]bool{}}
 	se := webrtc.SettingEngine{}
 	// The ICE checks start with the answer, but the browser only joins them
 	// once the "accept" line is pasted. pion gives up after 30s by default;
@@ -187,12 +202,14 @@ func newPeer(tok offerToken, stun, advertise string) (*webrtc.PeerConnection, er
 	if tok.Port > 0 {
 		// One socket for host and STUN candidates on the fixed port that
 		// `docker run -p` publishes. A port range of one port would make every
-		// further candidate (the advertised address, STUN) fail to bind.
+		// further candidate (the advertised address, STUN) fail to bind. The
+		// peers of all tabs share it.
 		conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: tok.Port})
 		if err != nil {
 			return nil, err
 		}
-		se.SetICEUDPMux(ice.NewUniversalUDPMuxDefault(ice.UniversalUDPMuxParams{UDPConn: conn}))
+		m.mux = ice.NewUniversalUDPMuxDefault(ice.UniversalUDPMuxParams{UDPConn: conn})
+		se.SetICEUDPMux(m.mux)
 	}
 	if advertise != "" {
 		if err := se.SetICEAddressRewriteRules(webrtc.ICEAddressRewriteRule{
@@ -204,12 +221,96 @@ func newPeer(tok offerToken, stun, advertise string) (*webrtc.PeerConnection, er
 		}
 	}
 	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
-	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
-	cfg := webrtc.Configuration{}
+	m.api = webrtc.NewAPI(webrtc.WithSettingEngine(se))
 	if stun != "" {
-		cfg.ICEServers = []webrtc.ICEServer{{URLs: []string{stun}}}
+		m.cfg.ICEServers = []webrtc.ICEServer{{URLs: []string{stun}}}
 	}
-	return api.NewPeerConnection(cfg)
+	return m, nil
+}
+
+func (m *mesh) newPeer() (*webrtc.PeerConnection, error) {
+	return m.api.NewPeerConnection(m.cfg)
+}
+
+// add watches pc: onConnected runs once it is connected, and the agent ends
+// when the last peer fails or closes.
+func (m *mesh) add(pc *webrtc.PeerConnection, onConnected func()) {
+	m.mu.Lock()
+	m.next++
+	n := m.next
+	m.peers[pc] = false
+	m.mu.Unlock()
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) { m.onDataChannel(dc) })
+	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if _, ok := m.peers[pc]; !ok {
+			return
+		}
+		log.Printf("webrtc: tab %d %s", n, s)
+		switch s {
+		case webrtc.PeerConnectionStateConnected:
+			m.peers[pc] = true
+			if onConnected != nil {
+				go onConnected()
+			}
+		case webrtc.PeerConnectionStateDisconnected:
+			// A closed tab may end here without a goodbye, and ICE only
+			// gives up on it after minutes. Without any connected tab for
+			// a while, the browser is gone.
+			m.peers[pc] = false
+			go m.orphaned()
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+			delete(m.peers, pc)
+			go pc.Close()
+			if len(m.peers) == 0 {
+				log.Print("webrtc: no tab is left")
+				m.cancel()
+			}
+		}
+	})
+}
+
+// orphanTimeout is how long the agent waits for a tab when none is
+// connected any more.
+const orphanTimeout = 30 * time.Second
+
+func (m *mesh) orphaned() {
+	select {
+	case <-m.ctx.Done():
+		return
+	case <-time.After(orphanTimeout):
+	}
+	if len(m.connected()) == 0 {
+		log.Printf("webrtc: no tab connected for %s", orphanTimeout)
+		m.cancel()
+	}
+}
+
+// connected returns the connected peers.
+func (m *mesh) connected() []*webrtc.PeerConnection {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var c []*webrtc.PeerConnection
+	for pc, ok := range m.peers {
+		if ok {
+			c = append(c, pc)
+		}
+	}
+	return c
+}
+
+func (m *mesh) close() {
+	m.mu.Lock()
+	peers := m.peers
+	m.peers = map[*webrtc.PeerConnection]bool{}
+	m.mu.Unlock()
+	for pc := range peers {
+		pc.Close()
+	}
+	if m.mux != nil {
+		m.mux.Close()
+	}
 }
 
 func answerOffer(ctx context.Context, pc *webrtc.PeerConnection, sdp string) (string, error) {
@@ -231,16 +332,44 @@ func answerOffer(ctx context.Context, pc *webrtc.PeerConnection, sdp string) (st
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
-	return encode(answerToken{V: 1, SDP: pc.LocalDescription().SDP})
+	return pc.LocalDescription().SDP, nil
 }
 
-type tunnel struct {
-	pc *webrtc.PeerConnection
+// signal answers the offer of another tab: one JSON message {"sdp": ...}
+// each way on a data channel "signal".
+func (m *mesh) signal(raw io.ReadWriteCloser) {
+	defer raw.Close()
+	buf := make([]byte, 64*1024)
+	n, err := raw.Read(buf)
+	if err != nil {
+		return
+	}
+	var req struct {
+		SDP string `json:"sdp"`
+	}
+	if err := json.Unmarshal(buf[:n], &req); err != nil {
+		log.Printf("signal: %v", err)
+		return
+	}
+	pc, err := m.newPeer()
+	if err != nil {
+		log.Printf("signal: %v", err)
+		return
+	}
+	m.add(pc, nil)
+	sdp, err := answerOffer(m.ctx, pc, req.SDP)
+	if err != nil {
+		log.Printf("signal: %v", err)
+		pc.Close()
+		return
+	}
+	b, _ := json.Marshal(map[string]string{"sdp": sdp})
+	raw.Write(b)
 }
 
 // serve forwards local TCP connections (kubelet, kube-proxy, pods) to the
-// kube-apiserver in the browser.
-func (t *tunnel) serve(ctx context.Context, l net.Listener) {
+// kube-apiserver in the browser, through any connected tab.
+func (m *mesh) serve(ctx context.Context, l net.Listener) {
 	go func() { <-ctx.Done(); l.Close() }()
 	for {
 		c, err := l.Accept()
@@ -248,57 +377,84 @@ func (t *tunnel) serve(ctx context.Context, l net.Listener) {
 			return
 		}
 		go func() {
-			ordered := true
-			dc, err := t.pc.CreateDataChannel("api", &webrtc.DataChannelInit{Ordered: &ordered})
-			if err != nil {
-				log.Printf("create data channel: %v", err)
+			raw := m.openAPI()
+			if raw == nil {
 				c.Close()
 				return
 			}
-			dc.OnOpen(func() {
-				raw, err := dc.Detach()
-				if err != nil {
-					log.Printf("detach: %v", err)
-					c.Close()
-					return
-				}
-				splice(c, raw)
-			})
+			splice(c, raw)
 		}()
 	}
 }
 
-func init() {
-	// Channels opened by the browser: apiserver -> kubelet (logs, exec, port-forward).
-	onDataChannel = func(dc *webrtc.DataChannel) {
-		label := dc.Label()
-		if label == "ctl" {
-			// The browser only opens "ctl" so the offer carries an SCTP section; nothing to do.
-			return
+// openAPI opens a data channel to the kube-apiserver. A tab that was just
+// closed may still count as connected for some seconds: then the channel
+// does not open, and the next tab gets its turn.
+func (m *mesh) openAPI() io.ReadWriteCloser {
+	ordered := true
+	for _, pc := range m.connected() {
+		dc, err := pc.CreateDataChannel("api", &webrtc.DataChannelInit{Ordered: &ordered})
+		if err != nil {
+			continue
 		}
-		target, ok := strings.CutPrefix(label, "kubelet:")
-		if !ok {
-			log.Printf("ignoring data channel %q", label)
-			dc.Close()
-			return
-		}
+		opened := make(chan io.ReadWriteCloser, 1)
 		dc.OnOpen(func() {
 			raw, err := dc.Detach()
 			if err != nil {
-				return
+				raw = nil
 			}
-			c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", target), 10*time.Second)
-			if err != nil {
-				log.Printf("dial kubelet: %v", err)
-				raw.Close()
-				return
-			}
-			splice(c, raw)
+			opened <- raw
 		})
+		select {
+		case raw := <-opened:
+			if raw != nil {
+				return raw
+			}
+		case <-time.After(3 * time.Second):
+			dc.Close()
+		case <-m.ctx.Done():
+			return nil
+		}
 	}
+	return nil
 }
 
-var onDataChannel func(*webrtc.DataChannel)
+// onDataChannel takes the channels a tab opens: "kubelet:<port>" from the
+// kube-apiserver to the kubelet (logs, exec, port-forward), and "signal".
+func (m *mesh) onDataChannel(dc *webrtc.DataChannel) {
+	label := dc.Label()
+	switch label {
+	case "ctl":
+		// The browser only opens "ctl" so the offer carries an SCTP section; nothing to do.
+		return
+	case "signal":
+		dc.OnOpen(func() {
+			if raw, err := dc.Detach(); err == nil {
+				m.signal(raw)
+			}
+		})
+		return
+	}
+	target, ok := strings.CutPrefix(label, "kubelet:")
+	if !ok {
+		log.Printf("ignoring data channel %q", label)
+		dc.Close()
+		return
+	}
+	dc.OnOpen(func() {
+		raw, err := dc.Detach()
+		if err != nil {
+			return
+		}
+		c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", target), 10*time.Second)
+		if err != nil {
+			log.Printf("dial kubelet: %v", err)
+			raw.Close()
+			return
+		}
+		splice(c, raw)
+	})
+}
 
 // dataChannelRW turns a detached data channel into a stream: SCTP messages are
 // at most 64 KiB, writes are chunked accordingly.

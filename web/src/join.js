@@ -66,6 +66,71 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
   };
   render();
 
+  // channels returns open(label) for the data channels a tab opens to a node.
+  const channels = (pc) => (label) => new Promise((resolve, reject) => {
+    const dc = pc.createDataChannel(label);
+    const t = setTimeout(() => reject(new Error("data channel timeout")), 15000);
+    dc.onopen = () => { clearTimeout(t); resolve(dc); };
+    dc.onerror = (e) => { clearTimeout(t); reject(e.error || new Error("data channel error")); };
+    dc.onclose = () => { clearTimeout(t); reject(new Error("data channel closed")); };
+  });
+
+  // watch follows the connection of a node. With the control plane in the
+  // shared worker, every tab connects to every docker node; the worker learns
+  // which tabs it can reach the node through.
+  const watch = (pc, name) => {
+    let up = false;
+    pc.onconnectionstatechange = () => {
+      render();
+      if (!cluster) {
+        // A failed connection never recovers: free it and its data channels.
+        if (pc.connectionState === "failed") pc.close();
+        return;
+      }
+      if (pc.connectionState === "connected" && !up) {
+        up = true;
+        cluster.rpc("meshUp", name);
+      } else if (pc.connectionState === "failed") {
+        if (up) cluster.rpc("meshDown", name);
+        up = false;
+        pc.close();
+        if (cluster.dataChannels.get(name)?.pc === pc) cluster.dataChannels.delete(name);
+      }
+    };
+  };
+
+  // meshConnect connects this tab to a docker node that joined through
+  // another tab: the offer goes there through the shared worker.
+  const meshConnect = async (name) => {
+    if (nodes.some((n) => n.info.name === name)) return;
+    const pc = new RTCPeerConnection({ iceServers: stun ? [{ urls: stun }] : [] });
+    const entry = { pc, info: { name } };
+    nodes.push(entry);
+    pc.createDataChannel("ctl");
+    pc.ondatachannel = (e) => cluster.bridge(e.channel);
+    const open = channels(pc);
+    open.pc = pc;
+    cluster.dataChannels.set(name, open);
+    watch(pc, name);
+    render();
+    try {
+      await pc.setLocalDescription(await pc.createOffer());
+      await gatheringComplete(pc, 3000);
+      const sdp = await cluster.rpc("meshOffer", name, pc.localDescription.sdp);
+      await pc.setRemoteDescription({ type: "answer", sdp });
+    } catch (e) {
+      console.warn(`tabernetes: connecting to ${name}:`, e);
+      pc.close();
+      nodes.splice(nodes.indexOf(entry), 1);
+      if (cluster.dataChannels.get(name) === open) cluster.dataChannels.delete(name);
+      render();
+    }
+  };
+  if (cluster) {
+    cluster.on("mesh", ({ name }) => meshConnect(name));
+    cluster.rpc("meshNodes").then((names) => names.forEach(meshConnect), () => {});
+  }
+
   // finish hands the answer of the node to the pending connection.
   const finish = async (answer, term) => {
     let ans;
@@ -95,12 +160,8 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
       pc.createDataChannel("ctl");
       // With the control plane in the shared worker, the data channels go on there.
       pc.ondatachannel = (e) => cluster ? cluster.bridge(e.channel) : globalThis.tabernetes.attachChannel(e.channel);
-      const open = (label) => new Promise((resolve, reject) => {
-        const dc = pc.createDataChannel(label);
-        const t = setTimeout(() => reject(new Error("data channel timeout")), 15000);
-        dc.onopen = () => { clearTimeout(t); resolve(dc); };
-        dc.onerror = (e) => { clearTimeout(t); reject(e.error || new Error("data channel error")); };
-      });
+      const open = channels(pc);
+      open.pc = pc;
       let info;
       if (cluster) {
         info = await cluster.rpc("prepareJoin");
@@ -113,11 +174,7 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
       const token = await encodeToken({
         v: 1, n: info.name, ip: info.ip, t: info.token, ca: info.ca, sdp: pc.localDescription.sdp, p: port,
       });
-      pc.onconnectionstatechange = () => {
-        render();
-        // A failed connection never recovers: free it and its data channels.
-        if (pc.connectionState === "failed") pc.close();
-      };
+      watch(pc, info.name);
       pending = { pc, info };
       globalThis.tabernetesLastJoin = { token, port, name: info.name };
       nodes.push(pending);
