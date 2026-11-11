@@ -116,6 +116,19 @@ export async function saveHome(put, del) {
   });
 }
 
+// keepStorage asks the browser to keep what Tabernetes saved. Without it the
+// storage of the origin is "best-effort": under disk pressure the browser may
+// delete the cluster, /root and the image layers without a word. Chrome
+// decides by itself (bookmarked or often used sites), Safari grants it to
+// sites in use, Firefox asks the user. It asks once the cluster runs, not on
+// page load, and not again once granted. Only a page can ask, not a worker.
+export async function keepStorage() {
+  try {
+    if (!navigator.storage?.persist || (await navigator.storage.persisted())) return;
+    if (!(await navigator.storage.persist())) console.info("tabernetes: the browser keeps the saved cluster and images as best-effort storage only");
+  } catch { /* no Storage API */ }
+}
+
 // The Web Locks of a layer (layers.js): a pod holds the first one, shared,
 // for as long as it runs with the layer. A pull holds the second one while it
 // unpacks the layer.

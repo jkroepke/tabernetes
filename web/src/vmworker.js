@@ -12,6 +12,7 @@
 import { V86 } from "v86";
 import { Tree, LayerStorage, modes } from "./rootfs.js";
 import { openStore } from "./layers.js";
+import { SHA256 } from "./sha256.js";
 
 const post = (m, transfer) => self.postMessage(m, transfer || []);
 const CACHE = "tabernetes-configs"; // the configs of the images, small JSON blobs
@@ -91,8 +92,48 @@ class Pull {
     return new URL(`/tabernetes-blobs/${digest}`, self.location.href).href;
   }
 
-  async blob(digest, keep = true) {
-    const c = keep && (await this.cache);
+  // layer streams the blob of a layer and hashes it on the way. verify()
+  // throws once the stream ended when the digest is wrong.
+  layer(digest) {
+    const hash = new SHA256();
+    let got = "";
+    const fetchLayer = async () => {
+      const r = await fetch(`${this.base}/blobs/${digest}`).catch((e) => {
+        throw new PullError(`failed to copy: httpReadSeeker: failed open: ${e.message} (registry mirror unreachable)`);
+      });
+      if (!r.ok) throw new PullError(`failed to copy: httpReadSeeker: failed open: unexpected status code ${r.url}: ${r.status} ${r.statusText}`);
+      // A broken connection fails the stream with a PullError, so that the
+      // pull does not report it as an unpack error.
+      const body = r.body.getReader();
+      return new ReadableStream({
+        pull: async (c) => {
+          let chunk;
+          try {
+            chunk = await body.read();
+          } catch (e) {
+            throw new PullError(`failed to copy: read ${digest}: ${e.message}`);
+          }
+          if (chunk.done) {
+            got = "sha256:" + hash.hex();
+            c.close();
+            return;
+          }
+          hash.update(chunk.value);
+          this.fetched += chunk.value.length;
+          c.enqueue(chunk.value);
+        },
+        cancel: (why) => body.cancel(why),
+      });
+    };
+    const verify = () => {
+      if (got !== digest) throw new PullError(`failed commit on ref "layer-${digest}": unexpected commit digest ${got}, expected ${digest}`);
+    };
+    return { fetch: fetchLayer, verify };
+  }
+
+  // blob fetches a small blob (the config) through the Cache Storage.
+  async blob(digest) {
+    const c = await this.cache;
     const hit = c && (await c.match(this.blobURL(digest)));
     if (hit) return new Uint8Array(await hit.arrayBuffer());
     const r = await fetch(`${this.base}/blobs/${digest}`);
@@ -137,10 +178,11 @@ async function pullImage(registry, image, onFetching) {
   for (const [i, l] of m.layers.entries()) {
     let idx = indexes[i];
     if (!idx) {
-      const b = await p.blob(l.digest, false);
+      const { fetch, verify } = p.layer(l.digest);
       try {
-        idx = await store.add(l.digest, b, l.mediaType);
+        idx = await store.add(l.digest, fetch, verify, l.mediaType);
       } catch (e) {
+        if (e instanceof PullError) throw e;
         const why = e?.name === "QuotaExceededError" ? "no space left on device" : e?.message || String(e);
         throw new PullError(`failed to extract layer ${l.digest}: write /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs: ${why}`);
       }
