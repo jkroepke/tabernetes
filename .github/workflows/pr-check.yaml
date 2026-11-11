@@ -6,6 +6,7 @@ on:
       - reopened
       - synchronize
       - labeled
+      - edited
       - unlabeled
       - edited
 
