@@ -174,8 +174,14 @@ jobs:
           VALIDATE_SPELL_CODESPELL: true
           VALIDATE_YAML: true
 
+  # Creates releases only when the repository variable RELEASES_ENABLED is
+  # true (Settings, Secrets and variables, Actions, Variables). Without it,
+  # main can take changes that should not be released yet.
   release:
-    if: github.repository_owner == 'jkroepke' && github.ref_name == 'main'
+    if: >-
+      github.repository_owner == 'jkroepke'
+      && github.ref_name == 'main'
+      && vars.RELEASES_ENABLED == 'true'
     name: Release
     runs-on: ubuntu-26.04
     concurrency: create-tag
