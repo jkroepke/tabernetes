@@ -83,11 +83,20 @@ that name.
   user/mount/net/cgroup namespaces, pasta (built from passt.top at the fixed
   commit `6aa4f88`, no Renovate on purpose) for the network,
   `KubeletInUserNamespace`. Keep `VOLUME /var/lib/containerd`.
+  A `--tmpfs` variant for containerd was discussed and not wanted.
 - **Persistence**: image layers in OPFS (`web/src/layers.js`, served to v86
   over 9p), cluster as an etcd snapshot in IndexedDB (`state.go`,
   `etcdshim/snapshot.go`), files of `/root` in IndexedDB. `forget` deletes
   all of it.
 - **Build tooling is mise** (`mise.toml` tasks), not a Makefile.
+- **Terminal**: the shell is mvdan.cc/sh with Go builtins (coreutils, `wget`,
+  `vi`, `kubectl edit` in raw mode). busybox-wasm and vigo were tried and
+  rejected.
+- **Persistence rules**: the etcd snapshot is saved only after boot, and a
+  change of lease keys alone does not trigger a save. A snapshot of another
+  Kubernetes minor version, or one that fails to boot, is dropped. `forget`
+  keeps the layers of running pods with a `<digest>.forgotten` mark; page
+  load and image GC sweep them later.
 
 ## Hosting and network constraints
 
@@ -106,6 +115,9 @@ that name.
   zstd. ghcr.io answers the CORS preflight with 405, so OCI artifacts are no
   option for the binary either.
 - The blog's CSP adds `'wasm-unsafe-eval'` only on pages with the shortcode.
+- Native `Content-Encoding: zstd` would need a proxy in front of Pages (for
+  example Cloudflare). Not wanted: the fzstd frames already decode in
+  parallel with download and compile.
 
 ## Runtime gotchas (Go `js/wasm` and browsers)
 
@@ -147,6 +159,18 @@ that name.
   `node/agent/imagemirror.go`). To debug a hang: `kill -USR1` containerd via
   `/proc` (the image has no `kill`/procps) and read the goroutine dump in
   `/var/log/containerd.log`; the agent restarts a killed containerd.
+- What the stall investigation (2026-11-08) proved, so nobody repeats it:
+  the goroutine dump showed a fetch blocked in a TLS read for 13 min, so no
+  bytes reached the netns. A newer pasta and a CONNECT proxy with a native
+  socket (tried, then reverted) both still stalled, so pasta is not the cause.
+  pasta answers TCP keepalives locally, so a dead upstream connection never
+  dies; only the timeout helps. The CRI transfer service counts a layer as
+  active only after its first progress, so the plain progress timeout did
+  not fire; `use_local_image_pull` counts every HTTP request. 20 s, not 10 s,
+  because of TCP retransmit backoff. `serializeImagePulls` stays `false`:
+  serial pulls plus back-off made the start take ~3 min. Parked alternatives:
+  Netavark (Podman only), RootlessKit (same as `userns.go`),
+  gvisor-tap-vsock, bypass4netns.
 - LAN join: publish the UDP port on all interfaces and pass
   `--advertise <LAN IP>` (the browser hides its IPs behind mDNS).
 
@@ -167,13 +191,24 @@ that name.
   sandbox disks are small.
 - Measure performance in several rounds: run-to-run variance is about one
   second.
+- Crash the control plane on purpose: CDP `Runtime.evaluate` of
+  `globalThis.tabernetes.attachPort(null,'api')` in the SharedWorker. Test
+  image GC with a vmworker bundle built with a small `IMAGE_FS` budget.
+- Sandboxes may refuse to build code fetched from outside (forks of v86,
+  kernel trees from GitHub), and their proxy may block demo sites on
+  github.io or pages.dev. Ubuntu packages over apt usually work, and dockerd
+  can be started by hand.
 
 ## Parked ideas (do not reopen without new numbers)
 
 - **Splitting the control plane into more workers** (apiserver / controllers /
   kubelet roles of one binary): measured on 2026-11-11, no gain beyond noise,
   +150 MiB per tab. Parked.
+  A kubelet-only variant first looked faster, but the early prompt came from a
+  bug (ready before the default ServiceAccount existed). Two rounds were not
+  enough to see that.
 - **Trimming controllers or APIs**: rejected (-0.4 s boot only).
+  The `providerless` build tag of k0s/k3s is a no-op in v1.37.
 - **wasm-opt -Oz**: -0.6 % zst, no faster boot. Rejected.
 - **Leader/follower etcd replication between tabs**: moot with the
   SharedWorker.
@@ -184,5 +219,12 @@ that name.
   `no_timer_check`, the pty poll must not block. Revisit when the Wasm TCG
   backend lands upstream, then pick the emulator per image architecture
   (386 -> v86, else QEMU). riscv64 via TinyEMU was rejected (no JIT).
+  ktock/qemu-wasm runs on wasm32 (wasm64 is not needed); the arm64 prebuilt
+  prints zero-padded numbers empty.
+- **v86 forks for 64-bit** (reviewed 2026-11-11): both keep the v86 API that
+  Tabernetes uses. v86_64 is x86_64 only, 1 CPU, 64-bit JIT, wasm32 up to
+  4 GiB. v64 does x86 32/64 and ARM64 (up to 8 cores with COOP/COEP), but its
+  ARM64 `virt` board has no virtio-9p, so the 9p layer rootfs does not work
+  there without a port to virtio-mmio/pci.
 - Of 37 popular Docker Hub images, 19 have `linux/386`, 24 `riscv64`, 12
   neither (node, MySQL, mariadb, mongo, rabbitmq, grafana, ...).
