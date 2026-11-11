@@ -1,14 +1,14 @@
 // Command init is PID 1 of a pod that runs in v86 on a tab node
-// (k8s/tabernetes/v86.go). The page serves the layers of the image over 9p,
-// with this program as /.tabernetes/init and the container as
-// /.tabernetes/config.json on top. The kernel mounts that as its root file
-// system and starts init=/.tabernetes/init.
+// (k8s/tabernetes/v86.go). The kernel starts it as /init of an initramfs,
+// where it waits for the pod (stage0.go): the page may save the VM at that
+// point and restore it for later pods. Then it mounts the layers of the
+// image over 9p, with the container as /.tabernetes/config.json on top, and
+// makes that the root file system.
 //
 // It does what containerd and runc do for a container: mount /proc, /sys and
 // /dev, write /etc/hosts and /etc/resolv.conf, set the hostname, then start
 // the entrypoint with the environment, working directory and user of the
-// container. The kernel has set up eth0 (ip= on its command line). The
-// console (ttyS0) is stdout and stderr of the container; the second serial
+// container. stage0 has set up eth0. The console (ttyS0) is stdout and stderr of the container; the second serial
 // port (ttyS1) tells the page "started", "exit <code>" and, if the
 // entrypoint did not start, "error <message>" before that. kubectl exec and
 // attach come in over the network (exec.go).
@@ -45,8 +45,16 @@ type config struct {
 var control *os.File
 
 func main() {
-	control, _ = os.OpenFile("/dev/ttyS1", os.O_WRONLY, 0)
-	code, err := run()
+	var code int
+	var err error
+	if inInitramfs() {
+		err = stage0()
+	} else {
+		control, _ = os.OpenFile("/dev/ttyS1", os.O_WRONLY, 0)
+	}
+	if err == nil {
+		code, err = run()
+	}
 	if err != nil {
 		// The kubelet reports a container that did not start as StartError
 		// with exit code 128, and the error in the events, not in the log.

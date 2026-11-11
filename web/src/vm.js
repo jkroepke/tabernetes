@@ -40,6 +40,7 @@ export function vmAPI({ version, workerURL, wasmURL, biosURL, kernelURL, initURL
         type: "start",
         ...opts,
         registry,
+        version,
         wasmURL: abs(wasmURL),
         biosURL: abs(biosURL),
         kernelURL: abs(kernelURL),

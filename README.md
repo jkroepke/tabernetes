@@ -156,11 +156,10 @@ browser tab (single wasm binary)                     docker run tabernetes
   in any tab (a shared Web Lock per layer) and layers used in the last two
   minutes stay. The worker merges the indices of the layers with
   their whiteouts into the file system JSON of v86 (`web/src/rootfs.js`), with
-  `/.tabernetes/init` and the container as `/.tabernetes/config.json` on top.
+  the container as `/.tabernetes/config.json` on top.
   v86 serves it over virtio 9p and reads a file from the tar only when the
   guest reads it; what the container writes stays in the memory of the
-  worker. The kernel mounts it as root (`root=host9p rootfstype=9p`), so the
-  image is not in the RAM of the VM (256 MiB, or the memory limit of the pod,
+  worker. init mounts it as root, so the image is not in the RAM of the VM (256 MiB, or the memory limit of the pod,
   at most 2 GiB: more is not possible in v86).
   The kernel is Linux 6.8 from Ubuntu for i386, `tinyconfig` plus
   `vm/kernel.config` (serial console, virtio-net, virtio-9p, highmem, so that
@@ -178,7 +177,14 @@ browser tab (single wasm binary)                     docker run tabernetes
   on port 60250 and starts the command in the container, with a pty for
   `-t` (`vm/init/exec.go`, `k8s/tabernetes/v86exec.go`). With `stdin` and
   `tty` in the pod (`kubectl run -it`), the entrypoint gets a pty, too, and
-  `kubectl attach` connects to it. nginx:alpine runs after about 5 seconds.
+  `kubectl attach` connects to it.
+  The VM boots while the image is pulled. init starts in an initramfs and
+  waits there for the pod; the first VM of each memory size saves its state
+  at that point (`web/src/vmstate.js`, OPFS), and later pods restore it
+  instead of booting the kernel. init then sets the clock, seeds the random
+  number generator, mounts the 9p root and sets up eth0
+  (`vm/init/stage0.go`). With the image present, the container of
+  nginx:alpine starts about 0.5 s after the kubelet asks for it.
 - The terminal has no tty device, but kubectl gets one: the js variant of
   `github.com/moby/term` (`k8s/_overlay/`) reports the terminal of the page
   as a tty, so `kubectl exec -it`, `attach -it` and `run -it --rm` go to raw
