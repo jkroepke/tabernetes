@@ -94,9 +94,13 @@ export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}
     n.data = buf;
   };
 
-  // changed paths, saved together a moment after the last change
+  // changed paths, saved together a moment after the last change, but no
+  // later than a few seconds after the first one: a program that writes all
+  // the time (a download with wget, a log) would put the save off forever.
+  // A reload right after a change, from vi say, saves on pagehide.
   const changed = new Set();
-  let timer = 0;
+  let timer = 0, since = 0;
+  if (persist && typeof addEventListener === "function") addEventListener("pagehide", () => changed.size && flush());
   const abs = (path) => "/" + split(path).join("/");
   // below prefix: prefix itself is always there
   const kept = (path) => persist && path.startsWith(persist.prefix + "/") &&
@@ -105,9 +109,10 @@ export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}
     if (!persist) return;
     path = abs(path);
     if (!kept(path)) return;
+    if (!changed.size) since = Date.now();
     changed.add(path);
     clearTimeout(timer);
-    timer = setTimeout(flush, 300);
+    timer = setTimeout(flush, Math.max(0, Math.min(300, since + 3000 - Date.now())));
   };
   const record = (path, n) => {
     const r = { path, mode: n.mode, mtime: n.mtime };
@@ -116,6 +121,7 @@ export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}
     return r;
   };
   function flush() {
+    clearTimeout(timer);
     const put = [], del = [];
     const walk = (path, n) => {
       if (!kept(path)) return;
