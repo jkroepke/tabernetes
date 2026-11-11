@@ -1,5 +1,5 @@
-// Package etcdshim is a tiny, non-persistent, single-node implementation of
-// the etcd v3 gRPC API. It implements just enough of the API for
+// Package etcdshim is a tiny, in-memory, single-node implementation of
+// the etcd v3 gRPC API. A snapshot (snapshot.go) can carry it over a reload. It implements just enough of the API for
 // kube-apiserver to run against it inside a WebAssembly sandbox.
 package etcdshim
 

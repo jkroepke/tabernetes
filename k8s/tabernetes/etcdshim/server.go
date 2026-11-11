@@ -32,7 +32,11 @@ type Server struct {
 
 // Serve starts the shim on the given listener.
 func Serve(l net.Listener) error {
-	srv := &Server{s: newStore(), url: "http://" + l.Addr().String()}
+	return serve(l, newStore())
+}
+
+func serve(l net.Listener, st *store) error {
+	srv := &Server{s: st, url: "http://" + l.Addr().String()}
 	// The etcd client pings every 30s. gRPC allows one ping per 5 minutes by
 	// default and answers more with GOAWAY "too_many_pings". Same as etcd.
 	g := grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{

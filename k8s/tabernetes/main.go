@@ -84,6 +84,61 @@ func boot() (*cluster, error) {
 	must(os.MkdirAll("/root", 0o755))
 	os.Setenv("HOME", "/root")
 
+	// The cluster of the last visit (state.go), or a new one.
+	st := loadState()
+	var c *cluster
+	if st != nil {
+		status("restoring the cluster of your last visit")
+		var err error
+		if c, err = st.restoreFiles(); err != nil {
+			return nil, fmt.Errorf("restoring the cluster: %w", err)
+		}
+	} else {
+		c = newCluster()
+	}
+	cfg, err := os.ReadFile(p("admin.kubeconfig"))
+	must(err)
+	must(os.MkdirAll("/root/.kube", 0o755))
+	must(os.WriteFile("/root/.kube/config", cfg, 0o600))
+
+	status("starting etcd")
+	l, err := net.Listen("tcp", "127.0.0.1:2379")
+	must(err)
+	opts := etcdshim.Options{Save: stateSaver(stateFiles()), Interval: 3 * time.Second}
+	if st != nil {
+		opts.Snapshot = st.Etcd
+	}
+	go func() { must(etcdshim.ServeWith(l, opts)) }()
+
+	status("starting kube-apiserver")
+	apiserver := run("kube-apiserver", app.NewAPIServerCommand(), apiserverArgs())
+	if err := waitReady(c, "https://127.0.0.1:6443/readyz", apiserver); err != nil {
+		return nil, fmt.Errorf("kube-apiserver did not get ready: %w", err)
+	}
+	if st != nil {
+		status("removing the nodes of your last visit")
+		if err := dropOldNodes(context.Background()); err != nil {
+			return nil, fmt.Errorf("removing the old nodes: %w", err)
+		}
+	}
+
+	startControllers()
+
+	// A restored cluster has its addons, maybe changed by the user.
+	if st == nil {
+		status("installing addons")
+		if err := installAddons(context.Background(), c); err != nil {
+			return nil, fmt.Errorf("installing addons: %w", err)
+		}
+	}
+	status("ready")
+	current = c
+	return c, nil
+}
+
+// newCluster creates the PKI, the tokens and the kubeconfigs of a new
+// cluster in dataDir.
+func newCluster() *cluster {
 	status("generating PKI")
 	ca := newPKI("ca", "tabernetes-ca")
 	ca.issue("apiserver", "kube-apiserver", nil, true,
@@ -109,18 +164,11 @@ func boot() (*cluster, error) {
 	writeKubeconfig("admin", c.adminToken)
 	writeKubeconfig("controller-manager", cmToken)
 	writeKubeconfig("scheduler", schedToken)
-	must(os.MkdirAll("/root/.kube", 0o755))
-	cfg, err := os.ReadFile(p("admin.kubeconfig"))
-	must(err)
-	must(os.WriteFile("/root/.kube/config", cfg, 0o600))
+	return c
+}
 
-	status("starting etcd")
-	l, err := net.Listen("tcp", "127.0.0.1:2379")
-	must(err)
-	go func() { must(etcdshim.Serve(l)) }()
-
-	status("starting kube-apiserver")
-	apiserver := run("kube-apiserver", app.NewAPIServerCommand(), []string{
+func apiserverArgs() []string {
+	return []string{
 		"--etcd-servers=http://127.0.0.1:2379",
 		"--bind-address=127.0.0.1",
 		"--advertise-address=" + advertiseIP,
@@ -153,11 +201,10 @@ func boot() (*cluster, error) {
 		"--service-cluster-ip-range=" + serviceCIDR,
 		"--profiling=false",
 		"--v=1",
-	})
-	if err := waitReady(c, "https://127.0.0.1:6443/readyz", apiserver); err != nil {
-		return nil, fmt.Errorf("kube-apiserver did not get ready: %w", err)
 	}
+}
 
+func startControllers() {
 	status("starting kube-controller-manager")
 	run("kube-controller-manager", cmapp.NewControllerManagerCommand(), []string{
 		"--kubeconfig=" + p("controller-manager.kubeconfig"),
@@ -191,14 +238,6 @@ func boot() (*cluster, error) {
 		"--profiling=false",
 		"--v=1",
 	})
-
-	status("installing addons")
-	if err := installAddons(context.Background(), c); err != nil {
-		return nil, fmt.Errorf("installing addons: %w", err)
-	}
-	status("ready")
-	current = c
-	return c, nil
 }
 
 // waitReady polls url until it answers 200. It gives up when the component

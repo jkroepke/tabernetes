@@ -1,6 +1,8 @@
 // Tiny in-memory file system for Go's js/wasm syscall layer.
 // Go expects a subset of the Node.js callback based fs API on globalThis.fs.
-// Nothing is persisted: a reload starts a fresh cluster.
+// The files below /root of a tab survive a reload: every change goes to
+// IndexedDB a moment later (state.js), and the next start loads them first.
+// Other tabs see a change after their next reload.
 
 const S_IFMT = 0o170000, S_IFREG = 0o100000, S_IFDIR = 0o040000, S_IFLNK = 0o120000;
 const constants = {
@@ -22,7 +24,9 @@ function newNode(mode, extra = {}) {
 const isDir = (n) => (n.mode & S_IFMT) === S_IFDIR;
 const isLink = (n) => (n.mode & S_IFMT) === S_IFLNK;
 
-export function createFS({ cwd = "/", onOutput = () => {} } = {}) {
+// persist: {prefix, skip: [paths], save(put, del)} keeps the files below
+// prefix, except the ones below skip.
+export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}) {
   const root = newNode(S_IFDIR | 0o755, { children: new Map() });
   const fds = new Map();
   let nextFd = 10;
@@ -86,6 +90,44 @@ export function createFS({ cwd = "/", onOutput = () => {} } = {}) {
     n.data = buf;
   };
 
+  // changed paths, saved together a moment after the last change
+  const changed = new Set();
+  let timer = 0;
+  const abs = (path) => "/" + split(path).join("/");
+  // below prefix: prefix itself is always there
+  const kept = (path) => persist && path.startsWith(persist.prefix + "/") &&
+    !persist.skip.some((s) => path === s || path.startsWith(s + "/"));
+  const touch = (path) => {
+    if (!persist) return;
+    path = abs(path);
+    if (!kept(path)) return;
+    changed.add(path);
+    clearTimeout(timer);
+    timer = setTimeout(flush, 300);
+  };
+  const record = (path, n) => {
+    const r = { path, mode: n.mode, mtime: n.mtime };
+    if (isLink(n)) r.target = n.target;
+    else if (!isDir(n)) r.data = n.data.slice(0, n.size);
+    return r;
+  };
+  function flush() {
+    const put = [], del = [];
+    const walk = (path, n) => {
+      if (!kept(path)) return;
+      put.push(record(path, n));
+      if (isDir(n)) for (const [name, c] of n.children) walk(path + "/" + name, c);
+    };
+    for (const path of changed) {
+      let n;
+      try { n = resolve(path, false).node; } catch { n = undefined; }
+      if (n) walk(path, n);
+      else del.push(path);
+    }
+    changed.clear();
+    if (put.length || del.length) persist.save(put, del).catch((e) => console.warn("tabernetes: saving files:", e));
+  }
+
   const getFd = (fd) => {
     const f = fds.get(fd);
     if (!f) throw fsErr("EBADF");
@@ -107,7 +149,9 @@ export function createFS({ cwd = "/", onOutput = () => {} } = {}) {
       if (!isDir(node) && (flags & constants.O_DIRECTORY)) throw fsErr("ENOTDIR", path);
       if ((flags & constants.O_TRUNC) && !isDir(node)) { node.size = 0; node.mtime = Date.now(); }
       const fd = nextFd++;
-      fds.set(fd, { node, pos: 0, flags });
+      const p = abs(path);
+      fds.set(fd, { node, pos: 0, flags, path: p });
+      if (flags & (constants.O_CREAT | constants.O_TRUNC)) touch(p);
       return fd;
     },
     close(fd) { getFd(fd); fds.delete(fd); },
@@ -134,6 +178,7 @@ export function createFS({ cwd = "/", onOutput = () => {} } = {}) {
       n.size = Math.max(n.size, pos + length);
       if (position == null) f.pos = pos + length;
       n.mtime = Date.now();
+      touch(f.path);
       return length;
     },
     fstat(fd) { return stat(getFd(fd).node); },
@@ -149,18 +194,21 @@ export function createFS({ cwd = "/", onOutput = () => {} } = {}) {
       if (node) throw fsErr("EEXIST", path);
       if (!parent) throw fsErr("EEXIST", path);
       parent.children.set(name, newNode(S_IFDIR | (perm & 0o7777), { children: new Map() }));
+      touch(path);
     },
     rmdir(path) {
       const { node, parent, name } = must(path, false);
       if (!isDir(node)) throw fsErr("ENOTDIR", path);
       if (node.children.size) throw fsErr("ENOTEMPTY", path);
       parent.children.delete(name);
+      touch(path);
     },
     unlink(path) {
       const { node, parent, name } = must(path, false);
       if (isDir(node)) throw fsErr("EISDIR", path);
       parent.children.delete(name);
       node.nlink--;
+      touch(path);
     },
     rename(from, to) {
       const src = must(from, false);
@@ -169,6 +217,8 @@ export function createFS({ cwd = "/", onOutput = () => {} } = {}) {
       if (dst.node && isDir(dst.node) && dst.node.children.size) throw fsErr("ENOTEMPTY", to);
       src.parent.children.delete(src.name);
       dst.parent.children.set(dst.name, src.node);
+      touch(from);
+      touch(to);
     },
     link(from, to) {
       const src = must(from);
@@ -176,25 +226,27 @@ export function createFS({ cwd = "/", onOutput = () => {} } = {}) {
       if (dst.node) throw fsErr("EEXIST", to);
       dst.parent.children.set(dst.name, src.node);
       src.node.nlink++;
+      touch(to);
     },
     symlink(target, path) {
       const dst = resolve(path, false);
       if (dst.node) throw fsErr("EEXIST", path);
       dst.parent.children.set(dst.name, newNode(S_IFLNK | 0o777, { target }));
+      touch(path);
     },
     readlink(path) {
       const { node } = must(path, false);
       if (!isLink(node)) throw fsErr("EINVAL", path);
       return node.target;
     },
-    chmod(path, mode) { const { node } = must(path); node.mode = (node.mode & S_IFMT) | (mode & 0o7777); },
-    fchmod(fd, mode) { const n = getFd(fd).node; n.mode = (n.mode & S_IFMT) | (mode & 0o7777); },
+    chmod(path, mode) { const { node } = must(path); node.mode = (node.mode & S_IFMT) | (mode & 0o7777); touch(path); },
+    fchmod(fd, mode) { const f = getFd(fd), n = f.node; n.mode = (n.mode & S_IFMT) | (mode & 0o7777); touch(f.path); },
     chown(path, uid, gid) { const { node } = must(path); node.uid = uid; node.gid = gid; },
     fchown(fd, uid, gid) { const n = getFd(fd).node; n.uid = uid; n.gid = gid; },
     lchown(path, uid, gid) { const { node } = must(path, false); node.uid = uid; node.gid = gid; },
-    utimes(path, atime, mtime) { const { node } = must(path); node.atime = atime * 1000; node.mtime = mtime * 1000; },
-    truncate(path, len) { const { node } = must(path); ensureCap(node, len); if (len > node.size) node.data.fill(0, node.size, len); node.size = len; },
-    ftruncate(fd, len) { const n = getFd(fd).node; ensureCap(n, len); if (len > n.size) n.data.fill(0, n.size, len); n.size = len; },
+    utimes(path, atime, mtime) { const { node } = must(path); node.atime = atime * 1000; node.mtime = mtime * 1000; touch(path); },
+    truncate(path, len) { const { node } = must(path); ensureCap(node, len); if (len > node.size) node.data.fill(0, node.size, len); node.size = len; touch(path); },
+    ftruncate(fd, len) { const f = getFd(fd), n = f.node; ensureCap(n, len); if (len > n.size) n.data.fill(0, n.size, len); n.size = len; touch(f.path); },
     fsync() {},
   };
 
@@ -230,13 +282,43 @@ export function createFS({ cwd = "/", onOutput = () => {} } = {}) {
       if (!resolve(cur).node) ops.mkdir(cur, 0o755);
     }
   };
+  // restore puts saved records (state.js) back, parents first, without
+  // saving them again.
+  fs.restore = (records) => {
+    const keep = persist;
+    persist = null;
+    for (const r of records) {
+      try {
+        const { node, parent, name } = resolve(r.path, false);
+        if (!parent) continue;
+        let n = node;
+        if (!n) {
+          const fmt = r.mode & S_IFMT;
+          if (fmt === S_IFDIR) n = newNode(r.mode, { children: new Map() });
+          else if (fmt === S_IFLNK) n = newNode(r.mode, { target: r.target });
+          else n = newNode(r.mode, { data: r.data, size: r.data.length });
+          parent.children.set(name, n);
+        }
+        n.mtime = r.mtime;
+      } catch { /* its parent is gone */ }
+    }
+    persist = keep;
+  };
   return fs;
 }
 
-export function installFS(onOutput) {
-  const fs = createFS({ cwd: "/root", onOutput });
+// installFS puts the file system on globalThis.fs. home (optional):
+// {records, save(put, del)} keeps /root, see state.js.
+export function installFS(onOutput, home = null) {
+  const fs = createFS({
+    cwd: "/root",
+    onOutput,
+    // the kubeconfig belongs to the cluster of this visit
+    persist: home && { prefix: "/root", skip: ["/root/.kube"], save: home.save },
+  });
   fs.mkdirSync("/tmp");
   fs.mkdirSync("/root");
+  if (home) fs.restore(home.records);
   globalThis.fs = fs;
   globalThis.process ??= {};
   Object.assign(globalThis.process, {

@@ -27,9 +27,22 @@ browser tab (single wasm binary)                     docker run tabernetes
   talk to each other over it, without any change to their code.
 - etcd is replaced by `k8s/tabernetes/etcdshim`. It is a small in-memory
   implementation of the etcd v3 gRPC API (KV, Txn, Watch, Lease). It
-  implements only what kube-apiserver uses. It persists nothing.
+  implements only what kube-apiserver uses.
 - The browser has no file system. `web/src/fs.js` is an in-memory file
   system with the Node.js callback API that Go's `syscall/js` expects.
+- The cluster survives a reload (`k8s/tabernetes/state.go`,
+  `web/src/state.js`). Every few seconds, when something changed, the control
+  plane saves a snapshot of the shim (the newest revision of every key and the
+  leases, `etcdshim/snapshot.go`) together with the PKI, the tokens and the
+  kubeconfigs to IndexedDB. The next boot starts from it: the store is
+  compacted at the saved revision, so the informers list again, and every
+  lease gets its full TTL. The nodes of the last visit are gone with their
+  tabs, so the control plane deletes them with their pods before the
+  controllers start; Deployments and DaemonSets start their pods again on the
+  new nodes. A snapshot of another Kubernetes minor version is ignored, and a
+  snapshot that does not boot is deleted. The files below `/root` of the
+  terminal (not `~/.kube`) go to IndexedDB, too, one record per file, a moment
+  after each change. `forget` deletes the cluster, the files and the images.
 - The terminal runs a real POSIX shell: [mvdan.cc/sh](https://github.com/mvdan/sh),
   a shell interpreter in Go, compiled into the same binary. Pipes, variables,
   loops, `$(...)`, redirects and here-documents work. There are no processes,
@@ -117,15 +130,28 @@ browser tab (single wasm binary)                     docker run tabernetes
   [v86](https://github.com/copy/v86), an x86 emulator that compiles x86 code
   to WebAssembly (`k8s/tabernetes/v86.go`). Each pod gets a worker
   (`web/src/vm.js`, `web/src/vmworker.js`) that pulls the `linux/386` variant
-  of the image, verifies the blobs and keeps them in the Cache Storage. Docker
+  of the image and verifies the blobs. Docker
   Hub sends no CORS headers, so the page pulls through a pull-through mirror
   of Docker Hub that does (`data-registry` in the shortcode; a `registry:3`
-  with `REGISTRY_PROXY_REMOTEURL` and a CORS middleware in front). The worker
-  applies the layers with their whiteouts and writes them as an initramfs
-  (`web/src/rootfs.js`), next to `/.tabernetes/init` and the container as
-  `/.tabernetes/config.json`. The kernel is Linux 6.8 from Ubuntu for i386,
-  `tinyconfig` plus `vm/kernel.config` (serial console, virtio-net, initrd),
-  built with clang in `vm/Dockerfile` (`mise run vm`, needs Docker). PID 1
+  with `REGISTRY_PROXY_REMOTEURL` and a CORS middleware in front). The image
+  store is the origin private file system (OPFS) of the browser
+  (`web/src/layers.js`): each layer is unpacked once, as the uncompressed tar
+  plus an index with the path, metadata and offset of every entry. All pods
+  and tabs share it, and it survives a reload (without OPFS the layers stay in
+  the memory of the worker). Its garbage collection works like the one of the
+  kubelet: above 85 % of 4 GiB (or of half the quota of the origin), the
+  least recently used layers go until 80 % are left. Layers of a running pod
+  in any tab (a shared Web Lock per layer) and layers used in the last two
+  minutes stay. The worker merges the indices of the layers with
+  their whiteouts into the file system JSON of v86 (`web/src/rootfs.js`), with
+  `/.tabernetes/init` and the container as `/.tabernetes/config.json` on top.
+  v86 serves it over virtio 9p and reads a file from the tar only when the
+  guest reads it; what the container writes stays in the memory of the
+  worker. The kernel mounts it as root (`root=host9p rootfstype=9p`), so the
+  image is not in the RAM of the VM (256 MiB, or the memory limit of the pod).
+  The kernel is Linux 6.8 from Ubuntu for i386, `tinyconfig` plus
+  `vm/kernel.config` (serial console, virtio-net, virtio-9p), built with clang
+  in `vm/Dockerfile` (`mise run vm`, needs Docker). PID 1
   (`vm/init`) does what runc does: it mounts `/proc`, `/sys` and `/dev`,
   writes `/etc/hosts` and `/etc/resolv.conf`, sets the hostname and starts
   the entrypoint with the environment, working directory and user of the
@@ -273,7 +299,9 @@ still works, too. Real isolation from the host needs rootless Docker or Podman.
 
 - Wasm runs on one thread. The boot takes about 15 seconds. Everything shares
   one CPU core.
-- No persistence: a reload starts a new cluster.
+- A reload keeps the cluster, but not the nodes and pods of the last visit,
+  and not what a pod wrote. Another tab sees a new file in `~` after its next
+  reload.
 - `kubectl exec`, `logs` and `port-forward` go through the WebRTC tunnel to
   the kubelet. The apiserver cannot reach pod or service IPs, so service
   proxy URLs do not work.

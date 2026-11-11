@@ -1,7 +1,8 @@
 // Command init is PID 1 of a pod that runs in v86 on a tab node
-// (k8s/tabernetes/v86.go). The page packs the layers of the image into an
-// initramfs, adds this program as /.tabernetes/init and the container as
-// /.tabernetes/config.json, and boots it with rdinit=/.tabernetes/init.
+// (k8s/tabernetes/v86.go). The page serves the layers of the image over 9p,
+// with this program as /.tabernetes/init and the container as
+// /.tabernetes/config.json on top. The kernel mounts that as its root file
+// system and starts init=/.tabernetes/init.
 //
 // It does what containerd and runc do for a container: mount /proc, /sys and
 // /dev, write /etc/hosts and /etc/resolv.conf, set the hostname, then start

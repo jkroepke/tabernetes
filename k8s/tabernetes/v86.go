@@ -17,8 +17,9 @@ import (
 // A container image on the tab node runs in v86 (https://github.com/copy/v86),
 // an x86 emulator that compiles x86 code to WebAssembly. The page pulls the
 // linux/386 variant of the image from a pull-through mirror of Docker Hub
-// (Docker Hub sends no CORS headers), packs the layers into an initramfs and
-// boots a small Linux kernel with it (web/src/vm.js, vmworker.js). PID 1 of
+// (Docker Hub sends no CORS headers), unpacks the layers into the image store
+// of the browser and boots a small Linux kernel with them as its root file
+// system over 9p (web/src/vm.js, vmworker.js, layers.js, rootfs.js). PID 1 of
 // the VM (vm/init) starts the entrypoint as runc would. The console of the
 // VM is the log of the container, and port-forward reaches the ports of the
 // pod through the network card of the VM.

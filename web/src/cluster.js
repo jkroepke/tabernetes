@@ -5,6 +5,7 @@
 // the control plane is a MessagePort of its own.
 import "./wasm_exec.js";
 import { installFS } from "./fs.js";
+import { clusterState, forget } from "./state.js";
 import { zstdFrames, instantiate } from "./wasm.js";
 import { decompress } from "fzstd";
 
@@ -45,6 +46,10 @@ installFS((fd, s) => {
   if (logs.length > 5000) logs.splice(0, logs.length - 5000);
 });
 
+// The cluster survives a reload: the control plane saves it (state.js).
+const saved = clusterState();
+globalThis.tabernetesState = saved;
+
 // boot compiles the binary while the tab sends it, then starts the control plane.
 async function boot(stream, size) {
   state = "booting";
@@ -63,7 +68,8 @@ async function boot(stream, size) {
     const instance = await instantiate(unpacked, go.importObject);
     globalThis.tabernetesMemory = instance.exports.mem;
     go.run(instance).then(() => exited(""), (e) => exited(e?.message ?? String(e)));
-    await globalThis.tabernetes.ready;
+    // A saved cluster that does not boot would not boot after a reload either.
+    await globalThis.tabernetes.ready.catch(async (e) => { await saved.drop(); throw e; });
     if (state !== "booting") return; // it exited meanwhile
     state = "ready";
     resolveReady();
@@ -181,6 +187,10 @@ const methods = {
   // meshOffer: the offer of the tab to the node, the answer comes back.
   meshOffer(id, name, sdp) {
     return signal(id, name, sdp);
+  },
+  // forget: no more saves, and the saved cluster is gone.
+  forget() {
+    return forget();
   },
   // logs: the last n lines of the control plane logs, for "logs" in a tab.
   logs(id, n) {

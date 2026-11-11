@@ -1,23 +1,29 @@
 // The worker of a pod on a tab node that runs a container image (vm.js,
 // k8s/tabernetes/v86.go). It pulls the linux/386 variant of the image from
-// the registry mirror, packs the layers into an initramfs (rootfs.js) and
-// boots it in v86, an x86 emulator that compiles x86 code to WebAssembly.
+// the registry mirror, unpacks the layers into the image store of the
+// browser (layers.js) and boots v86, an x86 emulator that compiles x86 code
+// to WebAssembly, with the merged layers as its root file system over 9p
+// (rootfs.js). The files stay outside the memory of the VM.
 //
 // Docker Hub sends no CORS headers, so the page cannot pull from it. The
-// mirror is a pull-through cache of Docker Hub that does. Blobs stay in the
-// Cache Storage of the browser: a second pull finds the image "already
-// present on machine".
+// mirror is a pull-through cache of Docker Hub that does. The unpacked
+// layers stay in the browser: a second pull finds the image "already present
+// on machine", in every tab and after a reload.
 import { V86 } from "v86";
-import { decompress as unzstd } from "fzstd";
-import { buildRootfs, modes } from "./rootfs.js";
+import { Tree, LayerStorage, modes } from "./rootfs.js";
+import { openStore } from "./layers.js";
 
 const post = (m, transfer) => self.postMessage(m, transfer || []);
-const CACHE = "tabernetes-images";
+const CACHE = "tabernetes-configs"; // the configs of the images, small JSON blobs
+// The layers were here before they moved to the image store.
+caches.delete("tabernetes-images").catch(() => {});
 const PLATFORM = { os: "linux", architecture: "386" };
 const INDEX_TYPES = ["application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"];
 const MANIFEST_TYPES = ["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"];
 
-const MAX_MEMORY = 2048; // MiB, of the VM of a pod
+// MiB, of the VM of a pod. The files of the image are not in it, only what
+// the container runs and writes to tmpfs, plus the page cache.
+const MIN_MEMORY = 128, DEFAULT_MEMORY = 256, MAX_MEMORY = 2048;
 
 class PullError extends Error {}
 
@@ -52,7 +58,7 @@ async function sha256(bytes) {
   return "sha256:" + hex(await crypto.subtle.digest("SHA-256", bytes));
 }
 
-// Pull fetches manifests and blobs, the blobs through the Cache Storage.
+// Pull fetches manifests and blobs, the config through the Cache Storage.
 class Pull {
   constructor(registry, ref) {
     this.base = registry.replace(/\/+$/, "") + "/v2/" + ref.repo;
@@ -71,12 +77,10 @@ class Pull {
     return { digest: r.headers.get("Docker-Content-Digest") || (await sha256(body)), json: JSON.parse(new TextDecoder().decode(body)) };
   }
 
-  // cached tells whether all blobs are in the Cache Storage.
-  async cached(digests) {
+  // cached tells whether the blob is in the Cache Storage.
+  async cached(digest) {
     const c = await this.cache;
-    if (!c) return false;
-    for (const d of digests) if (!(await c.match(this.blobURL(d)))) return false;
-    return true;
+    return !!(c && (await c.match(this.blobURL(digest))));
   }
 
   blobURL(digest) {
@@ -84,8 +88,8 @@ class Pull {
     return new URL(`/tabernetes-blobs/${digest}`, self.location.href).href;
   }
 
-  async blob(digest) {
-    const c = await this.cache;
+  async blob(digest, keep = true) {
+    const c = keep && (await this.cache);
     const hit = c && (await c.match(this.blobURL(digest)));
     if (hit) return new Uint8Array(await hit.arrayBuffer());
     const r = await fetch(`${this.base}/blobs/${digest}`);
@@ -98,11 +102,7 @@ class Pull {
   }
 }
 
-async function gunzip(bytes) {
-  const s = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
-  return new Uint8Array(await new Response(s).arrayBuffer());
-}
-
+let store; // the image store (layers.js), once per worker
 async function pullImage(registry, image, onFetching) {
   const ref = parseRef(image);
   if (ref.domain !== "docker.io") {
@@ -120,20 +120,29 @@ async function pullImage(registry, image, onFetching) {
   } else {
     throw new PullError(`failed to pull and unpack image "${ref.name}": unsupported manifest`);
   }
-  const blobs = [m.config.digest, ...m.layers.map((l) => l.digest)];
+  store ??= await openStore();
   const size = m.layers.reduce((n, l) => n + (l.size || 0), 0) + (m.config.size || 0);
-  const present = await p.cached(blobs);
+  for (const l of m.layers) await store.use(l.digest);
+  const indexes = await Promise.all(m.layers.map((l) => store.index(l.digest)));
+  const present = (await p.cached(m.config.digest)) && indexes.every(Boolean);
   if (!present) onFetching();
   const config = JSON.parse(new TextDecoder().decode(await p.blob(m.config.digest)));
   if (config.architecture && config.architecture !== PLATFORM.architecture) {
     throw new PullError(`failed to pull and unpack image "${ref.name}": no match for platform in manifest: not found (the tab node runs linux/386 images, this one is ${config.os}/${config.architecture})`);
   }
   const layers = [];
-  for (const l of m.layers) {
-    const b = await p.blob(l.digest);
-    if (l.mediaType?.includes("zstd")) layers.push(unzstd(b));
-    else if (l.mediaType?.includes("gzip") || (b[0] === 0x1f && b[1] === 0x8b)) layers.push(await gunzip(b));
-    else layers.push(b);
+  for (const [i, l] of m.layers.entries()) {
+    let idx = indexes[i];
+    if (!idx) {
+      const b = await p.blob(l.digest, false);
+      try {
+        idx = await store.add(l.digest, b, l.mediaType);
+      } catch (e) {
+        const why = e?.name === "QuotaExceededError" ? "no space left on device" : e?.message || String(e);
+        throw new PullError(`failed to extract layer ${l.digest}: write /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs: ${why}`);
+      }
+    }
+    layers.push({ id: l.digest, entries: idx.entries });
   }
   return { present, size, imageID, config: config.config || {}, layers };
 }
@@ -165,6 +174,8 @@ async function start(m) {
     return;
   }
   post({ type: "pulled", present: img.present, size: img.size, imageID: img.imageID, ms: Date.now() - t0 });
+  // The layers of this pod are in use now; a new image may need room.
+  if (!img.present) store.gc().catch((e) => console.warn("tabernetes: image garbage collection:", e));
 
   const spec = containerSpec(img.config, m.container);
   if (!spec.args.length) {
@@ -174,35 +185,55 @@ async function start(m) {
   const init = new Uint8Array(await (await fetch(m.initURL)).arrayBuffer());
   const c = m.container;
   const conf = { ...spec, hostname: m.hostname, ip: m.ip, gateway: m.gateway, stdin: !!c.stdin, stdinOnce: !!c.stdinOnce, tty: !!c.tty };
-  const initrd = buildRootfs(img.layers, {
+  // The root file system: the layers, and the init of the pod on top. The
+  // mount points must be there for the kernel (devtmpfs) and init.
+  const tree = new Tree();
+  img.layers.forEach((l, i) => {
+    tree.layer = i;
+    tree.addLayer(l.id, l.entries);
+  });
+  tree.layer = img.layers.length;
+  const now = Math.floor(Date.now() / 1000);
+  const mem = new Map();
+  const extra = {
     ".tabernetes/init": { mode: modes.S_IFREG | 0o755, data: init },
     ".tabernetes/config.json": { mode: modes.S_IFREG | 0o644, data: new TextEncoder().encode(JSON.stringify(conf)) },
-  });
-  img.layers = null;
-  // The initramfs is unpacked into the root file system, a tmpfs. Its limit
-  // is half of the RAM that is left next to the initramfs itself, and a file
-  // takes whole pages there. So the VM needs a bit more than three times the
-  // initramfs, plus room for the kernel and the running container. A memory
-  // limit of the pod can give the VM more room, not less than that.
-  const need = Math.ceil((initrd.length * 3.4) / 2 ** 20) + 96;
-  if (need > MAX_MEMORY) {
-    post({ type: "error", message: `the image is too large for a tab: ${Math.round(initrd.length / 2 ** 20)} MiB unpacked, the VM of a pod has room for about ${Math.floor((MAX_MEMORY - 96) / 3.4)} MiB` });
-    return;
+  };
+  for (const [path, e] of Object.entries(extra)) {
+    const key = `mem:${mem.size}`;
+    mem.set(key, e.data);
+    tree.set(path, { uid: 0, gid: 0, mtime: now, mode: e.mode, size: e.data.length, key });
   }
-  const memory = Math.max(m.memory || 0, Math.max(256, need) * 2 ** 20);
+  for (const d of ["dev", "proc", "sys", "tmp"]) {
+    if (!tree.files.has(d)) tree.set(d, { uid: 0, gid: 0, mtime: now, mode: modes.S_IFDIR | (d === "tmp" ? 0o1777 : 0o755) });
+  }
+  const layers = new Map();
+  for (const l of img.layers) layers.set(l.id, await store.layer(l.id));
+  const fsJSON = tree.v86();
+  img.layers = null;
+  const memory = Math.min(MAX_MEMORY, Math.max(MIN_MEMORY, m.memory ? Math.ceil(m.memory / 2 ** 20) : DEFAULT_MEMORY)) * 2 ** 20;
   emulator = new V86({
     wasm_path: m.wasmURL,
     bios: { url: m.biosURL },
     bzimage: { url: m.kernelURL },
-    initrd: { buffer: initrd.buffer },
-    cmdline: `console=ttyS0 quiet loglevel=3 rdinit=/.tabernetes/init ip=${m.ip}::${m.gateway}:255.255.255.0:${m.hostname}:eth0:off`,
+    // an empty 9p file system; the tree comes in below, before the boot
+    filesystem: {},
+    // cache=loose: only the guest changes the files, it may keep them
+    cmdline: "console=ttyS0 quiet loglevel=3 root=host9p rootfstype=9p rw " +
+      "rootflags=trans=virtio,version=9p2000.L,cache=loose,msize=262144 init=/.tabernetes/init " +
+      `ip=${m.ip}::${m.gateway}:255.255.255.0:${m.hostname}:eth0:off`,
     memory_size: memory,
     uart1: true,
-    autostart: true,
+    autostart: false,
     disable_keyboard: true,
     disable_mouse: true,
     disable_speaker: true,
     net_device: { type: "virtio", relay_url: "fetch", vm_ip: m.ip, router_ip: m.gateway },
+  });
+  emulator.add_listener("emulator-loaded", () => {
+    emulator.fs9p.storage = new LayerStorage(layers, mem);
+    emulator.fs9p.load_from_json(fsJSON);
+    emulator.run();
   });
   // The console is stdout and stderr of the container. Batch the bytes.
   // A character of several bytes may be split between two batches.

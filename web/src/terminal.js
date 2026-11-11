@@ -4,6 +4,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { installFS } from "./fs.js";
+import { clusterState, loadHome, saveHome, forget } from "./state.js";
 import { zstdFrames, instantiate } from "./wasm.js";
 
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
@@ -47,6 +48,8 @@ export async function startTerminal(el, opts) {
   const crash = [];
   globalThis.tabernetesCrash = crash;
   let crashing = false;
+  // The files of /root from the last visit (state.js).
+  const home = { records: await loadHome(), save: saveHome };
   installFS((fd, s) => {
     if (crashing || /^(panic:|fatal error:)/m.test(s)) {
       crashing = true;
@@ -61,11 +64,12 @@ export async function startTerminal(el, opts) {
     if (s.includes("is not as new as written version")) return;
     logs.push(s);
     if (logs.length > 5000) logs.splice(0, logs.length - 5000);
-  });
+  }, home);
 
   term.writeln("\x1b[1mTabernetes\x1b[0m: a real Kubernetes control plane, compiled to WebAssembly, running in your browser.");
   term.writeln(DIM("kube-apiserver, kube-controller-manager, kube-scheduler and kubectl are the upstream"));
   term.writeln(DIM("components. etcd is replaced by a tiny in-memory implementation. All of it runs in this browser, not on a server."));
+  term.writeln(DIM("The browser keeps the cluster and your files in ~ for the next visit; forget deletes them."));
   term.writeln("");
 
   // ---- download + boot ----
@@ -76,6 +80,9 @@ export async function startTerminal(el, opts) {
   // With a shared worker, the control plane runs there and this tab joins it
   // as a node (tabs.js). The worker reports how far it is.
   const cluster = opts.cluster;
+  // Without a shared worker the control plane of this tab keeps the cluster.
+  const saved = cluster ? null : clusterState();
+  if (saved) globalThis.tabernetesState = saved;
   let ended = false; // the worker said why already
   if (cluster) {
     // Another tab started the control plane: its boot steps are old news.
@@ -84,7 +91,7 @@ export async function startTerminal(el, opts) {
     cluster.on("status", ({ text }) => globalThis.tabernetesStatus(text));
     // The worker ends after both, so that a reload boots a new control plane
     // even while other tabs are still open.
-    const again = () => { ended = true; term.writeln(DIM("Reload the page to boot a new cluster.")); };
+    const again = () => { ended = true; term.writeln(DIM("Reload the page to start the control plane again.")); };
     cluster.on("failed", ({ error }) => {
       term.writeln(`\r\n\x1b[31mthe control plane did not start: ${error}\x1b[0m`);
       again();
@@ -162,6 +169,8 @@ export async function startTerminal(el, opts) {
   try {
     await globalThis.tabernetes.ready;
   } catch (e) {
+    // A saved cluster that does not boot would not boot after a reload either.
+    await saved?.drop();
     term.writeln(`\r\n\x1b[31mthe cluster did not start: ${e.message}\x1b[0m`);
     term.writeln(DIM("The control plane logs are in tabernetesLogs in the DevTools console. Reload to try again."));
     return { term };
@@ -207,8 +216,9 @@ export async function startTerminal(el, opts) {
         "  llm [model]              deploys a language model to the GPU of a tab (WebGPU)",
         "  logs [n]                 the last n lines of the control plane logs",
         "  history [n] | -c         the commands of this tab (Ctrl-R searches them)",
+        "  forget [-y]              delete the cluster, the files in ~ and the images this browser keeps",
         "  clear                    clear the screen",
-        ...terminal.filter((n) => !["join", "accept", "proxy", "vnc", "logs", "history", "clear"].includes(n)).map((n) => `  ${n}`),
+        ...terminal.filter((n) => !["join", "accept", "proxy", "vnc", "logs", "history", "forget", "clear"].includes(n)).map((n) => `  ${n}`),
         "",
         "Tools (small versions, the common flags)",
         ...list(tools),
@@ -230,6 +240,18 @@ export async function startTerminal(el, opts) {
       const n = Number(args[0]) || history.length;
       const from = Math.max(0, history.length - n);
       write(history.slice(from).map((l, i) => `${String(from + i + 1).padStart(5)}  ${l}`).join("\n"));
+    },
+    // forget deletes what the browser keeps for the next visit. The running
+    // cluster goes on until the last tab of the page is closed.
+    async forget(args, { write, ask }) {
+      if (args[0] !== "-y") {
+        let answer;
+        try { answer = await ask("Delete the cluster, the files in ~ and the images this browser keeps? [y/N] "); } catch { return 1; }
+        if (!/^y(es)?$/i.test(answer.trim())) return 1;
+      }
+      if (cluster) await cluster.rpc("forget").catch(() => {});
+      await forget();
+      write(`Deleted. The cluster runs on until ${cluster ? "every tab of this page is closed" : "you leave this page"}; the next visit starts a new one.\n`);
     },
     async logs(args, { write }) {
       const n = Number(args[0]) || 40;

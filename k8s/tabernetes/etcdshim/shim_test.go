@@ -54,3 +54,43 @@ func TestWatch(t *testing.T) {
 	tx, err := c.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("/a/x"), "=", r.Header.Revision)).Then(clientv3.OpPut("/a/x", "3")).Else(clientv3.OpGet("/a/x")).Commit()
 	t.Logf("txn ok=%v err=%v", tx.Succeeded, err)
 }
+
+func TestSnapshot(t *testing.T) {
+	s := newStore()
+	s.mu.Lock()
+	s.leases[7] = &lease{id: 7, ttl: 60, expiry: time.Now(), keys: map[string]struct{}{}}
+	s.rev++
+	s.put(s.rev, []byte("/a"), []byte("1"), 0)
+	s.rev++
+	s.put(s.rev, []byte("/b"), []byte("2"), 7)
+	s.rev++
+	s.put(s.rev, []byte("/a"), []byte("3"), 0)
+	s.rev++
+	s.del(s.rev, "/b")
+	s.rev++
+	s.put(s.rev, []byte("/c"), []byte("4"), 7)
+	s.mu.Unlock()
+
+	r := newStore()
+	if err := r.restore(s.snapshot()); err != nil {
+		t.Fatal(err)
+	}
+	if r.rev != s.rev || r.compactRev != s.rev {
+		t.Fatalf("rev %d compact %d, want %d", r.rev, r.compactRev, s.rev)
+	}
+	if kv := r.current("/a"); kv == nil || string(kv.Value) != "3" || kv.Version != 2 || kv.CreateRevision != 2 {
+		t.Fatalf("/a = %v", kv)
+	}
+	if r.current("/b") != nil {
+		t.Fatal("/b was deleted")
+	}
+	if l := r.leases[7]; l == nil || len(l.keys) != 1 || time.Until(l.expiry) < 50*time.Second {
+		t.Fatalf("lease 7 = %+v", l)
+	}
+	if got := r.rangeKeys([]byte("/"), []byte("0")); len(got) != 2 {
+		t.Fatalf("keys %v", got)
+	}
+	if err := r.restore([]byte("tbs1\x05")); err == nil {
+		t.Fatal("a cut snapshot restored")
+	}
+}
