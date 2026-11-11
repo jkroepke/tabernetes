@@ -270,6 +270,10 @@ GitHub release with `tabernetes.tar.gz` and a build provenance attestation.
 The bundle of a release prints `docker run` with the node image of the same
 version. `Create Tag` (`.github/workflows/tag.yaml`) tags by hand.
 
+The repository variable `RELEASES_ENABLED` (Settings, Secrets and variables,
+Actions, Variables) switches the automatic releases on. Only the value `true`
+creates releases; without it, changes on `main` wait for the next release.
+
 Check a download with:
 
 ```bash

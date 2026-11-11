@@ -33,6 +33,8 @@ that name.
   pushes the node image as `<version>` and `latest`, attests and publishes the
   release. PR titles must start with `feat`, `fix`, `chore` or `docs`
   (`pr-check.yaml`); squash merges make the PR title the commit message.
+- The release job runs only when the repository variable `RELEASES_ENABLED`
+  is `true`. Set it to anything else to merge to `main` without releasing.
 - The node image of a release is pinned in the bundle (`TABERNETES_VERSION`
   at build time). Local builds and PRs use `latest`.
 
