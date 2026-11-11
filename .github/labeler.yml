@@ -2,15 +2,18 @@
 version: 1
 appendOnly: true
 labels:
+  - label: '💥 breaking-change'
+    type: 'pull_request'
+    title: '^[a-z]+(\(.*\))?!:.*'
   - label: 'chore'
     type: 'pull_request'
-    title: '^chore:.*'
+    title: '^chore(\(.*\))?!?:.*'
   - label: '🐞 bug'
     type: 'pull_request'
-    title: '^fix:.*'
+    title: '^fix(\(.*\))?!?:.*'
   - label: '✨ enhancement'
     type: 'pull_request'
-    title: '^feat:.*'
+    title: '^feat(\(.*\))?!?:.*'
   - label: '📖 docs'
     type: 'pull_request'
-    title: '^docs:.*'
+    title: '^docs(\(.*\))?!?:.*'
