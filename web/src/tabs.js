@@ -1,6 +1,6 @@
 // The tab side of the shared control plane (cluster.js, k8s/tabernetes/tabs.go).
 // connectCluster returns null where the browser has no SharedWorker or no Web
-// Locks (Chrome on Android): the tab then runs the control plane itself.
+// Locks: the tab then runs the control plane itself.
 
 export async function connectCluster(url, tries = 0) {
   if (typeof SharedWorker !== "function" || !navigator.locks?.request) return null;
@@ -9,7 +9,12 @@ export async function connectCluster(url, tries = 0) {
   // Held until the tab closes. The worker waits for it to learn that.
   await new Promise((held) => navigator.locks.request(lock, () => { held(); return new Promise(() => {}); }));
 
-  const worker = new SharedWorker(url, { name: "tabernetes" });
+  // extendedLifetime (Chrome 148+, others ignore it): the control plane runs
+  // on for a short time (about 30 s in Chrome) after the last tab closed. A
+  // reload of the only tab then joins the running cluster instead of
+  // booting a new one: 3 s instead of 12.6 s to the prompt (v1.0.0).
+  // The options must be the same for every tab of a page.
+  const worker = new SharedWorker(url, { name: "tabernetes", extendedLifetime: true });
   const port = worker.port;
   const calls = new Map();
   const listeners = { status: [], failed: [], exited: [], mesh: [] };
