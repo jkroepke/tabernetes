@@ -485,10 +485,13 @@ func spawn(path string, argv []string, attr *os.ProcAttr) (int, <-chan syscall.W
 	if err != nil {
 		return 0, nil, err
 	}
+	// Release sets p.Pid to -1, so keep the pid first. With -1, a kill of
+	// the process group was kill(1): it hit init, not the command.
+	pid := p.Pid
 	ch := make(chan syscall.WaitStatus, 1)
-	waiters[p.Pid] = ch
+	waiters[pid] = ch
 	p.Release()
-	return p.Pid, ch, nil
+	return pid, ch, nil
 }
 
 func reaper() {

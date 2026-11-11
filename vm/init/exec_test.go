@@ -56,6 +56,9 @@ func TestAttachDisconnectKeepsMainProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if c.main.pid <= 0 {
+		t.Fatalf("the main process has no pid: %d", c.main.pid)
+	}
 	t.Cleanup(func() { syscall.Kill(-c.main.pid, syscall.SIGKILL); <-done })
 	server, client := net.Pipe()
 	t.Cleanup(func() { server.Close(); client.Close() })
