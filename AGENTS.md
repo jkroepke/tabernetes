@@ -226,5 +226,15 @@ that name.
   4 GiB. v64 does x86 32/64 and ARM64 (up to 8 cores with COOP/COEP), but its
   ARM64 `virt` board has no virtio-9p, so the 9p layer rootfs does not work
   there without a port to virtio-mmio/pci.
+  Measured with the pod setup (9p rootfs, fetch network, Go init, 512 MiB,
+  1 CPU, Node.js, x86_64 tinyconfig kernel = `vm/kernel.config` without the
+  i386 options): nginx answered HTTP after 2.5-2.9 s on v86 (386) and after
+  7.0-8.0 s on v64 (x86_64), with Alpine and Debian alike. Inside a running
+  pod, v64 is only 0-30 % slower (gzip, sha256, a shell loop); the gap is
+  boot. v64 needs `cpu_type: "x86_64"` and `graphics_adapter: "bochs_vga"`
+  (`"none"` crashes in SeaBIOS) and is not on npm. v86_64 (c394574) cannot run
+  Go: every amd64 Go binary, our init too, dies in `mallocinit` with
+  "sysMemStat overflow", with and without the JIT. Next step if 64-bit is
+  wanted: v64 for images without a `386` variant, v86 for the rest.
 - Of 37 popular Docker Hub images, 19 have `linux/386`, 24 `riscv64`, 12
   neither (node, MySQL, mariadb, mongo, rabbitmq, grafana, ...).
