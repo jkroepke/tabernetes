@@ -12,8 +12,8 @@ ARG KERNEL_IMAGE=mirror.gcr.io/library/ubuntu:24.04
 FROM --platform=$BUILDPLATFORM ${KERNEL_IMAGE} AS kernel
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y --no-install-recommends bc bison bzip2 clang flex libelf-dev libssl-dev lld llvm lz4 make linux-source-6.8.0 \
- && rm -rf /var/lib/apt/lists/*
+  && apt-get install -y --no-install-recommends bc bison bzip2 clang flex libelf-dev libssl-dev lld llvm lz4 make linux-source-6.8.0 \
+  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 RUN tar xjf /usr/src/linux-source-6.8.0/linux-source-6.8.0.tar.bz2 --strip-components=1
 COPY kernel.config /kernel.config
