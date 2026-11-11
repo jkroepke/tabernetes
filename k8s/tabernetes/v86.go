@@ -89,11 +89,13 @@ func (v *v86VM) start(ctx context.Context, log io.Writer, pull *imagePull) error
 		memory = q.Value()
 	}
 	opts := map[string]any{
-		"image":    c.Image,
-		"hostname": v.tp.name,
-		"ip":       v.tp.ip,
-		"gateway":  v.tp.n.gateway(),
-		"memory":   memory,
+		"image": c.Image,
+		// the API server defaults it: Always for :latest, else IfNotPresent
+		"pullPolicy": string(c.ImagePullPolicy),
+		"hostname":   v.tp.name,
+		"ip":         v.tp.ip,
+		"gateway":    v.tp.n.gateway(),
+		"memory":     memory,
 		"container": map[string]any{
 			"command":    command,
 			"args":       args,
@@ -147,6 +149,9 @@ func (v *v86VM) start(ctx context.Context, log io.Writer, pull *imagePull) error
 		}),
 		"error": fn(func(a []js.Value) {
 			err := errors.New(a[0].String())
+			if len(a) > 2 && a[2].Truthy() {
+				err = errNeverPull{err}
+			}
 			if !settle(err) {
 				// the VM failed while the container ran
 				fmt.Fprintln(log, "error:", err)

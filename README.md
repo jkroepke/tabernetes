@@ -145,7 +145,11 @@ browser tab (single wasm binary)                     docker run tabernetes
   of the image and verifies the blobs. Docker
   Hub sends no CORS headers, so the page pulls through a pull-through mirror
   of Docker Hub that does (`data-registry` in the shortcode; a `registry:3`
-  with `REGISTRY_PROXY_REMOTEURL` and a CORS middleware in front). The image
+  with `REGISTRY_PROXY_REMOTEURL` and a CORS middleware in front). Like the
+  kubelet, the worker follows `imagePullPolicy`: with `IfNotPresent` (the
+  default for a tag other than `latest`) and `Never`, an image that is
+  complete in the browser starts without a request to the mirror, and
+  `Never` without the image is `ErrImageNeverPull`. The image
   store is the origin private file system (OPFS) of the browser
   (`web/src/layers.js`): each layer is unpacked once, as the uncompressed tar
   plus an index with the path, metadata and offset of every entry. All pods

@@ -13,7 +13,7 @@ export function vmAPI({ version, workerURL, wasmURL, biosURL, kernelURL, initURL
     // args, env as "NAME=value", workingDir), hostname, ip, gateway, memory
     // (bytes, 0 for automatic). on: pulling(), pulled(info), started(info),
     // console(text), exit(code, message: why the entrypoint did not start),
-    // error(message, pull).
+    // error(message, pull, never: not present with the pull policy Never).
     start(opts, on) {
       const worker = new Worker(workerURL);
       const conns = new Map();
@@ -25,7 +25,7 @@ export function vmAPI({ version, workerURL, wasmURL, biosURL, kernelURL, initURL
           case "started": on.started(m); break;
           case "console": on.console(m.data); break;
           case "exit": on.exit(m.code, m.message || ""); break;
-          case "error": on.error(m.message, !!m.pull); break;
+          case "error": on.error(m.message, !!m.pull, !!m.never); break;
           case "conn": {
             const c = conns.get(m.id);
             if (!c) break;

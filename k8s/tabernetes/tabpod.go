@@ -206,6 +206,19 @@ func (tp *tabPod) run() {
 			w.stop()
 			if !pull.wasPulled() {
 				logs.finish()
+				if _, ok := errors.AsType[errNeverPull](err); ok {
+					// what the kubelet does: no pull, the pod waits and
+					// tries again
+					tp.event(corev1.EventTypeWarning, "ErrImageNeverPull", err.Error())
+					tp.setWaiting("ErrImageNeverPull", err.Error())
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(backoff):
+					}
+					backoff = min(backoff*2, backoffMax)
+					continue
+				}
 				// the download failed: the kubelet calls that a failed pull
 				image := tp.container.Image
 				tp.event(corev1.EventTypeWarning, "Failed", fmt.Sprintf("Failed to pull image %q: %v", image, err))
@@ -302,6 +315,10 @@ func (tp *tabPod) backOff(backoff *time.Duration) bool {
 	*backoff = min(*backoff*2, backoffMax)
 	return true
 }
+
+// errNeverPull is the error of a container whose image is not present, with
+// the pull policy Never.
+type errNeverPull struct{ error }
 
 // imagePull tells the events of a pod what the kubelet would say about an
 // image pull, for a workload that downloads what it runs: the model of

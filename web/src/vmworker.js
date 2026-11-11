@@ -36,6 +36,8 @@ const MANIFEST_TYPES = ["application/vnd.oci.image.manifest.v1+json", "applicati
 const MIN_MEMORY = 128, DEFAULT_MEMORY = 256, MAX_MEMORY = 2048;
 
 class PullError extends Error {}
+// The image is not there and the pull policy is Never.
+class NeverPullError extends PullError {}
 
 // parseRef normalizes an image reference as Docker does: nginx is
 // docker.io/library/nginx:latest.
@@ -91,6 +93,23 @@ class Pull {
   async cached(digest) {
     const c = await this.cache;
     return !!(c && (await c.match(this.blobURL(digest))));
+  }
+
+  // resolved returns what the last pull of this reference resolved it to:
+  // the image ID and the manifest of the linux/386 variant, or null.
+  async resolved() {
+    const c = await this.cache;
+    const hit = c && (await c.match(this.refURL()).catch(() => null));
+    return hit ? hit.json().catch(() => null) : null;
+  }
+
+  async remember(imageID, manifest) {
+    const c = await this.cache;
+    if (c) await c.put(this.refURL(), new Response(JSON.stringify({ imageID, manifest }))).catch(() => {});
+  }
+
+  refURL() {
+    return new URL(`/tabernetes-refs/${encodeURIComponent(this.ref.name)}`, self.location.href).href;
   }
 
   blobURL(digest) {
@@ -153,12 +172,23 @@ class Pull {
 }
 
 let store; // the image store (layers.js), once per worker
-async function pullImage(registry, image, onFetching) {
+// pullImage pulls an image, or finds it present. policy is the
+// imagePullPolicy of the container: with IfNotPresent and Never, an image
+// that a pull of the same reference left complete is used without asking
+// the registry, as the kubelet does.
+async function pullImage(registry, image, policy, onFetching) {
   const ref = parseRef(image);
   if (ref.domain !== "docker.io") {
     throw new PullError(`failed to resolve reference "${ref.name}": the tab node pulls from Docker Hub only (through the registry mirror of this page)`);
   }
   const p = new Pull(registry, ref);
+  store ??= await openStore();
+  if (policy !== "Always") {
+    const hit = await p.resolved();
+    const img = hit?.manifest?.layers && (await presentImage(p, ref, hit.imageID, hit.manifest));
+    if (img) return img;
+    if (policy === "Never") throw new NeverPullError(`Container image "${image}" is not present with pull policy of Never`);
+  }
   let { digest, json: m } = await p.manifest(ref.reference, [...INDEX_TYPES, ...MANIFEST_TYPES]);
   const imageID = `${ref.domain}/${ref.repo}@${digest}`;
   if (m.manifests) {
@@ -170,12 +200,25 @@ async function pullImage(registry, image, onFetching) {
   } else {
     throw new PullError(`failed to pull and unpack image "${ref.name}": unsupported manifest`);
   }
-  store ??= await openStore();
+  const img = await unpackImage(p, ref, imageID, m, onFetching);
+  await p.remember(imageID, m);
+  return img;
+}
+
+// presentImage returns the image if all of it is in the browser, else null.
+const presentImage = (p, ref, imageID, m) => unpackImage(p, ref, imageID, m, null);
+
+// unpackImage fetches and unpacks what is missing of the image with the
+// manifest m. Without onFetching, it returns null if something is missing.
+async function unpackImage(p, ref, imageID, m, onFetching) {
   const size = m.layers.reduce((n, l) => n + (l.size || 0), 0) + (m.config.size || 0);
-  for (const l of m.layers) await store.use(l.digest);
+  await Promise.all(m.layers.map((l) => store.use(l.digest)));
   const indexes = await Promise.all(m.layers.map((l) => store.index(l.digest)));
   const present = (await p.cached(m.config.digest)) && indexes.every(Boolean);
-  if (!present) onFetching();
+  if (!present) {
+    if (!onFetching) return null;
+    onFetching();
+  }
   const config = JSON.parse(new TextDecoder().decode(await p.blob(m.config.digest)));
   if (config.architecture && config.architecture !== PLATFORM.architecture) {
     throw new PullError(`failed to pull and unpack image "${ref.name}": no match for platform in manifest: not found (the tab node runs linux/386 images, this one is ${config.os}/${config.architecture})`);
@@ -223,9 +266,6 @@ const fetchBytes = async (url) => new Uint8Array(await (await fetch(url)).arrayB
 // bootVM starts the VM of the pod, without its file system: from a saved
 // state, or by booting the kernel. It resolves once init waits for the pod.
 async function bootVM(m, memory) {
-  const [kernel, init] = await Promise.all([fetchBytes(m.kernelURL), fetchBytes(m.initURL)]);
-  const build = await buildID(m.version || "", kernel, init).catch(() => "");
-  const state = build && (await loadState(build, memory));
   const base = {
     wasm_path: m.wasmURL,
     bios: { url: m.biosURL },
@@ -241,19 +281,24 @@ async function bootVM(m, memory) {
     preserve_mac_from_state_image: true,
     net_device: { type: "virtio", relay_url: "fetch", vm_ip: m.ip, router_ip: m.gateway },
   };
+  // Most pods restore a state: v86 compiles its wasm while the state loads.
+  const blank = new V86(base);
+  const loaded = new Promise((r) => blank.add_listener("emulator-loaded", r));
+  const [kernel, init] = await Promise.all([fetchBytes(m.kernelURL), fetchBytes(m.initURL)]);
+  const build = await buildID(m.version || "", kernel, init).catch(() => "");
+  const state = build && (await loadState(build, memory));
   if (state) {
-    const e = new V86(base);
-    await new Promise((r) => e.add_listener("emulator-loaded", r));
-    fastUnpack(e.v86.cpu);
+    await loaded;
+    fastUnpack(blank.v86.cpu);
     try {
-      await e.restore_state(state);
-      return { emulator: e, init };
+      await blank.restore_state(state);
+      return { emulator: blank, init };
     } catch (err) {
       console.warn("tabernetes: the saved state of the VM does not restore, booting:", err);
-      e.destroy();
       dropState(build, memory).catch(() => {});
     }
   }
+  blank.destroy();
   const e = new V86({
     ...base,
     bzimage: { buffer: kernel.buffer },
@@ -287,7 +332,10 @@ const opfs = () => navigator.storage?.getDirectory?.().then(() => true, () => fa
 // fastUnpack replaces how v86 restores the memory of a state: it zeroes all
 // of the memory first, which takes 160 ms for 256 MiB and makes the browser
 // commit every page. The memory of a new VM is zero already, apart from
-// what v86 put there itself (the BIOS).
+// what v86 put there itself: the BIOS and the VGA BIOS, below 1 MiB (checked
+// with v86 0.5.473: 29 pages, all below 0x100000). Checking every page
+// would take 80 ms.
+const LOW_PAGES = (1 << 20) >> 12;
 function fastUnpack(cpu) {
   cpu.unpack_memory = function (bitmap, packed) {
     const pages = this.memory_size[0] >> 12;
@@ -296,7 +344,7 @@ function fastUnpack(cpu) {
       if (bitmap.get(p)) {
         this.mem8.set(packed.subarray(d << 12, (d + 1) << 12), p << 12);
         d++;
-      } else if (!this.is_memory_zeroed(p << 12, 4096)) {
+      } else if (p < LOW_PAGES && !this.is_memory_zeroed(p << 12, 4096)) {
         this.zero_memory(p << 12, 4096);
       }
     }
@@ -320,10 +368,10 @@ async function start(m) {
   vm.catch(() => {});
   let img;
   try {
-    img = await pullImage(m.registry, m.image, () => post({ type: "pulling" }));
+    img = await pullImage(m.registry, m.image, m.pullPolicy, () => post({ type: "pulling" }));
   } catch (e) {
     vm.then((v) => v.emulator.destroy(), () => {});
-    post({ type: "error", pull: true, message: e instanceof PullError ? e.message : `failed to pull and unpack image "${m.image}": ${e.message}` });
+    post({ type: "error", pull: true, never: e instanceof NeverPullError, message: e instanceof PullError ? e.message : `failed to pull and unpack image "${m.image}": ${e.message}` });
     return;
   }
   post({ type: "pulled", present: img.present, size: img.size, imageID: img.imageID, ms: Date.now() - t0 });
