@@ -69,8 +69,11 @@ that name.
   `k8s/tabernetes/tabs.go`). Every tab joins as node `tab-N` over
   MessagePorts; a Web Lock per tab is its liveness. A closed tab is taken over
   by the others (the `llm` Deployment prefers its tab but is not pinned).
-  Without SharedWorker or Web Locks (Chrome on Android) the tab runs the
-  control plane itself.
+  Without SharedWorker or Web Locks the tab runs the control plane itself.
+  Chrome on Android has SharedWorker again since Chrome 148. The worker is
+  created with `extendedLifetime` (Chrome 148+), so it outlives the last tab
+  by about 30 s and a reload joins the running cluster (2-3 s to the prompt
+  instead of ~12 s). `forget` closes it with the last tab.
 - **The kubelet of a tab is like a Virtual Kubelet**: a node for the control
   plane, but no container runtime. Limit of 8 pods per tab (kept on purpose).
 - **Real images in a tab run in v86** (32-bit x86 JIT to Wasm, npm `v86`),
@@ -89,7 +92,7 @@ that name.
   `etcdshim/snapshot.go`), files of `/root` in IndexedDB. `forget` deletes
   all of it.
 - **Build tooling is mise** (`mise.toml` tasks), not a Makefile.
-- **Terminal**: the shell is mvdan.cc/sh with Go builtins (coreutils, `wget`,
+- **Terminal**: the shell is mvdan.cc/sh with Go built-ins (coreutils, `wget`,
   `vi`, `kubectl edit` in raw mode). busybox-wasm and vigo were tried and
   rejected.
 - **Persistence rules**: the etcd snapshot is saved only after boot, and a
@@ -128,9 +131,12 @@ that name.
   memory profiling crashed with "invalid runtime symbol table" when unwinding
   from `runtime.beforeIdle`.
 - RSA key generation is too slow: certificates use ECDSA (patch in client-go).
-- The wall clock has millisecond resolution; client-go event names use
-  `UnixNano`, so two events in the same millisecond collide. The tab node
-  records events through a queue, one per millisecond.
+- Go's wall clock in `wasm_exec.js` uses `Date.now()` (milliseconds);
+  client-go event names use `UnixNano`, so two events in the same
+  millisecond collide. The web task of `mise.toml` patches it to use
+  `performance.now()` while that agrees with `Date.now()`. The tab node still
+  records events through a queue, one per millisecond, because Firefox and
+  Safari coarsen `performance.now()` to about 1 ms.
 - SharedWorker: no nested Worker, no `RTCPeerConnection`, a
   `WebAssembly.Module` cannot be posted (messageerror). A teed ReadableStream
   can be transferred. WebRTC therefore lives in the tabs and is bridged to the

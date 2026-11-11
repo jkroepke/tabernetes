@@ -285,7 +285,10 @@ does not send `Content-Encoding` for it, and `DecompressionStream` has no
 zstd. The page fetches the `.zst` file and unpacks it with
 [fzstd](https://github.com/101arrowz/fzstd) in a Web Worker, block by block
 while it downloads. The browser compiles the WebAssembly while the bytes
-arrive, so download, unpacking and compiling overlap.
+arrive, so download, unpacking and compiling overlap. The first tab hands
+the unpacked bytes on to the shared worker of the control plane: a shared
+worker cannot start workers of its own and would unpack the frames one after
+the other, about 1.5 s longer.
 
 The blog fingerprints the files with Hugo, so the name of the binary
 changes with its content. The page keeps the binary in the Cache Storage of

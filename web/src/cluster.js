@@ -1,13 +1,13 @@
 // SharedWorker: the control plane that all Tabernetes tabs of the page share
 // (k8s/tabernetes/tabs.go). It lives as long as one of the tabs is open, so
-// any tab may close. The first tab hands over the binary it downloads, every
+// any tab may close, and a short time longer (extendedLifetime, tabs.js), so
+// that a reload finds it. The first tab hands over the binary it downloads, every
 // tab joins as a node (tab-1, tab-2, ...). Each connection between a tab and
 // the control plane is a MessagePort of its own.
 import "./wasm_exec.js";
 import { installFS } from "./fs.js";
 import { clusterState, forget } from "./state.js";
-import { zstdFrames, instantiate } from "./wasm.js";
-import { decompress } from "fzstd";
+import { instantiate } from "./wasm.js";
 
 const tabs = new Map(); // tab id -> MessagePort
 // The docker nodes from join: every tab connects to each of them over WebRTC
@@ -19,6 +19,7 @@ let feed = null; // the controller of the stream its chunks go to, while they ar
 let state = "new"; // new, booting, ready, failed, exited
 let started = false; // the control plane runs, or it did
 let failure = "";
+let forgotten = false; // forget ran: no reload may find this cluster
 let resolveReady, rejectReady;
 const ready = new Promise((res, rej) => { resolveReady = res; rejectReady = rej; });
 ready.catch(() => {});
@@ -52,21 +53,14 @@ const saved = clusterState();
 globalThis.tabernetesState = saved;
 
 // boot compiles the binary while the tab sends it, then starts the control plane.
-async function boot(stream, size) {
+async function boot(stream) {
   state = "booting";
   try {
     const go = new globalThis.Go();
     go.env = { HOME: "/root", USER: "root", PATH: "/usr/bin" };
-    // No workers in a shared worker: the frames unpack one after the other.
-    const unpacked = new ReadableStream({
-      async start(ctl) {
-        try {
-          for await (const frame of zstdFrames(stream, size)) ctl.enqueue(decompress(frame));
-          ctl.close();
-        } catch (e) { ctl.error(e); }
-      },
-    });
-    const instance = await instantiate(unpacked, go.importObject);
+    // The tab sends the binary unpacked: a shared worker cannot start
+    // workers, so it would unpack the zstd frames one after the other.
+    const instance = await instantiate(stream, go.importObject);
     globalThis.tabernetesMemory = instance.exports.mem;
     started = true;
     go.run(instance).then(() => exited(""), (e) => exited(e?.message ?? String(e)));
@@ -195,8 +189,10 @@ const methods = {
   meshOffer(id, name, sdp) {
     return signal(id, name, sdp);
   },
-  // forget: no more saves, and the saved cluster is gone.
+  // forget: no more saves, and the saved cluster is gone. The cluster runs
+  // on until the last tab closes, but not beyond: the next visit starts new.
   forget() {
+    forgotten = true;
     return forget();
   },
   // logs: the last n lines of the control plane logs, for "logs" in a tab.
@@ -218,6 +214,7 @@ self.onconnect = (e) => {
         // The tab holds this lock while it is open.
         navigator.locks.request(data.lock, () => {
           tabs.delete(id);
+          if (forgotten && !tabs.size) { self.close(); return; }
           // Its node, and the docker nodes that no other tab is connected to.
           for (const name of port.nodes) globalThis.tabernetes?.dropNode(name);
           leave(id, port.joined);
@@ -235,11 +232,11 @@ self.onconnect = (e) => {
         break;
       }
       case "binary": {
-        // The tab sends the download as it arrives (compressed, about 30 MB),
-        // in one message per chunk: not every browser can transfer a
+        // The tab sends the binary as it unpacks it (about 290 MB), in one
+        // message per chunk: not every browser can transfer a
         // ReadableStream (Safari).
         if (id !== binary || state !== "new") break;
-        boot(new ReadableStream({ start(ctl) { feed = ctl; } }), data.size);
+        boot(new ReadableStream({ start(ctl) { feed = ctl; } }));
         break;
       }
       case "chunk": {
