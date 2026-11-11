@@ -114,7 +114,9 @@ browser tab (single wasm binary)                     docker run tabernetes
   Deployment `llm` and returns, as `kubectl create deployment` would. The
   scheduler prefers the tab that ran `llm`; when that tab closes, the pod
   moves to another tab with WebGPU. The tab node (`k8s/tabernetes/tabnode.go`)
-  is a small kubelet in the Wasm: it registers the node `tab-1` (lease,
+  is not the upstream kubelet. It is a small one in the Wasm, like a
+  [Virtual Kubelet](https://virtual-kubelet.io/): for the control plane it is
+  a node, but there is no container runtime behind it. It registers the node `tab-1` (lease,
   status, taint `tabernetes.dev/tab` with `PreferNoSchedule`, so a node from
   `join` comes first, `kubernetes.io/os=browser`, so the DaemonSets stay away,
   and the extended resource `tabernetes.dev/webgpu`), runs the pods bound to it and serves
@@ -307,6 +309,12 @@ still works, too. Real isolation from the host needs rootless Docker or Podman.
 - A reload keeps the cluster, but not the nodes and pods of the last visit,
   and not what a pod wrote. Another tab sees a new file in `~` after its next
   reload.
+- The kubelet of a tab is not the real one. It runs pods with one container
+  and no init containers, at most 8 per tab. It has no volumes and no probes,
+  and of the resources only the memory limit counts: it is the memory of the
+  VM. Of `valueFrom` it knows the fields of the pod, not ConfigMaps and
+  Secrets. A pod that asks for a volume or such a variable gets an
+  `Unsupported` warning event and starts without it.
 - `kubectl exec`, `logs` and `port-forward` go through the WebRTC tunnel to
   the kubelet. The apiserver cannot reach pod or service IPs, so service
   proxy URLs do not work.
