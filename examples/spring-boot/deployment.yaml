@@ -1,0 +1,35 @@
+# kubectl apply -f deployment.yaml, then
+# kubectl port-forward deploy/spring-boot 8080:8080 & and wget -qO- localhost:8080
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spring-boot
+spec:
+  selector:
+    matchLabels:
+      app: spring-boot
+  template:
+    metadata:
+      labels:
+        app: spring-boot
+    spec:
+      containers:
+        - name: demo
+          image: jkroepke/tabernetes-spring-boot:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              # the memory of the VM; the app needs about 100 MiB
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spring-boot
+spec:
+  selector:
+    app: spring-boot
+  ports:
+    - port: 80
+      targetPort: 8080

@@ -185,6 +185,8 @@ browser tab (single wasm binary)                     docker run tabernetes
   number generator, mounts the 9p root and sets up eth0
   (`vm/init/stage0.go`). With the image present, the container of
   nginx:alpine starts about 0.5 s after the kubelet asks for it.
+  `examples/spring-boot` builds a Spring Boot app as a `linux/386` image; it
+  answers about 50 s after the start.
 - The terminal has no tty device, but kubectl gets one: the js variant of
   `github.com/moby/term` (`k8s/_overlay/`) reports the terminal of the page
   as a tty, so `kubectl exec -it`, `attach -it` and `run -it --rm` go to raw
