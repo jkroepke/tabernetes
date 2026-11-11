@@ -253,14 +253,72 @@ func (srv *Server) evalCompares(cmps []*pb.Compare) bool {
 	return true
 }
 
-func (srv *Server) txnLocked(rev int64, r *pb.TxnRequest, wrote *bool) (*pb.TxnResponse, error) {
-	ok := srv.evalCompares(r.Compare)
-	ops := r.Failure
+// branch returns the ops of r that run: Success if the compares hold.
+func branch(r *pb.TxnRequest, ok bool) []*pb.RequestOp {
 	if ok {
-		ops = r.Success
+		return r.Success
 	}
+	return r.Failure
+}
+
+// txnPath evaluates the compares of r, and of the txns nested in the branch
+// it takes, all against the store before the txn, as etcd does. The result
+// is the outcome of each compare in the order txnCheck and txnLocked visit
+// them.
+func (srv *Server) txnPath(r *pb.TxnRequest, path []bool) []bool {
+	ok := srv.evalCompares(r.Compare)
+	path = append(path, ok)
+	for _, op := range branch(r, ok) {
+		if t, isTxn := op.Request.(*pb.RequestOp_RequestTxn); isTxn {
+			path = srv.txnPath(t.RequestTxn, path)
+		}
+	}
+	return path
+}
+
+// txnCheck finds the errors of a txn before it writes anything, as etcd
+// does: a txn is all or nothing. Without it, a put with an unknown lease
+// after a put of another key left that first put in the store, at a
+// revision that the next write used again.
+func (srv *Server) txnCheck(r *pb.TxnRequest, path *[]bool) error {
+	s := srv.s
+	ok := (*path)[0]
+	*path = (*path)[1:]
+	for _, op := range branch(r, ok) {
+		switch o := op.Request.(type) {
+		case *pb.RequestOp_RequestRange:
+			if rev := o.RequestRange.Revision; rev > s.rev {
+				return rpctypes.ErrGRPCFutureRev
+			} else if rev > 0 && rev < s.compactRev {
+				return rpctypes.ErrGRPCCompacted
+			}
+		case *pb.RequestOp_RequestPut:
+			p := o.RequestPut
+			cur := s.current(string(p.Key))
+			if (p.IgnoreValue || p.IgnoreLease) && cur == nil {
+				return rpctypes.ErrGRPCKeyNotFound
+			}
+			lease := p.Lease
+			if p.IgnoreLease {
+				lease = cur.Lease
+			}
+			if lease != 0 && s.leases[lease] == nil {
+				return rpctypes.ErrGRPCLeaseNotFound
+			}
+		case *pb.RequestOp_RequestTxn:
+			if err := srv.txnCheck(o.RequestTxn, path); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (srv *Server) txnLocked(rev int64, r *pb.TxnRequest, path *[]bool, wrote *bool) (*pb.TxnResponse, error) {
+	ok := (*path)[0]
+	*path = (*path)[1:]
 	resp := &pb.TxnResponse{Succeeded: ok}
-	for _, op := range ops {
+	for _, op := range branch(r, ok) {
 		switch o := op.Request.(type) {
 		case *pb.RequestOp_RequestRange:
 			rr, err := srv.rangeLocked(o.RequestRange)
@@ -283,7 +341,7 @@ func (srv *Server) txnLocked(rev int64, r *pb.TxnRequest, wrote *bool) (*pb.TxnR
 			}
 			resp.Responses = append(resp.Responses, &pb.ResponseOp{Response: &pb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: dr}})
 		case *pb.RequestOp_RequestTxn:
-			tr, err := srv.txnLocked(rev, o.RequestTxn, wrote)
+			tr, err := srv.txnLocked(rev, o.RequestTxn, path, wrote)
 			if err != nil {
 				return nil, err
 			}
@@ -297,14 +355,20 @@ func (srv *Server) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, 
 	s := srv.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	wrote := false
-	resp, err := srv.txnLocked(s.rev+1, r, &wrote)
-	if err != nil {
+	path := srv.txnPath(r, nil)
+	check := path
+	if err := srv.txnCheck(r, &check); err != nil {
 		return nil, err
 	}
+	wrote := false
+	resp, err := srv.txnLocked(s.rev+1, r, &path, &wrote)
 	if wrote {
+		// Even after an error: what the txn wrote is in the store now.
 		s.rev++
 		s.wake()
+	}
+	if err != nil {
+		return nil, err
 	}
 	resp.Header = srv.header()
 	return resp, nil
