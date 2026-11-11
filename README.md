@@ -3,8 +3,13 @@
 A real Kubernetes control plane in a browser tab. kube-apiserver,
 kube-controller-manager, kube-scheduler and kubectl are compiled with
 `GOOS=js GOARCH=wasm` into a single binary. The page at
-[/tabernetes/](https://jkroepke.de/tabernetes/) boots it in a terminal.
+[jkroepke.de/tabernetes](https://jkroepke.de/tabernetes/) boots it in a terminal.
 A real node can join with Docker. The node talks to the browser over WebRTC.
+
+Tabernetes started as a part of [my blog](https://github.com/jkroepke/blog)
+(the history up to `jkroepke/blog#154` comes from there). This repository
+builds it and publishes every version as a GitHub release; the blog downloads
+a pinned release when it builds.
 
 ## How it works
 
@@ -71,7 +76,7 @@ browser tab (single wasm binary)                     docker run tabernetes
   `kubectl proxy` included. On Windows and Linux, Ctrl-C copies instead while
   text is selected, and Ctrl-V pastes.
 - `proxy 8080` opens `localhost:8080` of the Wasm in a new browser tab. A
-  service worker under `/tabernetes-proxy/` (`static/tabernetes-proxy/sw.js`) hands
+  service worker under `/tabernetes-proxy/` (`web/proxy-sw.js`) hands
   every request of that tab to the terminal tab, which sends it to the
   in-process network. The tab works as long as the terminal tab is open.
   Every terminal tab has its own `localhost`, so the worker remembers which
@@ -219,13 +224,56 @@ exactly what needs attention.
 
 ## Build
 
-The tasks live in `tabernetes/mise.toml`. mise installs Go and Node.js.
+The tasks live in `mise.toml`. mise installs Go and Node.js. The VM for
+container images needs Docker.
 
 ```bash
-cd tabernetes
-mise run build       # assets/tabernetes/{tabernetes.wasm.zst,tabernetes.js,unzstd.js,xterm.css}
+mise run build       # everything into dist/
+mise run test        # etcd shim tests, shell tests, go vet of the agent and the VM init
+mise run dist        # dist/ packed into .build/tabernetes.tar.gz, the asset of a release
 mise run node-image  # ghcr.io/jkroepke/tabernetes:latest for the local platform
-cd .. && hugo server # http://localhost:1313/tabernetes/
+```
+
+The first build clones Kubernetes into `.build/kubernetes` and takes a few
+minutes; later builds only redo what changed.
+
+To try a local build on the blog, unpack `.build/tabernetes.tar.gz` into
+`assets/tabernetes/` of the blog, copy `proxy-sw.js` to
+`static/tabernetes-proxy/sw.js` and run `hugo server`.
+
+## Release
+
+`dist/` is everything a page needs:
+
+| File | What |
+| --- | --- |
+| `tabernetes.wasm.zst` | the binary, concatenated zstd frames of 32 MiB |
+| `tabernetes.js` | the terminal, an ES module |
+| `unzstd.js`, `cluster.js`, `gpuworker.js`, `vmworker.js` | the workers |
+| `v86.wasm`, `vm/{bzImage,init,seabios.bin}` | v86 and the VM that it boots for a pod |
+| `xterm.css` | the style of the terminal |
+| `proxy-sw.js` | the service worker of `proxy <port>`, served as `/tabernetes-proxy/sw.js` |
+
+The page passes their URLs to the terminal as `data-*` attributes of
+`<div id="tabernetes">` (`web/src/index.js`); the shortcode
+`layouts/_shortcodes/tabernetes.html` of the blog is the reference. It also
+needs `'wasm-unsafe-eval'` in the `script-src` of its CSP.
+
+Releases are automatic. Pull request titles follow
+[Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`,
+`chore:`, `docs:`), and on every push to `main`
+[semantic-release](https://semantic-release.gitbook.io/) creates the next
+tag from them and starts CI on it (a tag pushed with `GITHUB_TOKEN` does not
+start workflows by itself, a `workflow_dispatch` does). The tag run builds `dist/`, pushes the node image
+as `ghcr.io/jkroepke/tabernetes:<version>` and `:latest`, and publishes the
+GitHub release with `tabernetes.tar.gz` and a build provenance attestation.
+The bundle of a release prints `docker run` with the node image of the same
+version. `Create Tag` (`.github/workflows/tag.yaml`) tags by hand.
+
+Check a download with:
+
+```bash
+gh attestation verify tabernetes.tar.gz --repo jkroepke/tabernetes
 ```
 
 The binary is around 290 MB, or 28 MB with zstd (gzip: 45 MB). GitHub Pages
@@ -235,7 +283,7 @@ zstd. The page fetches the `.zst` file and unpacks it with
 while it downloads. The browser compiles the WebAssembly while the bytes
 arrive, so download, unpacking and compiling overlap.
 
-Hugo fingerprints the files in `assets/tabernetes/`, so the name of the binary
+The blog fingerprints the files with Hugo, so the name of the binary
 changes with its content. The page keeps the binary in the Cache Storage of
 the browser and the next visit downloads nothing. GitHub Pages itself sends
 only `max-age=600`.
@@ -248,9 +296,9 @@ only `max-age=600`.
 3. Run `mise run test` (etcd shim tests), then boot the page and run
    `join`.
 
-The node image is built by `.github/workflows/tabernetes-image.yaml` with the same
-version and pushed as `latest` only. The printed `docker run` uses
-`--pull always`, so a join always runs the current image.
+CI builds the node image with the same version. A release pushes it as
+`<version>` and `latest`. The printed `docker run` uses `--pull always`, so a
+join always runs the image of its page.
 
 The node image also brings the images that every join needs: pause,
 kube-proxy, flannel and CoreDNS. The `images` stage of `node/Dockerfile` takes
@@ -268,7 +316,7 @@ The node container runs a kubelet, containerd and runc, but it needs neither
 
 | Flag | Why |
 | --- | --- |
-| `--pull always` | the image has only the `latest` tag; this fetches the current one instead of a cached old one |
+| `--pull always` | `latest` of a local build changes; this fetches the current one instead of a cached old one |
 | `--memory 2g --pids-limit 4096` | the node evicts and garbage collects almost never, so the limits keep a runaway pod from taking down the host |
 | `--security-opt seccomp=unconfined` | Docker's profile allows a new user namespace only with `CAP_SYS_ADMIN` |
 | `--security-opt systempaths=unconfined` | the kernel refuses a new `sysfs` and `cgroup2` mount while Docker masks parts of `/proc` and `/sys` |

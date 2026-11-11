@@ -1,0 +1,22 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>jkroepke/renovate-config"
+  ],
+  "packageRules": [
+    {
+      "description": "A new Kubernetes minor version needs work in k8s/patch.go, so it gets a pull request of its own.",
+      "matchPackageNames": [
+        "kubernetes/kubernetes"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "The k8s module (tabernetes-overlay) only compiles inside the Kubernetes checkout.",
+      "matchFileNames": [
+        "k8s/go.mod"
+      ],
+      "enabled": false
+    }
+  ]
+}

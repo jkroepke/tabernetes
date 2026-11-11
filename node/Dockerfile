@@ -16,8 +16,11 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
 ARG KUBERNETES_VERSION
 ARG CONTAINERD_VERSION=2.4.2
+# renovate: github-releases=opencontainers/runc
 ARG RUNC_VERSION=v1.5.2
+# renovate: github-releases=containernetworking/plugins
 ARG CNI_PLUGINS_VERSION=v1.9.1
+# renovate: github-releases=kubernetes-sigs/cri-tools
 ARG CRICTL_VERSION=v1.37.0
 RUN apt-get update && apt-get install -y --no-install-recommends binutils ca-certificates curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /out

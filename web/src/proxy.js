@@ -1,6 +1,6 @@
 // proxy <port> opens what listens on localhost:<port> of the in-browser
 // cluster (kubectl port-forward) in a new tab. A service worker
-// (static/tabernetes-proxy/sw.js) catches the requests of that tab and posts them
+// (web/proxy-sw.js, served as /tabernetes-proxy/sw.js) catches the requests of that tab and posts them
 // here; Go runs them against its in-process network.
 const B = (s) => `\x1b[1m${s}\x1b[0m`;
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;

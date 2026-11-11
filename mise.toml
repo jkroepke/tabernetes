@@ -1,8 +1,9 @@
 # Tabernetes: a Kubernetes control plane in the browser.
 #
-#   mise run build       build the WebAssembly binary and the terminal into ../assets/tabernetes/
+#   mise run build       build the WebAssembly binary and the terminal into dist/
 #   mise run web         rebuild only the terminal (needs .build/wasm_exec.js)
 #   mise run vm          build the VM for container images on tab nodes (needs docker)
+#   mise run dist        pack dist/ into .build/tabernetes.tar.gz, the asset of a release
 #   mise run test        run the etcd shim tests
 #   mise run node-image  build the node image (tabernetes) for the local platform
 #
@@ -11,13 +12,14 @@
 
 [tools]
 go = "1.27.3"
+node = "26.13.0"
 
 [env]
-# renovate: datasource=github-tags depName=kubernetes/kubernetes
+# renovate: github-tags=kubernetes/kubernetes
 KUBERNETES_VERSION = "v1.37.2"
 NODE_IMAGE = "ghcr.io/jkroepke/tabernetes"
 # The shell of the terminal, vendored into the Kubernetes checkout by k8s/patch.go.
-# renovate: datasource=go depName=mvdan.cc/sh/v3
+# renovate: go=mvdan.cc/sh/v3
 MVDAN_SH_VERSION = "v3.14.1"
 
 [tasks.checkout]
@@ -45,12 +47,12 @@ touch .build/kubernetes/.patched
 '''
 
 [tasks.wasm]
-description = "Build ../assets/tabernetes/tabernetes.wasm.zst"
+description = "Build dist/tabernetes.wasm.zst"
 depends = ["patch"]
 sources = [".build/kubernetes/.patched", "k8s/build.sh"]
-outputs = ["../assets/tabernetes/tabernetes.wasm.zst", ".build/wasm_exec.js"]
+outputs = ["dist/tabernetes.wasm.zst", ".build/wasm_exec.js"]
 run = '''
-mkdir -p ../assets/tabernetes
+mkdir -p dist
 k8s/build.sh .build/kubernetes .build/tabernetes.wasm
 # wasm_exec.js must come from the same Go version that built tabernetes.wasm.
 cp "$(cd .build/kubernetes && go env GOROOT)/lib/wasm/wasm_exec.js" .build/wasm_exec.js
@@ -63,14 +65,14 @@ node -e '
   for (let i = 0; i < wasm.length; i += 32 << 20) frames.push(zlib.zstdCompressSync(wasm.subarray(i, i + (32 << 20)), { params: {
     [c.ZSTD_c_compressionLevel]: 19, [c.ZSTD_c_checksumFlag]: 1, [c.ZSTD_c_nbWorkers]: os.availableParallelism() } }));
   fs.writeFileSync(process.argv[2], Buffer.concat(frames));
-' .build/tabernetes.wasm ../assets/tabernetes/tabernetes.wasm.zst
+' .build/tabernetes.wasm dist/tabernetes.wasm.zst
 '''
 
 [tasks.vm]
-description = "Build the kernel, init and BIOS that v86 boots into ../assets/tabernetes/vm/"
+description = "Build the kernel, init and BIOS that v86 boots into dist/vm/"
 run = '''
 # docker builds them (vm/Dockerfile) only when vm/ changed.
-out=../assets/tabernetes/vm
+out=dist/vm
 sum="$(find vm -type f | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | cut -d" " -f1)"
 if [ "$(cat "$out/.sum" 2>/dev/null)" != "$sum" ]; then
   rm -rf "$out"
@@ -80,20 +82,24 @@ fi
 '''
 
 [tasks.web]
-description = "Bundle the terminal into ../assets/tabernetes/"
+description = "Bundle the terminal into dist/"
 depends = ["vm"]
 wait_for = ["wasm"]
 run = '''
 if [ ! -f .build/wasm_exec.js ]; then mise run wasm; fi
-# Hugo fingerprints these (layouts/_shortcodes/tabernetes.html), so the browser
-# can cache them for good.
-mkdir -p ../assets/tabernetes
-out="$(cd ../assets/tabernetes && pwd)"
+# The page that embeds them should give them fingerprinted URLs (the blog does it
+# with Hugo), so the browser can cache them for good.
+mkdir -p dist
+out="$(cd dist && pwd)"
+# The printed docker run of a release (TABERNETES_VERSION=v1.2.3, set by CI)
+# uses the node image of that release, everything else uses latest.
+image="$NODE_IMAGE:latest"
+if [ -n "${TABERNETES_VERSION:-}" ]; then image="$NODE_IMAGE:${TABERNETES_VERSION#v}"; fi
 cp .build/wasm_exec.js web/src/wasm_exec.js
 cd web
 npm ci --no-audit --no-fund
 npx esbuild src/index.js --bundle --minify --format=esm --target=es2022 \
-  --define:TABERNETES_IMAGE="\"$NODE_IMAGE:latest\"" \
+  --define:TABERNETES_IMAGE="\"$image\"" \
   --define:V86_VERSION="\"$(node -p 'require("./node_modules/v86/package.json").version')\"" \
   --outfile="$out/tabernetes.js"
 # The zstd decoder runs in a worker, so that the page does not freeze.
@@ -110,11 +116,22 @@ npx esbuild src/vmworker.js --bundle --minify --format=iife --target=es2022 \
   --outfile="$out/vmworker.js"
 cp node_modules/v86/build/v86.wasm "$out/v86.wasm"
 cp node_modules/@xterm/xterm/css/xterm.css "$out/xterm.css"
+# The service worker of "proxy <port>". The page serves it as
+# /tabernetes-proxy/sw.js, its scope is /tabernetes-proxy/ (web/src/proxy.js).
+cp proxy-sw.js "$out/proxy-sw.js"
 '''
 
 [tasks.build]
-description = "Build everything into ../assets/tabernetes/"
+description = "Build everything into dist/"
 depends = ["wasm", "web"]
+
+[tasks.dist]
+description = "Pack dist/ (mise run build) into .build/tabernetes.tar.gz, the asset of a release"
+run = '''
+mkdir -p .build
+tar -czf .build/tabernetes.tar.gz --exclude .sum -C dist .
+(cd .build && shasum -a 256 tabernetes.tar.gz > tabernetes.tar.gz.sha256)
+'''
 
 [tasks.test]
 description = "Run the etcd shim tests and the shell tests (in node), vet the node agent"
