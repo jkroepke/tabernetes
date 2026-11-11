@@ -70,7 +70,10 @@ that name.
   MessagePorts; a Web Lock per tab is its liveness. A closed tab is taken over
   by the others (the `llm` Deployment prefers its tab but is not pinned).
   Without SharedWorker or Web Locks the tab runs the control plane itself.
-  Chrome on Android has SharedWorker again since Chrome 148.
+  Chrome on Android has SharedWorker again since Chrome 148. The worker is
+  created with `extendedLifetime` (Chrome 148+), so it outlives the last tab
+  by about 30 s and a reload joins the running cluster (2-3 s to the prompt
+  instead of ~12 s). `forget` closes it with the last tab.
 - **The kubelet of a tab is like a Virtual Kubelet**: a node for the control
   plane, but no container runtime. Limit of 8 pods per tab (kept on purpose).
 - **Real images in a tab run in v86** (32-bit x86 JIT to Wasm, npm `v86`),

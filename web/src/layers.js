@@ -20,7 +20,8 @@
 // go until 80 % are left. A layer that a pod in any tab runs with is never
 // collected (a shared Web Lock per layer, held by the worker of the pod), and
 // neither is one used in the last 2 minutes (imageMinimumGCAge).
-const IMAGE_FS = 4 << 30;
+// Not 4 << 30: JavaScript shifts in 32 bits, and that is 0.
+const IMAGE_FS = 4 * 2 ** 30;
 const HIGH = 0.85, LOW = 0.8, MIN_AGE = 2 * 60 * 1000;
 
 import { Decompress } from "fzstd";
