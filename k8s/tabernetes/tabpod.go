@@ -180,21 +180,32 @@ func (tp *tabPod) run() {
 	}
 	backoff := backoffStart
 	for ctx.Err() == nil {
+		tp.mu.Lock()
+		select {
+		case <-tp.logs.done:
+			tp.logs = newLogBuffer()
+		default:
+		}
+		logs := tp.logs
+		tp.mu.Unlock()
 		w, err := newWorkload(tp, &tp.container)
 		if err != nil {
 			tp.event(corev1.EventTypeWarning, "Failed", err.Error())
 			tp.setWaiting("ErrImagePull", err.Error())
+			logs.finish()
 			return
 		}
 		pull := &imagePull{tp: tp, t0: time.Now()}
-		err = w.start(ctx, tp.logs, pull)
+		err = w.start(ctx, logs, pull)
 		if ctx.Err() != nil {
 			w.stop()
+			logs.finish()
 			return
 		}
 		if err != nil {
 			w.stop()
 			if !pull.wasPulled() {
+				logs.finish()
 				// the download failed: the kubelet calls that a failed pull
 				image := tp.container.Image
 				tp.event(corev1.EventTypeWarning, "Failed", fmt.Sprintf("Failed to pull image %q: %v", image, err))
@@ -216,7 +227,7 @@ func (tp *tabPod) run() {
 				code, reason = se.code, "StartError"
 				tp.event(corev1.EventTypeWarning, "Failed", "Error: "+err.Error())
 			} else {
-				fmt.Fprintln(tp.logs, "error:", err)
+				fmt.Fprintln(logs, "error:", err)
 				tp.event(corev1.EventTypeWarning, "Failed", err.Error())
 			}
 			restart := tp.restarts(code)
@@ -345,6 +356,7 @@ func (tp *tabPod) stop(reason, msg string) {
 	tp.cancel()
 	tp.mu.Lock()
 	w := tp.w
+	logs := tp.logs
 	tp.w = nil
 	tp.mu.Unlock()
 	if w != nil {
@@ -353,6 +365,7 @@ func (tp *tabPod) stop(reason, msg string) {
 		}
 		w.stop()
 	}
+	logs.finish()
 }
 
 func (tp *tabPod) running() workload {
@@ -373,6 +386,7 @@ func (tp *tabPod) setWaiting(reason, msg string) {
 // pod is done.
 func (tp *tabPod) setTerminated(code int, reason, msg string, restart bool) {
 	tp.mu.Lock()
+	logs := tp.logs
 	now := metav1.Now()
 	t := &corev1.ContainerStateTerminated{ExitCode: int32(code), Reason: reason, Message: msg, StartedAt: now, FinishedAt: now}
 	if r := tp.status.State.Running; r != nil {
@@ -390,6 +404,7 @@ func (tp *tabPod) setTerminated(code int, reason, msg string, restart bool) {
 		tp.phase = corev1.PodFailed
 	}
 	tp.mu.Unlock()
+	logs.finish()
 	tp.update()
 }
 

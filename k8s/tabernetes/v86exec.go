@@ -34,10 +34,11 @@ const (
 
 // frames from the VM
 const (
-	vmStdout = 1
-	vmStderr = 2
-	vmExit   = 3 // exit code: int32
-	vmError  = 4 // the command did not start
+	vmStdout   = 1
+	vmStderr   = 2
+	vmExit     = 3 // exit code: int32
+	vmError    = 4 // the command did not start
+	vmStdinAck = 5 // the previous stdin frame was consumed
 )
 
 // streamer is a workload with a terminal and an attachable main process.
@@ -89,6 +90,7 @@ func (v *v86VM) stream(ctx context.Context, attach bool, cmd []string, in io.Rea
 		_, err := conn.Write(buf)
 		return err
 	}
+	stdinAck := make(chan struct{}, 1)
 	if in != nil {
 		go func() {
 			buf := make([]byte, 32<<10)
@@ -96,6 +98,13 @@ func (v *v86VM) stream(ctx context.Context, attach bool, cmd []string, in io.Rea
 				n, err := in.Read(buf)
 				if n > 0 && send(vmStdin, buf[:n]) != nil {
 					return
+				}
+				if n > 0 {
+					select {
+					case <-stdinAck:
+					case <-ctx.Done():
+						return
+					}
 				}
 				if err != nil {
 					send(vmClose, nil)
@@ -140,6 +149,11 @@ func (v *v86VM) stream(ctx context.Context, attach bool, cmd []string, in io.Rea
 			return err
 		}
 		switch h[0] {
+		case vmStdinAck:
+			select {
+			case stdinAck <- struct{}{}:
+			default:
+			}
 		case vmStdout:
 			out.Write(b)
 		case vmStderr:

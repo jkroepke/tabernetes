@@ -162,13 +162,17 @@ func newTabNode(ctx context.Context) (*tabNode, error) {
 		pods:   map[types.UID]*tabPod{},
 		events: make(chan tabEvent, 256),
 	}
-	go n.recordEvents()
-	if err := n.serveKubelet(); err != nil {
+	closeKubelet, err := n.serveKubelet()
+	if err != nil {
+		b.Shutdown()
 		return nil, err
 	}
 	if err := n.register(ctx); err != nil {
+		closeKubelet()
+		b.Shutdown()
 		return nil, err
 	}
+	go n.recordEvents()
 	go n.heartbeat()
 	n.watchPods()
 	return n, nil
@@ -462,34 +466,65 @@ type logBuffer struct {
 	dropped int
 	part    []byte
 	wake    chan struct{}
+	done    chan struct{}
 }
 
 type logLine struct {
-	t    time.Time
-	text string
+	t       time.Time
+	text    string
+	partial bool
 }
 
-func newLogBuffer() *logBuffer { return &logBuffer{wake: make(chan struct{})} }
+func newLogBuffer() *logBuffer {
+	return &logBuffer{wake: make(chan struct{}), done: make(chan struct{})}
+}
 
 func (b *logBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	select {
+	case <-b.done:
+		return 0, io.ErrClosedPipe
+	default:
+	}
 	b.part = append(b.part, p...)
 	for {
 		i := bytes.IndexByte(b.part, '\n')
 		if i < 0 {
 			break
 		}
-		b.lines = append(b.lines, logLine{time.Now(), string(b.part[:i])})
+		b.lines = append(b.lines, logLine{t: time.Now(), text: string(b.part[:i])})
 		b.part = b.part[i+1:]
 	}
+	b.trim()
+	close(b.wake)
+	b.wake = make(chan struct{})
+	return len(p), nil
+}
+
+// finish keeps the last fragment and ends followers of this container run.
+func (b *logBuffer) finish() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	select {
+	case <-b.done:
+		return
+	default:
+	}
+	if len(b.part) > 0 {
+		b.lines = append(b.lines, logLine{t: time.Now(), text: string(b.part), partial: true})
+		b.part = nil
+	}
+	b.trim()
+	close(b.done)
+	close(b.wake)
+}
+
+func (b *logBuffer) trim() {
 	if len(b.lines) > 5000 {
 		b.dropped += len(b.lines) - 4000
 		b.lines = append([]logLine(nil), b.lines[len(b.lines)-4000:]...)
 	}
-	close(b.wake)
-	b.wake = make(chan struct{})
-	return len(p), nil
 }
 
 // since returns the lines from number i on, the number after the last one,

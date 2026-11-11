@@ -15,12 +15,13 @@ import (
 
 // dcConn adapts a browser RTCDataChannel to an io.ReadWriteCloser.
 type dcConn struct {
-	dc     js.Value
-	mu     sync.Mutex
-	cond   *sync.Cond
-	buf    []byte
-	closed bool
-	funcs  []js.Func
+	dc        js.Value
+	mu        sync.Mutex
+	cond      *sync.Cond
+	buf       []byte
+	closed    bool
+	funcs     []js.Func
+	closeOnce sync.Once
 }
 
 const (
@@ -50,10 +51,7 @@ func newDCConn(dc js.Value) *dcConn {
 		return nil
 	})
 	onClose := js.FuncOf(func(js.Value, []js.Value) any {
-		c.mu.Lock()
-		c.closed = true
-		c.cond.Broadcast()
-		c.mu.Unlock()
+		c.Close()
 		return nil
 	})
 	c.funcs = []js.Func{onMsg, onClose}
@@ -106,11 +104,19 @@ func (c *dcConn) Write(p []byte) (int, error) {
 }
 
 func (c *dcConn) Close() error {
-	c.mu.Lock()
-	c.closed = true
-	c.cond.Broadcast()
-	c.mu.Unlock()
-	c.dc.Call("close")
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		c.cond.Broadcast()
+		c.mu.Unlock()
+		c.dc.Set("onmessage", js.Null())
+		c.dc.Set("onclose", js.Null())
+		c.dc.Call("close")
+		for _, f := range c.funcs {
+			f.Release()
+		}
+		c.funcs = nil
+	})
 	return nil
 }
 

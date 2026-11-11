@@ -1,7 +1,11 @@
 {
   "name": "tabernetes-web",
   "private": true,
+  "type": "module",
   "description": "Browser terminal for the Tabernetes Kubernetes control plane",
+  "scripts": {
+    "test": "node --test"
+  },
   "devDependencies": {
     "@mlc-ai/web-llm": "0.2.87",
     "@novnc/novnc": "1.7.0",

@@ -58,11 +58,18 @@ jobs:
           # on a cache hit only the (cheap) web part is rebuilt
           TARGET: ${{ steps.cache-wasm.outputs.cache-hit == 'true' && 'web' || 'build' }}
 
-      # Only when the wasm was rebuilt: the cache key covers everything the
-      # tests check (k8s/**, mise.toml).
+      # The control plane tests need the Kubernetes checkout, which is
+      # prepared when wasm is rebuilt. Web and VM tests also run on cache hits.
       - name: Test
         if: steps.cache-wasm.outputs.cache-hit != 'true'
         run: mise run test
+
+      - name: Web tests
+        run: npm --prefix web test
+
+      - name: VM tests
+        if: steps.cache-wasm.outputs.cache-hit == 'true'
+        run: go -C vm test -race ./init
 
       - name: Pack
         run: mise run dist

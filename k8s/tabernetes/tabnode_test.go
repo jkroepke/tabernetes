@@ -33,3 +33,29 @@ func TestLogBuffer(t *testing.T) {
 		t.Fatalf("since(6001) = %v", lines)
 	}
 }
+
+func TestLogBufferFinish(t *testing.T) {
+	t.Parallel()
+	b := newLogBuffer()
+	fmt.Fprint(b, "one\ntwo")
+	_, next, more := b.since(0)
+	b.finish()
+	b.finish() // stopping an already completed pod must be safe
+	select {
+	case <-b.done:
+	default:
+		t.Fatal("the container log did not end")
+	}
+	select {
+	case <-more:
+	default:
+		t.Fatal("followers were not woken")
+	}
+	lines, _, _ := b.since(next)
+	if len(lines) != 1 || lines[0].text != "two" || !lines[0].partial {
+		t.Fatalf("final fragment = %v", lines)
+	}
+	if _, err := b.Write([]byte("late output")); err == nil {
+		t.Fatal("accepted output after the container ended")
+	}
+}
