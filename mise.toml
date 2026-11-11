@@ -96,6 +96,18 @@ out="$(cd dist && pwd)"
 image="$NODE_IMAGE:latest"
 if [ -n "${TABERNETES_VERSION:-}" ]; then image="$NODE_IMAGE:${TABERNETES_VERSION#v}"; fi
 cp .build/wasm_exec.js web/src/wasm_exec.js
+# Go reads the wall clock from Date.now(), in whole milliseconds, so two
+# events in the same millisecond get the same name. performance.now() is
+# finer (0.1 ms in Chrome, coarser in Firefox and Safari). It may drift from
+# the wall clock (laptop sleep), so it is used only while it agrees with
+# Date.now() to the millisecond.
+node -e '
+  const fs = require("node:fs"), f = process.argv[1];
+  const old = "const msec = (new Date).getTime();";
+  const src = fs.readFileSync(f, "utf8");
+  if (!src.includes(old)) throw new Error("wasm_exec.js: runtime.walltime changed, update the patch in mise.toml");
+  fs.writeFileSync(f, src.replace(old, "const now = Date.now(), fine = performance.timeOrigin + performance.now(); const msec = Math.abs(fine - now) < 1 ? fine : now;"));
+' web/src/wasm_exec.js
 cd web
 npm ci --no-audit --no-fund
 npx esbuild src/index.js --bundle --minify --format=esm --target=es2022 \

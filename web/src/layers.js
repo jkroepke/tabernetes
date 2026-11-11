@@ -149,9 +149,11 @@ export class TarIndex {
   }
 }
 
-// unpack decompresses a layer blob, hands the tar to write(chunk, at) and
-// returns its index and size.
-async function unpack(blob, mediaType, write) {
+// unpack decompresses a layer as it streams in, hands the tar to
+// write(chunk, at) and returns its index and size. The compressed layer is
+// never in memory as a whole: for the 230 MB layer of python that halved the
+// peak memory of the pull (~1 GB before).
+async function unpack(stream, mediaType, write) {
   const idx = new TarIndex();
   let at = 0;
   const put = (chunk) => {
@@ -159,18 +161,48 @@ async function unpack(blob, mediaType, write) {
     at += chunk.length;
     idx.push(chunk);
   };
-  if (mediaType?.includes("zstd") || (blob[0] === 0x28 && blob[1] === 0xb5 && blob[2] === 0x2f && blob[3] === 0xfd)) {
+  const r = stream.getReader();
+  let { done, value: first } = await r.read();
+  first ??= new Uint8Array(0);
+  const zstd = mediaType?.includes("zstd") || (first[0] === 0x28 && first[1] === 0xb5 && first[2] === 0x2f && first[3] === 0xfd);
+  const gzip = !zstd && (mediaType?.includes("gzip") || (first[0] === 0x1f && first[1] === 0x8b));
+  if (zstd) {
+    // fzstd needs to know which chunk is the last one, so each chunk waits
+    // for the next.
     const d = new Decompress((chunk) => put(chunk));
-    for (let i = 0; i < blob.length; i += 1 << 20) d.push(blob.subarray(i, i + (1 << 20)), i + (1 << 20) >= blob.length);
-  } else if (mediaType?.includes("gzip") || (blob[0] === 0x1f && blob[1] === 0x8b)) {
-    const r = new Blob([blob]).stream().pipeThrough(new DecompressionStream("gzip")).getReader();
+    let prev = first;
+    while (!done) {
+      const { done: end, value } = await r.read();
+      done = end;
+      if (value) {
+        d.push(prev, false);
+        prev = value;
+      }
+    }
+    d.push(prev, true);
+  } else if (gzip) {
+    const rest = new ReadableStream({
+      start(c) { if (first.length) c.enqueue(first); if (done) c.close(); },
+      async pull(c) {
+        const { done, value } = await r.read();
+        if (value) c.enqueue(value);
+        if (done) c.close();
+      },
+      cancel(why) { return r.cancel(why); },
+    });
+    const z = rest.pipeThrough(new DecompressionStream("gzip")).getReader();
     for (;;) {
-      const { done, value } = await r.read();
+      const { done, value } = await z.read();
       if (done) break;
       put(value);
     }
   } else {
-    put(blob);
+    if (first.length) put(first);
+    while (!done) {
+      const { done: end, value } = await r.read();
+      done = end;
+      if (value) put(value);
+    }
   }
   return { entries: idx.entries, size: at };
 }
@@ -206,8 +238,10 @@ class OPFSStore {
     }
   }
 
-  // add unpacks a layer, once for all tabs.
-  async add(digest, blob, mediaType) {
+  // add unpacks a layer, once for all tabs. fetch() returns the stream of
+  // the compressed layer and verify() throws when its digest is wrong; the
+  // index is written only after it passed, so a bad layer is never used.
+  async add(digest, fetch, verify, mediaType) {
     const run = async () => {
       const have = await this.index(digest);
       if (have) return have;
@@ -216,11 +250,17 @@ class OPFSStore {
       let idx;
       try {
         h.truncate(0);
-        const { entries, size } = await unpack(blob, mediaType, (chunk, at) => {
-          if (h.write(chunk, { at }) !== chunk.length) throw new DOMException("short write", "QuotaExceededError");
-        });
-        h.flush();
-        idx = { version: VERSION, size, entries };
+        try {
+          const { entries, size } = await unpack(await fetch(), mediaType, (chunk, at) => {
+            if (h.write(chunk, { at }) !== chunk.length) throw new DOMException("short write", "QuotaExceededError");
+          });
+          verify();
+          h.flush();
+          idx = { version: VERSION, size, entries };
+        } catch (e) {
+          h.truncate(0); // give the room back, the layer has no index anyway
+          throw e;
+        }
       } finally {
         h.close();
       }
@@ -322,9 +362,10 @@ class MemoryStore {
   async use() {}
   async gc() { return 0; }
 
-  async add(digest, blob, mediaType) {
+  async add(digest, fetch, verify, mediaType) {
     const chunks = [];
-    const { entries, size } = await unpack(blob, mediaType, (chunk) => chunks.push(chunk.slice()));
+    const { entries, size } = await unpack(await fetch(), mediaType, (chunk) => chunks.push(chunk.slice()));
+    verify();
     const tar = new Uint8Array(size);
     let off = 0;
     for (const c of chunks) { tar.set(c, off); off += c.length; }

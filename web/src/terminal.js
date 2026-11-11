@@ -4,7 +4,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { installFS } from "./fs.js";
-import { clusterState, loadHome, saveHome, forget, sweepLayers } from "./state.js";
+import { clusterState, loadHome, saveHome, forget, sweepLayers, keepStorage } from "./state.js";
 import { zstdFrames, instantiate } from "./wasm.js";
 
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
@@ -177,6 +177,7 @@ export async function startTerminal(el, opts) {
   try {
     await globalThis.tabernetes.ready;
     booted = true;
+    keepStorage();
   } catch (e) {
     // A saved cluster that does not boot would not boot after a reload either.
     await saved?.drop();
