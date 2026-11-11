@@ -21,8 +21,11 @@ const PLATFORM = { os: "linux", architecture: "386" };
 const INDEX_TYPES = ["application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"];
 const MANIFEST_TYPES = ["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"];
 
-// MiB, of the VM of a pod. The files of the image are not in it, only what
-// the container runs and writes to tmpfs, plus the page cache.
+// MiB, of the VM of a pod: its memory limit, or 256 MiB without one. The
+// files of the image are not in it, only what the container runs and writes
+// to tmpfs, plus the page cache. Every pod has a worker and a wasm memory of
+// its own, but v86 gives a VM at most 2 GiB (less 128 KiB). The kernel uses
+// all of it (highmem, vm/kernel.config), not only the first 896 MiB.
 const MIN_MEMORY = 128, DEFAULT_MEMORY = 256, MAX_MEMORY = 2048;
 
 class PullError extends Error {}

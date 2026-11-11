@@ -155,9 +155,11 @@ browser tab (single wasm binary)                     docker run tabernetes
   v86 serves it over virtio 9p and reads a file from the tar only when the
   guest reads it; what the container writes stays in the memory of the
   worker. The kernel mounts it as root (`root=host9p rootfstype=9p`), so the
-  image is not in the RAM of the VM (256 MiB, or the memory limit of the pod).
+  image is not in the RAM of the VM (256 MiB, or the memory limit of the pod,
+  at most 2 GiB: more is not possible in v86).
   The kernel is Linux 6.8 from Ubuntu for i386, `tinyconfig` plus
-  `vm/kernel.config` (serial console, virtio-net, virtio-9p), built with clang
+  `vm/kernel.config` (serial console, virtio-net, virtio-9p, highmem, so that
+  it uses more than 896 MiB), built with clang
   in `vm/Dockerfile` (`mise run vm`, needs Docker). PID 1
   (`vm/init`) does what runc does: it mounts `/proc`, `/sys` and `/dev`,
   writes `/etc/hosts` and `/etc/resolv.conf`, sets the hostname and starts
