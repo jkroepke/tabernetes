@@ -344,7 +344,7 @@ func main() {
 			// a tab that runs the control plane itself is a node too; the
 			// SharedWorker has no document and is none
 			if err == nil && js.Global().Get("document").Truthy() {
-				registerTab()
+				go registerTab()
 			}
 		}
 		return nil, err

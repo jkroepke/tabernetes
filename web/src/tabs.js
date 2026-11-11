@@ -74,11 +74,11 @@ export async function connectCluster(url, tries = 0) {
     state: h.state,
     failure: h.failure,
     on(type, fn) { listeners[type].push(fn); },
-    // sendBinary hands the download to the worker as it arrives, in one
-    // message per chunk: not every browser can transfer a ReadableStream
+    // sendBinary hands the unpacked binary to the worker as it arrives, in
+    // one message per chunk: not every browser can transfer a ReadableStream
     // (Safari).
-    async sendBinary(stream, size) {
-      port.postMessage({ type: "binary", size });
+    async sendBinary(stream) {
+      port.postMessage({ type: "binary" });
       try {
         for (const r = stream.getReader(); ;) {
           const { value, done } = await r.read();
