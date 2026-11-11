@@ -12,8 +12,8 @@ ARG KERNEL_IMAGE=mirror.gcr.io/library/ubuntu:24.04
 FROM --platform=$BUILDPLATFORM ${KERNEL_IMAGE} AS kernel
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y --no-install-recommends bc bison bzip2 clang flex libelf-dev libssl-dev lld llvm make linux-source-6.8.0 \
- && rm -rf /var/lib/apt/lists/*
+  && apt-get install -y --no-install-recommends bc bison bzip2 clang flex libelf-dev libssl-dev lld llvm lz4 make linux-source-6.8.0 \
+  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 RUN tar xjf /usr/src/linux-source-6.8.0/linux-source-6.8.0.tar.bz2 --strip-components=1
 COPY kernel.config /kernel.config
@@ -22,7 +22,7 @@ RUN set -eux; \
     make -s tinyconfig; \
     ./scripts/kconfig/merge_config.sh -m .config /kernel.config >/dev/null; \
     make -s olddefconfig; \
-    for o in X86_32 M686 SERIAL_8250_CONSOLE VIRTIO_PCI VIRTIO_NET NET_9P_VIRTIO 9P_FS DEVTMPFS IP_PNP COMPAT_32BIT_TIME HIGHMEM4G; do \
+    for o in X86_32 M686 SERIAL_8250_CONSOLE VIRTIO_PCI VIRTIO_NET NET_9P_VIRTIO 9P_FS DEVTMPFS IP_PNP COMPAT_32BIT_TIME HIGHMEM4G KERNEL_LZ4 NO_HZ_IDLE; do \
       grep -q "^CONFIG_$o=y" .config || { echo "kernel.config: CONFIG_$o did not make it into .config" >&2; exit 1; }; \
     done; \
     make -s -j"$(nproc)" bzImage; \
