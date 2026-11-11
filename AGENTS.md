@@ -89,7 +89,7 @@ that name.
   `etcdshim/snapshot.go`), files of `/root` in IndexedDB. `forget` deletes
   all of it.
 - **Build tooling is mise** (`mise.toml` tasks), not a Makefile.
-- **Terminal**: the shell is mvdan.cc/sh with Go builtins (coreutils, `wget`,
+- **Terminal**: the shell is mvdan.cc/sh with Go built-ins (coreutils, `wget`,
   `vi`, `kubectl edit` in raw mode). busybox-wasm and vigo were tried and
   rejected.
 - **Persistence rules**: the etcd snapshot is saved only after boot, and a
