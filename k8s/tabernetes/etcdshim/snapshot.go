@@ -30,12 +30,20 @@ type Options struct {
 	// Save gets a snapshot every Interval while the store changes.
 	Save     func([]byte)
 	Interval time.Duration
+	// Ready, if set, holds the saves back until it is closed: a snapshot of a
+	// cluster that is still booting would restore half a cluster.
+	Ready <-chan struct{}
+	// Volatile are key prefixes whose changes alone are no reason to save:
+	// heartbeats, which a restored cluster writes again anyway. The keys are
+	// in the snapshot like all others.
+	Volatile []string
 }
 
 // ServeWith starts the shim like Serve, from a snapshot and saving one now
 // and then.
 func ServeWith(l net.Listener, o Options) error {
 	s := newStore()
+	s.volatile = o.Volatile
 	if o.Snapshot != nil {
 		if err := s.restore(o.Snapshot); err != nil {
 			return err
@@ -45,25 +53,30 @@ func ServeWith(l net.Listener, o Options) error {
 		if o.Interval <= 0 {
 			o.Interval = 2 * time.Second
 		}
-		go s.saveLoop(o.Save, o.Interval)
+		go s.saveLoop(o.Save, o.Interval, o.Ready)
 	}
 	return serve(l, s)
 }
 
-func (s *store) saveLoop(save func([]byte), every time.Duration) {
-	s.mu.Lock()
-	saved := s.rev
-	s.mu.Unlock()
-	for range time.Tick(every) {
+func (s *store) saveLoop(save func([]byte), every time.Duration, ready <-chan struct{}) {
+	if ready != nil {
+		<-ready
+	}
+	// The first snapshot goes out right away: what is there now was never
+	// saved, or was restored from a snapshot of another time.
+	saved := int64(-1)
+	for {
 		s.mu.Lock()
-		if s.rev == saved {
-			s.mu.Unlock()
-			continue
+		var b []byte
+		if s.durable != saved {
+			saved = s.durable
+			b = s.snapshotLocked()
 		}
-		saved = s.rev
-		b := s.snapshotLocked()
 		s.mu.Unlock()
-		save(b)
+		if b != nil {
+			save(b)
+		}
+		time.Sleep(every)
 	}
 }
 
@@ -109,6 +122,11 @@ func (s *store) snapshotLocked() []byte {
 }
 
 var errSnapshot = errors.New("etcdshim: broken snapshot")
+
+// Check tells whether ServeWith can start from the snapshot.
+func Check(snapshot []byte) error {
+	return emptyStore().restore(snapshot)
+}
 
 func (s *store) restore(b []byte) error {
 	if len(b) < len(magic) || string(b[:len(magic)]) != string(magic) {

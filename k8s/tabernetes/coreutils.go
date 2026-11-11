@@ -810,7 +810,8 @@ func splitWgetArgs(args []string) (flags, urls []string) {
 		switch {
 		case a == "--":
 			return flags, append(urls, args[i+1:]...)
-		case a == "-O" || a == "--output-document":
+		case a == "--output-document" || len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.IndexByte(a, 'O') == len(a)-1:
+			// -O file and -qO file: the file is the next argument
 			flags = append(flags, a)
 			if i+1 < len(args) {
 				i++

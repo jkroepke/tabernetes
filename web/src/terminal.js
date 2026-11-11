@@ -4,7 +4,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { installFS } from "./fs.js";
-import { clusterState, loadHome, saveHome, forget } from "./state.js";
+import { clusterState, loadHome, saveHome, forget, sweepLayers } from "./state.js";
 import { zstdFrames, instantiate } from "./wasm.js";
 
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
@@ -50,6 +50,8 @@ export async function startTerminal(el, opts) {
   let crashing = false;
   // The files of /root from the last visit (state.js).
   const home = { records: await loadHome(), save: saveHome };
+  // The images that forget left to the pods that still ran with them.
+  sweepLayers().catch(() => {});
   installFS((fd, s) => {
     if (crashing || /^(panic:|fatal error:)/m.test(s)) {
       crashing = true;
@@ -145,7 +147,11 @@ export async function startTerminal(el, opts) {
   globalThis.tabernetesStatus(cached ? "compiled WebAssembly from the browser cache" : "downloaded and compiled WebAssembly");
   // The "free" command reads the size of the linear memory from here.
   globalThis.tabernetesMemory = instance.exports.mem;
+  let booted = false;
   const exited = (why) => {
+    // A saved cluster that crashes the control plane while it boots would
+    // do so after every reload: the next one starts a new cluster.
+    if (!booted) saved?.drop();
     term.writeln(`\r\n\x1b[31m${cluster ? "this tab" : "the control plane"} exited${why ? `: ${why}` : ""}\x1b[0m`);
     if (crash.length) {
       // The first lines name the cause and the crashing goroutine.
@@ -168,6 +174,7 @@ export async function startTerminal(el, opts) {
   go.run(instance).then(() => exited(), (e) => exited(e?.message ?? String(e)));
   try {
     await globalThis.tabernetes.ready;
+    booted = true;
   } catch (e) {
     // A saved cluster that does not boot would not boot after a reload either.
     await saved?.drop();
@@ -250,13 +257,16 @@ export async function startTerminal(el, opts) {
         if (!/^y(es)?$/i.test(answer.trim())) return 1;
       }
       if (cluster) await cluster.rpc("forget").catch(() => {});
-      await forget();
+      const kept = await forget();
       write(`Deleted. The cluster runs on until ${cluster ? "every tab of this page is closed" : "you leave this page"}; the next visit starts a new one.\n`);
+      // Their containers read the files from the layers (rootfs.js).
+      if (kept) write("The images of the running pods stay until the pods are gone: the next visit deletes them.\n");
     },
     async logs(args, { write }) {
       const n = Number(args[0]) || 40;
       // With a shared worker, the control plane logs there.
-      const all = cluster ? await cluster.rpc("logs", n + 1).catch(() => "") : logs.join("");
+      // A control plane that is gone left its last lines behind (tabs.js).
+      const all = cluster ? cluster.ended?.logs ?? await cluster.rpc("logs", n + 1).catch(() => "") : logs.join("");
       write(all.split("\n").slice(-n - 1).join("\n"));
     },
     ...(opts.builtins || {}),

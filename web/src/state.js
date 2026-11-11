@@ -4,10 +4,13 @@
 //                  the PKI and an etcd snapshot (k8s/tabernetes/state.go)
 //   /root          IndexedDB "tabernetes", store "home": a record per file of
 //                  the terminal (fs.js)
-//   the images     OPFS tabernetes/layers (layers.js)
+//   the images     OPFS tabernetes/layers (layers.js), their configs in the
+//                  cache "tabernetes-configs" (vmworker.js), and the models
+//                  of llm pods in the caches of WebLLM
 //
-// IndexedDB and OPFS share the quota of the origin, a part of the free disk.
-// localStorage would hold a few MB of strings only. forget deletes all of it.
+// IndexedDB, OPFS and the caches share the quota of the origin, a part of the
+// free disk. localStorage would hold a few MB of strings only. forget deletes
+// all of it.
 
 const DB = "tabernetes";
 
@@ -20,8 +23,13 @@ function db() {
       r.result.createObjectStore("home");
     };
     r.onsuccess = () => {
-      // forget in another tab deletes the database: let it.
-      r.result.onversionchange = () => { r.result.close(); opening = null; };
+      // forget in another tab deletes the database: let it, and do not
+      // create it again with the next save.
+      r.result.onversionchange = (e) => {
+        if (e.newVersion === null) forgotten = true;
+        r.result.close();
+        opening = null;
+      };
       resolve(r.result);
     };
     r.onerror = () => reject(r.error);
@@ -108,8 +116,75 @@ export async function saveHome(put, del) {
   });
 }
 
-// forget deletes what this browser keeps: the cluster, the files and the
-// images. Saves stop in this context; others stop when the database is gone.
+// The Web Locks of a layer (layers.js): a pod holds the first one, shared,
+// for as long as it runs with the layer. A pull holds the second one while it
+// unpacks the layer.
+export const useLock = (digest) => `tabernetes-image-${digest}`;
+export const unpackLock = (digest) => `tabernetes-layer-${digest}`;
+
+// removeLayer deletes the files of a layer (layers.js), unless a pod in any
+// tab runs with it or a pull unpacks it. It reports whether the layer is gone.
+export async function removeLayer(dir, name) {
+  const rm = async () => {
+    for (const ext of ["json", "tar", "used", "forgotten"]) await dir.removeEntry(`${name}.${ext}`).catch(() => {});
+    return true;
+  };
+  if (!navigator.locks) return rm();
+  const digest = name.replace("-", ":");
+  return !!(await navigator.locks.request(useLock(digest), { ifAvailable: true }, (free) => free &&
+    navigator.locks.request(unpackLock(digest), { ifAvailable: true }, (idle) => idle && rm())));
+}
+
+async function layersDir() {
+  try {
+    const root = await navigator.storage.getDirectory();
+    return await (await root.getDirectoryHandle("tabernetes")).getDirectoryHandle("layers");
+  } catch {
+    return null; // no OPFS, or no layers
+  }
+}
+
+async function layerNames(dir, ext) {
+  const names = new Set();
+  for await (const name of dir.keys()) {
+    const m = name.match(/^(.+)\.(tar|json|used|forgotten)$/);
+    if (m && (!ext || m[2] === ext)) names.add(m[1]);
+  }
+  return [...names];
+}
+
+// forgetLayers deletes the images and returns how many layers are left. A
+// pod reads its files from the layers for as long as it runs, so the layers
+// of a running pod stay and get a mark: sweepLayers deletes them later.
+async function forgetLayers() {
+  const dir = await layersDir();
+  if (!dir) return 0;
+  let kept = 0;
+  for (const name of await layerNames(dir)) {
+    if (await removeLayer(dir, name).catch(() => false)) continue;
+    kept++;
+    await dir.getFileHandle(`${name}.forgotten`, { create: true }).catch(() => {});
+  }
+  if (!kept) {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry("tabernetes", { recursive: true }).catch(() => {});
+  }
+  return kept;
+}
+
+// sweepLayers deletes the layers that forget had to keep, once their pods
+// are gone. The page runs it when it loads, and so does the image garbage
+// collection.
+export async function sweepLayers() {
+  const dir = await layersDir();
+  if (!dir) return;
+  for (const name of await layerNames(dir, "forgotten")) await removeLayer(dir, name).catch(() => {});
+}
+
+// forget deletes what this browser keeps: the cluster, the files, the images
+// and the models. Saves stop in this context, and in the others when they
+// see the database go. It returns the number of image layers that running
+// pods still read: these go later (sweepLayers).
 export async function forget() {
   forgotten = true;
   const d = await opening?.catch(() => null);
@@ -117,7 +192,9 @@ export async function forget() {
   opening = null;
   await done(indexedDB.deleteDatabase(DB)).catch(() => {});
   try {
-    const root = await navigator.storage.getDirectory();
-    await root.removeEntry("tabernetes", { recursive: true });
-  } catch { /* no OPFS, or a running pod still reads a layer */ }
+    for (const name of await caches.keys()) {
+      if (name === "tabernetes-configs" || name.startsWith("webllm/")) await caches.delete(name);
+    }
+  } catch { /* no Cache Storage */ }
+  return forgetLayers().catch(() => 0);
 }

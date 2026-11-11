@@ -94,3 +94,44 @@ func TestSnapshot(t *testing.T) {
 		t.Fatal("a cut snapshot restored")
 	}
 }
+
+func TestSaveLoop(t *testing.T) {
+	s := newStore()
+	s.volatile = []string{"/registry/leases/"}
+	saves := make(chan []byte, 16)
+	ready := make(chan struct{})
+	go s.saveLoop(func(b []byte) { saves <- b }, 10*time.Millisecond, ready)
+	put := func(key string) {
+		s.mu.Lock()
+		s.rev++
+		s.put(s.rev, []byte(key), []byte("x"), 0)
+		s.mu.Unlock()
+	}
+	saved := func(want bool, what string) {
+		t.Helper()
+		select {
+		case <-saves:
+			if !want {
+				t.Fatalf("saved %s", what)
+			}
+		case <-time.After(100 * time.Millisecond):
+			if want {
+				t.Fatalf("did not save %s", what)
+			}
+		}
+	}
+	put("/registry/pods/default/a")
+	saved(false, "before the cluster was ready")
+	close(ready)
+	saved(true, "once the cluster was ready")
+	saved(false, "again without a change")
+	put("/registry/leases/kube-node-lease/tab-1")
+	saved(false, "for a heartbeat")
+	put("/registry/pods/default/b")
+	saved(true, "a new pod")
+	s.mu.Lock()
+	s.rev++
+	s.del(s.rev, "/registry/pods/default/a")
+	s.mu.Unlock()
+	saved(true, "a deleted pod")
+}

@@ -17,6 +17,7 @@ const statusLines = [];
 let binary = null; // the tab that hands over the binary, once
 let feed = null; // the controller of the stream its chunks go to, while they arrive
 let state = "new"; // new, booting, ready, failed, exited
+let started = false; // the control plane runs, or it did
 let failure = "";
 let resolveReady, rejectReady;
 const ready = new Promise((res, rej) => { resolveReady = res; rejectReady = rej; });
@@ -67,9 +68,9 @@ async function boot(stream, size) {
     });
     const instance = await instantiate(unpacked, go.importObject);
     globalThis.tabernetesMemory = instance.exports.mem;
+    started = true;
     go.run(instance).then(() => exited(""), (e) => exited(e?.message ?? String(e)));
-    // A saved cluster that does not boot would not boot after a reload either.
-    await globalThis.tabernetes.ready.catch(async (e) => { await saved.drop(); throw e; });
+    await globalThis.tabernetes.ready;
     if (state !== "booting") return; // it exited meanwhile
     state = "ready";
     resolveReady();
@@ -88,12 +89,18 @@ function exited(why) {
 // that, a reload would find the dead one for as long as another tab is open.
 function end(how, why) {
   if (state === "failed" || state === "exited") return;
+  // A saved cluster that does not boot, or that crashes the control plane
+  // while it boots, would do so after every reload: the next one starts new.
+  const dropped = started && state === "booting" ? saved.drop() : Promise.resolve();
   state = how;
   failure = why;
-  broadcast(how === "failed" ? { type: "failed", error: why } : { type: "exited", why, crash: crash.join("") });
+  // The tabs keep the last lines of the logs: "logs" cannot ask for them anymore.
+  const last = logs.join("").split("\n").slice(-500).join("\n");
+  broadcast(how === "failed" ? { type: "failed", error: why, logs: last } : { type: "exited", why, crash: crash.join(""), logs: last });
   rejectReady(new Error(how === "failed" ? why : `the control plane exited${why ? `: ${why}` : ""}`));
-  // after the answers to the tabs that wait in joinTab
-  setTimeout(() => self.close(), 1000);
+  // after the answers to the tabs that wait in joinTab, and after the drop
+  const close = () => setTimeout(() => self.close(), 1000);
+  Promise.race([dropped, new Promise((r) => setTimeout(r, 5000))]).then(close, close);
 }
 
 // open opens a connection to a tab. extra.dc names a node that joined with

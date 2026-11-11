@@ -3,10 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"k8s.io/component-base/version"
@@ -15,8 +19,42 @@ import (
 //go:embed addons/*.yaml
 var addonFS embed.FS
 
-func installAddons(ctx context.Context, c *cluster) error {
+// addons returns the manifests of this build by file name.
+func addons() (map[string][]byte, error) {
 	entries, err := addonFS.ReadDir("addons")
+	if err != nil {
+		return nil, err
+	}
+	files := map[string][]byte{}
+	for _, e := range entries {
+		b, err := addonFS.ReadFile("addons/" + e.Name())
+		if err != nil {
+			return nil, err
+		}
+		files[e.Name()] = bytes.ReplaceAll(b, []byte("KUBERNETES_VERSION"), []byte(version.Get().GitVersion))
+	}
+	return files, nil
+}
+
+// addonsHash names the addons of this build. A saved cluster remembers it
+// (state.go): another build may bring other addons.
+func addonsHash() string {
+	files, err := addons()
+	if err != nil {
+		return ""
+	}
+	h := sha256.New()
+	for _, name := range slices.Sorted(maps.Keys(files)) {
+		fmt.Fprintf(h, "%s %d\n", name, len(files[name]))
+		h.Write(files[name])
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// installAddons applies the addons. update is for a restored cluster: the
+// manifests of this build win over what the user changed in the old ones.
+func installAddons(ctx context.Context, update bool) error {
+	files, err := addons()
 	if err != nil {
 		return err
 	}
@@ -24,23 +62,22 @@ func installAddons(ctx context.Context, c *cluster) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	for _, e := range entries {
-		b, err := addonFS.ReadFile("addons/" + e.Name())
-		if err != nil {
-			return err
-		}
-		b = bytes.ReplaceAll(b, []byte("KUBERNETES_VERSION"), []byte(version.Get().GitVersion))
-		if err := os.WriteFile(filepath.Join(dir, e.Name()), b, 0o644); err != nil {
+	for name, b := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), b, 0o644); err != nil {
 			return err
 		}
 	}
+	args, tries := []string{"apply", "--server-side", "-f", dir}, 10
+	if update {
+		args, tries = append(args, "--force-conflicts"), 3
+	}
 	// The controllers may still be busy creating default service accounts etc.
 	for i := 0; ; i++ {
-		code := runKubectl(ctx, []string{"apply", "--server-side", "-f", dir}, nil, os.Stderr, os.Stderr)
+		code := runKubectl(ctx, args, nil, os.Stderr, os.Stderr)
 		if code == 0 {
 			return nil
 		}
-		if i == 10 {
+		if i == tries {
 			return fmt.Errorf("applying addons failed with exit code %d", code)
 		}
 		time.Sleep(2 * time.Second)

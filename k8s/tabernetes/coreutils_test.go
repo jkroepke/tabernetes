@@ -123,6 +123,9 @@ func TestSplitWgetArgs(t *testing.T) {
 		{[]string{"localhost:8080", "-qO-"}, []string{"-qO-"}, []string{"localhost:8080"}},
 		{[]string{"u", "-O", "-"}, []string{"-O", "-"}, []string{"u"}},
 		{[]string{"-O", "x.md", "u"}, []string{"-O", "x.md"}, []string{"u"}},
+		{[]string{"-qO", "x.md", "u"}, []string{"-qO", "x.md"}, []string{"u"}},
+		{[]string{"u", "-qO", "-"}, []string{"-qO", "-"}, []string{"u"}},
+		{[]string{"-Ox.md", "u"}, []string{"-Ox.md"}, []string{"u"}},
 		{[]string{"--", "-u"}, nil, []string{"-u"}},
 	} {
 		flags, urls := splitWgetArgs(tc.args)

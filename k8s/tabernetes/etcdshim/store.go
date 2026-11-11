@@ -6,6 +6,7 @@ package etcdshim
 import (
 	"bytes"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,18 +43,27 @@ type store struct {
 	notify     chan struct{}
 	leases     map[int64]*lease
 	nextLease  int64
+	// durable is the revision of the last change worth a save: one of a key
+	// that is not volatile (snapshot.go).
+	durable  int64
+	volatile []string
 }
 
 func newStore() *store {
-	s := &store{
+	s := emptyStore()
+	go s.expireLoop()
+	return s
+}
+
+// emptyStore is a store whose leases never expire.
+func emptyStore() *store {
+	return &store{
 		rev:       1,
 		keys:      map[string][]record{},
 		notify:    make(chan struct{}),
 		leases:    map[int64]*lease{},
 		nextLease: 0x1000,
 	}
-	go s.expireLoop()
-	return s
 }
 
 // wake must be called with mu held after a write.
@@ -72,6 +82,16 @@ func (s *store) getAt(key string, rev int64) *mvccpb.KeyValue {
 }
 
 func (s *store) current(key string) *mvccpb.KeyValue { return s.getAt(key, s.rev) }
+
+// changed notes a write to key at rev for the next save.
+func (s *store) changed(rev int64, key string) {
+	for _, p := range s.volatile {
+		if strings.HasPrefix(key, p) {
+			return
+		}
+	}
+	s.durable = rev
+}
 
 // inRange reports whether key is within [start, end) using etcd semantics.
 func inRange(key, start, end []byte) bool {
@@ -139,6 +159,7 @@ func (s *store) put(rev int64, key, value []byte, leaseID int64) (prev *mvccpb.K
 		}
 	}
 	s.addKey(k)
+	s.changed(rev, k)
 	s.keys[k] = append(s.keys[k], record{rev: rev, kv: kv})
 	s.log = append(s.log, event{rev: rev, typ: mvccpb.PUT, kv: kv, prevKV: prev})
 	return prev
@@ -154,6 +175,7 @@ func (s *store) del(rev int64, key string) *mvccpb.KeyValue {
 			delete(l.keys, key)
 		}
 	}
+	s.changed(rev, key)
 	s.keys[key] = append(s.keys[key], record{rev: rev, deleted: true})
 	s.log = append(s.log, event{rev: rev, typ: mvccpb.DELETE, kv: &mvccpb.KeyValue{Key: []byte(key), ModRevision: rev}, prevKV: prev})
 	return prev

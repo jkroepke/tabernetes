@@ -73,7 +73,9 @@ func (v *v86VM) start(ctx context.Context, log io.Writer, pull *imagePull) error
 	c := v.tp.container
 	env := []any{}
 	for _, e := range c.Env {
-		env = append(env, e.Name+"="+e.Value)
+		if value, ok := v.tp.envValue(e); ok {
+			env = append(env, e.Name+"="+value)
+		}
 	}
 	command, args := []any{}, []any{}
 	for _, s := range c.Command {

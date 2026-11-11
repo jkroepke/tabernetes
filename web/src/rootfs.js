@@ -135,6 +135,7 @@ export class LayerStorage {
     this.mem = mem; // key -> Uint8Array
     this.lru = new Map();
     this.bytes = 0;
+    this.loading = new Map(); // key -> the read of the file that is under way
   }
 
   async read(key, offset, count, size) {
@@ -152,14 +153,22 @@ export class LayerStorage {
     if (size > LayerStorage.WHOLE) {
       return layer.read(start + offset, Math.max(0, Math.min(count, size - offset)));
     }
-    data = await layer.read(start, size);
-    this.lru.set(key, data);
-    this.bytes += data.length;
-    for (const [k, v] of this.lru) {
-      if (this.bytes <= LayerStorage.CACHE) break;
-      this.lru.delete(k);
-      this.bytes -= v.length;
+    // Two processes of the pod may ask for the same file at once: one read.
+    let load = this.loading.get(key);
+    if (!load) {
+      load = layer.read(start, size).then((data) => {
+        this.lru.set(key, data);
+        this.bytes += data.length;
+        for (const [k, v] of this.lru) {
+          if (this.bytes <= LayerStorage.CACHE) break;
+          this.lru.delete(k);
+          this.bytes -= v.length;
+        }
+        return data;
+      }).finally(() => this.loading.delete(key));
+      this.loading.set(key, load);
     }
+    data = await load;
     return data.subarray(offset, offset + count);
   }
 

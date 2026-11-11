@@ -104,7 +104,16 @@ func boot() (*cluster, error) {
 	status("starting etcd")
 	l, err := net.Listen("tcp", "127.0.0.1:2379")
 	must(err)
-	opts := etcdshim.Options{Save: stateSaver(stateFiles()), Interval: 3 * time.Second}
+	// The page keeps the cluster once it has booted: a reload in the middle
+	// of the first boot must not find a cluster without its addons. The
+	// leases are heartbeats: they alone are no reason to write it again.
+	booted := make(chan struct{})
+	opts := etcdshim.Options{
+		Save:     stateSaver(stateFiles()),
+		Interval: time.Second,
+		Ready:    booted,
+		Volatile: []string{"/registry/leases/", "/registry/masterleases/", "/registry/peerserverleases/"},
+	}
 	if st != nil {
 		opts.Snapshot = st.Etcd
 	}
@@ -124,13 +133,23 @@ func boot() (*cluster, error) {
 
 	startControllers()
 
-	// A restored cluster has its addons, maybe changed by the user.
-	if st == nil {
+	// A restored cluster has its addons, maybe changed by the user. It gets
+	// them again only when this build brings other ones.
+	switch {
+	case st == nil:
 		status("installing addons")
-		if err := installAddons(context.Background(), c); err != nil {
+		if err := installAddons(context.Background(), false); err != nil {
 			return nil, fmt.Errorf("installing addons: %w", err)
 		}
+	case st.Addons != addonsHash():
+		status("updating the addons")
+		if err := installAddons(context.Background(), true); err != nil {
+			// the cluster of the user is worth more than a new addon
+			fmt.Fprintln(os.Stderr, "tabernetes: updating the addons:", err)
+			status("the addons are not up to date: " + err.Error())
+		}
 	}
+	close(booted)
 	status("ready")
 	current = c
 	return c, nil

@@ -61,8 +61,9 @@ var (
 const (
 	tabTaint       = "tabernetes.dev/tab"
 	webgpuResource = "tabernetes.dev/webgpu"
-	// The kubelet reports the node status every 10 s. The lease is the
-	// heartbeat the node lifecycle controller looks at.
+	// The lease is the heartbeat the node lifecycle controller looks at. The
+	// node status is written every 5 minutes, as the kubelet does when
+	// nothing changed: every write is a new save of the cluster (state.go).
 	tabHeartbeat     = 10 * time.Second
 	tabLeaseDuration = 40
 )
@@ -322,7 +323,7 @@ func (n *tabNode) heartbeat() {
 				fmt.Fprintln(os.Stderr, "tab node: lease:", err)
 			}
 		}
-		if i%6 == 5 {
+		if i%30 == 29 {
 			if err := n.updateStatus(ctx); err != nil {
 				fmt.Fprintln(os.Stderr, "tab node: status:", err)
 			}
@@ -434,11 +435,23 @@ func (n *tabNode) podByName(namespace, name string) *tabPod {
 	return nil
 }
 
-// allocateIP hands out the next address of the pod CIDR. n.mu is held.
+// allocateIP hands out the next address of the pod CIDR that no pod of the
+// tab has. n.mu is held.
 func (n *tabNode) allocateIP() string {
-	ip := n.podCIDR.IP.To4()
-	n.nextIP++
-	return net.IPv4(ip[0], ip[1], ip[2], byte(2+(n.nextIP-1)%250)).String()
+	base := n.podCIDR.IP.To4()
+	used := map[string]bool{}
+	for _, tp := range n.pods {
+		used[tp.ip] = true
+	}
+	var ip string
+	for range 250 {
+		n.nextIP++
+		ip = net.IPv4(base[0], base[1], base[2], byte(2+(n.nextIP-1)%250)).String()
+		if !used[ip] {
+			break
+		}
+	}
+	return ip
 }
 
 // logBuffer keeps the output of a container for kubectl logs. Line numbers

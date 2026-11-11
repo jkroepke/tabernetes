@@ -74,6 +74,7 @@ type tabPod struct {
 	restartPolicy   corev1.RestartPolicy
 	ref             *corev1.ObjectReference
 	ip              string
+	ignored         []string // what the pod asks for and the tab node does not have
 	logs            *logBuffer
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -118,7 +119,47 @@ func (n *tabNode) newPod(pod *corev1.Pod) *tabPod {
 	if len(pod.Spec.Containers) != 1 || len(pod.Spec.InitContainers) > 0 {
 		tp.phase, tp.reason, tp.message = corev1.PodFailed, "UnsupportedPod", "the tab node runs pods with exactly one container and no init containers"
 	}
+	for _, v := range pod.Spec.Volumes {
+		// every pod has the one of its service account token
+		if !strings.HasPrefix(v.Name, "kube-api-access-") {
+			tp.ignored = append(tp.ignored, "volume "+v.Name)
+		}
+	}
+	if len(tp.container.EnvFrom) > 0 {
+		tp.ignored = append(tp.ignored, "envFrom")
+	}
+	for _, e := range tp.container.Env {
+		if _, ok := tp.envValue(e); !ok {
+			tp.ignored = append(tp.ignored, "env "+e.Name)
+		}
+	}
 	return tp
+}
+
+// envValue returns the value of an environment variable of the container.
+// Of the downward API the tab node knows the fields of the pod itself, and
+// it does not read ConfigMaps or Secrets: ok is false for these.
+func (tp *tabPod) envValue(e corev1.EnvVar) (value string, ok bool) {
+	if e.ValueFrom == nil {
+		return e.Value, true
+	}
+	if f := e.ValueFrom.FieldRef; f != nil {
+		switch f.FieldPath {
+		case "metadata.name":
+			return tp.name, true
+		case "metadata.namespace":
+			return tp.namespace, true
+		case "metadata.uid":
+			return string(tp.uid), true
+		case "spec.nodeName":
+			return tabNodeName, true
+		case "status.podIP", "status.podIPs":
+			return tp.ip, true
+		case "status.hostIP", "status.hostIPs":
+			return tabNodeIP, true
+		}
+	}
+	return "", false
 }
 
 func (tp *tabPod) event(typ, reason, msg string) {
@@ -133,6 +174,9 @@ func (tp *tabPod) run() {
 	if tp.phase == corev1.PodFailed {
 		tp.event(corev1.EventTypeWarning, tp.reason, tp.message)
 		return
+	}
+	if len(tp.ignored) > 0 {
+		tp.event(corev1.EventTypeWarning, "Unsupported", "the tab node has no volumes, and of valueFrom only the fields of the pod; the container starts without: "+strings.Join(tp.ignored, ", "))
 	}
 	backoff := backoffStart
 	for ctx.Err() == nil {

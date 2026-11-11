@@ -10,6 +10,10 @@ const constants = {
   O_APPEND: 0o2000, O_DIRECTORY: 0o200000, O_SYNC: 0o4010000,
 };
 
+// Node.js applies the umask in the kernel, here open and mkdir do: a new
+// file is -rw-r--r--, not -rw-rw-rw-.
+const UMASK = 0o022;
+
 function fsErr(code, path) {
   const e = new Error(`${code}: ${path ?? ""}`);
   e.code = code;
@@ -141,7 +145,7 @@ export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}
       if (!node) {
         if (!(flags & constants.O_CREAT)) throw fsErr("ENOENT", path);
         if (!parent || !isDir(parent)) throw fsErr("ENOENT", path);
-        node = newNode(S_IFREG | (mode & 0o7777), { data: new Uint8Array(0), size: 0 });
+        node = newNode(S_IFREG | (mode & 0o7777 & ~UMASK), { data: new Uint8Array(0), size: 0 });
         parent.children.set(name, node);
         parent.mtime = Date.now();
       }
@@ -193,7 +197,7 @@ export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}
       const { node, parent, name } = resolve(path);
       if (node) throw fsErr("EEXIST", path);
       if (!parent) throw fsErr("EEXIST", path);
-      parent.children.set(name, newNode(S_IFDIR | (perm & 0o7777), { children: new Map() }));
+      parent.children.set(name, newNode(S_IFDIR | (perm & 0o7777 & ~UMASK), { children: new Map() }));
       touch(path);
     },
     rmdir(path) {
@@ -323,7 +327,7 @@ export function installFS(onOutput, home = null) {
   globalThis.process ??= {};
   Object.assign(globalThis.process, {
     getuid: () => 0, getgid: () => 0, geteuid: () => 0, getegid: () => 0,
-    getgroups: () => [0], pid: 1, ppid: 0, umask: () => 0o022,
+    getgroups: () => [0], pid: 1, ppid: 0, umask: () => UMASK,
     cwd: () => fs.cwd(), chdir: (path) => fs.chdir(path),
   });
   return fs;

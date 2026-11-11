@@ -16,6 +16,8 @@ export async function connectCluster(url, tries = 0) {
   const dataChannels = new Map(); // docker node name -> open(label) of join.js
   let seq = 0;
   let hello;
+  let ended = null; // the message of the control plane that failed or exited
+  const gone = () => new Error(ended.type === "failed" ? ended.error : `the control plane exited${ended.why ? `: ${ended.why}` : ""}`);
   const greeted = new Promise((resolve, reject) => {
     hello = resolve;
     worker.onerror = (e) => reject(new Error(`the shared worker failed: ${e.message || "no details"}`));
@@ -26,10 +28,17 @@ export async function connectCluster(url, tries = 0) {
     switch (data.type) {
       case "hello": hello(data); break;
       case "status": case "failed": case "exited": case "mesh":
+        if (data.type === "failed" || data.type === "exited") {
+          // The worker closes in a moment: nothing answers a call anymore.
+          ended = data;
+          for (const call of calls.values()) call.reject(gone());
+          calls.clear();
+        }
         listeners[data.type].forEach((fn) => fn(data));
         break;
       case "rpc": {
         const call = calls.get(data.seq);
+        if (!call) break;
         calls.delete(data.seq);
         data.error ? call.reject(new Error(data.error)) : call.resolve(data.result);
         break;
@@ -83,8 +92,11 @@ export async function connectCluster(url, tries = 0) {
         port.postMessage({ type: "chunk", error: String(e?.message || e) });
       }
     },
+    // ended: the last lines of the logs of a control plane that is gone.
+    get ended() { return ended; },
     rpc(method, ...args) {
       return new Promise((resolve, reject) => {
+        if (ended) { reject(gone()); return; }
         calls.set(++seq, { resolve, reject });
         port.postMessage({ type: "rpc", seq, method, args });
       });

@@ -31,18 +31,22 @@ browser tab (single wasm binary)                     docker run tabernetes
 - The browser has no file system. `web/src/fs.js` is an in-memory file
   system with the Node.js callback API that Go's `syscall/js` expects.
 - The cluster survives a reload (`k8s/tabernetes/state.go`,
-  `web/src/state.js`). Every few seconds, when something changed, the control
-  plane saves a snapshot of the shim (the newest revision of every key and the
+  `web/src/state.js`). Once the boot is complete, and then every second in
+  which something other than a heartbeat lease changed, the control plane
+  saves a snapshot of the shim (the newest revision of every key and the
   leases, `etcdshim/snapshot.go`) together with the PKI, the tokens and the
   kubeconfigs to IndexedDB. The next boot starts from it: the store is
   compacted at the saved revision, so the informers list again, and every
   lease gets its full TTL. The nodes of the last visit are gone with their
   tabs, so the control plane deletes them with their pods before the
   controllers start; Deployments and DaemonSets start their pods again on the
-  new nodes. A snapshot of another Kubernetes minor version is ignored, and a
-  snapshot that does not boot is deleted. The files below `/root` of the
-  terminal (not `~/.kube`) go to IndexedDB, too, one record per file, a moment
-  after each change. `forget` deletes the cluster, the files and the images.
+  new nodes. The addons are applied again only when the build brings other
+  ones. A snapshot of another Kubernetes minor version or a broken one is
+  ignored, and a snapshot that does not boot is deleted. The files below
+  `/root` of the terminal (not `~/.kube`) go to IndexedDB, too, one record per
+  file, a moment after each change. `forget` deletes the cluster, the files,
+  the images and the models of `llm`. The layers of a pod that still runs
+  stay until the pod is gone, the next visit deletes them.
 - The terminal runs a real POSIX shell: [mvdan.cc/sh](https://github.com/mvdan/sh),
   a shell interpreter in Go, compiled into the same binary. Pipes, variables,
   loops, `$(...)`, redirects and here-documents work. There are no processes,
@@ -90,8 +94,9 @@ browser tab (single wasm binary)                     docker run tabernetes
   transfer a stream), and the worker compiles a second instance of the binary
   for the control plane. When the control plane fails or exits, the worker
   ends, so a reload boots a new one even while other tabs are open. `logs`
-  reads the log of the worker. Each tab runs the binary for its shell,
-  kubectl and kubelet, and every connection between a tab and the worker is a
+  reads the log of the worker, and its last lines once it has ended. Each tab
+  runs the binary for its shell, kubectl and kubelet, and every connection
+  between a tab and the worker is a
   MessagePort of its own. A tab holds a Web Lock while it is open; the worker
   waits for that lock, so it learns when a tab closes, deletes its node and
   renews the node leases in between (timers of a hidden tab may fire only once

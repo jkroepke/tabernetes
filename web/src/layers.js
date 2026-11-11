@@ -11,6 +11,8 @@
 // OPFS: tabernetes/layers/<digest>.tar and <digest>.json. The index is
 // written last: a layer without one was not unpacked to the end.
 // <digest>.used is touched whenever a pod starts with the layer.
+// <digest>.forgotten marks a layer that forget could not delete, because a
+// pod still ran with it (state.js).
 //
 // Image garbage collection works like the one of the kubelet: when the
 // layers take more than 85 % of the image file system (IMAGE_FS, or half of
@@ -22,6 +24,7 @@ const IMAGE_FS = 4 << 30;
 const HIGH = 0.85, LOW = 0.8, MIN_AGE = 2 * 60 * 1000;
 
 import { Decompress } from "fzstd";
+import { useLock, unpackLock, removeLayer } from "./state.js";
 
 const dec = new TextDecoder();
 const VERSION = 1; // of the index
@@ -130,7 +133,8 @@ export class TarIndex {
     // links and directories have no data, whatever the size field says
     this.skip = "0\x007".includes(type) || !"125634".includes(type) ? Math.ceil(size / 512) * 512 : 0;
     let name = str(h, 0, 100);
-    if (str(h, 257, 6).startsWith("ustar")) {
+    // POSIX only: GNU tar ("ustar  ") keeps other fields in that place
+    if (str(h, 257, 6) === "ustar") {
       const prefix = str(h, 345, 155);
       if (prefix) name = prefix + "/" + name;
     }
@@ -172,9 +176,6 @@ async function unpack(blob, mediaType, write) {
 }
 
 const fileName = (digest) => digest.replace(":", "-");
-const digestOf = (name) => name.replace("-", ":");
-const useLock = (digest) => `tabernetes-image-${digest}`;
-const unpackLock = (digest) => `tabernetes-layer-${digest}`;
 
 // openStore returns the image store: in OPFS if the browser has it, else in
 // memory.
@@ -261,15 +262,20 @@ class OPFSStore {
     // one tab at a time
     return navigator.locks.request("tabernetes-image-gc", { ifAvailable: true }, async (lock) => {
       if (!lock) return 0;
-      const layers = new Map(); // file name -> {size, used}
-      const get = (n) => layers.get(n) || layers.set(n, { size: 0, used: 0 }).get(n);
+      const layers = new Map(); // file name -> {size, used, forgotten}
+      const get = (n) => layers.get(n) || layers.set(n, { size: 0, used: 0, forgotten: false }).get(n);
       for await (const [name, h] of this.dir.entries()) {
-        const m = name.match(/^(.+)\.(tar|json|used)$/);
+        const m = name.match(/^(.+)\.(tar|json|used|forgotten)$/);
         if (!m || h.kind !== "file") continue;
         const f = await h.getFile();
         const l = get(m[1]);
         if (m[2] === "tar") l.size = f.size;
-        l.used = Math.max(l.used, f.lastModified);
+        if (m[2] === "forgotten") l.forgotten = true;
+        else l.used = Math.max(l.used, f.lastModified);
+      }
+      // forget left these to the pods that ran with them
+      for (const [name, l] of layers) {
+        if (l.forgotten && await removeLayer(this.dir, name)) layers.delete(name);
       }
       let total = 0;
       for (const l of layers.values()) total += l.size;
@@ -286,14 +292,8 @@ class OPFSStore {
       for (const [name, l] of [...layers].sort((a, b) => a[1].used - b[1].used)) {
         if (freed >= goal) break;
         if (now - l.used < MIN_AGE) continue;
-        const digest = digestOf(name);
         // not while a pod runs with it, and not while a pull unpacks it
-        await navigator.locks.request(useLock(digest), { ifAvailable: true }, (free) => free &&
-          navigator.locks.request(unpackLock(digest), { ifAvailable: true }, async (unpacking) => {
-            if (!unpacking) return;
-            for (const ext of ["json", "tar", "used"]) await this.dir.removeEntry(`${name}.${ext}`).catch(() => {});
-            freed += l.size;
-          }));
+        if (await removeLayer(this.dir, name)) freed += l.size;
       }
       if (freed < goal) console.warn(`tabernetes: image garbage collection freed ${freed} bytes, wanted ${goal}: the other layers are in use`);
       return freed;

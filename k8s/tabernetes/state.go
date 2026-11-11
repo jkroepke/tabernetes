@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -12,6 +13,8 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/component-base/version"
+
+	"k8s.io/kubernetes/cmd/tabernetes/etcdshim"
 )
 
 // The cluster survives a reload: the page keeps it in the IndexedDB of the
@@ -31,6 +34,9 @@ type savedState struct {
 	Version string
 	Files   map[string][]byte // name in dataDir -> content
 	Etcd    []byte
+	// Addons names the addons it got (addonsHash). A build with other
+	// addons applies them again.
+	Addons string
 }
 
 // stateAPI is globalThis.tabernetesState: load(): Promise<Uint8Array|null>
@@ -73,14 +79,21 @@ func loadState() *savedState {
 	js.CopyBytesToGo(b, v)
 	var st savedState
 	if err := gob.NewDecoder(bytes.NewReader(b)).Decode(&st); err != nil {
-		fmt.Fprintln(os.Stderr, "tabernetes: the saved cluster is broken, starting a new one:", err)
+		fmt.Fprintln(os.Stderr, "tabernetes: the saved cluster:", err)
+		status("the saved cluster is broken, starting a new one")
 		return nil
 	}
 	if minor(st.Version) != minor(version.Get().GitVersion) {
 		status(fmt.Sprintf("the saved cluster is from Kubernetes %s, starting a new one", st.Version))
 		return nil
 	}
-	if st.Files["ca.crt"] == nil || st.Files["tokens.csv"] == nil || st.Etcd == nil {
+	err = etcdshim.Check(st.Etcd)
+	if st.Files["ca.crt"] == nil || st.Files["tokens.csv"] == nil || st.Files["admin.kubeconfig"] == nil {
+		err = errors.New("files are missing")
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "tabernetes: the saved cluster:", err)
+		status("the saved cluster is broken, starting a new one")
 		return nil
 	}
 	return &st
@@ -126,10 +139,10 @@ func stateSaver(files map[string][]byte) func([]byte) {
 	if api.IsUndefined() {
 		return nil
 	}
-	ver := version.Get().GitVersion
+	ver, addons := version.Get().GitVersion, addonsHash()
 	return func(etcd []byte) {
 		var buf bytes.Buffer
-		if err := gob.NewEncoder(&buf).Encode(savedState{Version: ver, Files: files, Etcd: etcd}); err != nil {
+		if err := gob.NewEncoder(&buf).Encode(savedState{Version: ver, Files: files, Etcd: etcd, Addons: addons}); err != nil {
 			fmt.Fprintln(os.Stderr, "tabernetes: saving the cluster:", err)
 			return
 		}
