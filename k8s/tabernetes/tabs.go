@@ -207,12 +207,14 @@ func follow(cfg js.Value) (*cluster, error) {
 	}
 	current = c
 
-	registerTab()
+	go registerTab()
 	return c, nil
 }
 
 // registerTab makes this tab a node. A tab without WebGPU is a node too,
 // without tabernetes.dev/webgpu; a failure costs the tab only its node.
+// It runs in the background: the shell and kubectl do not need the node,
+// and on a new cluster the node waits seconds for its pod CIDR.
 func registerTab() {
 	status("registering this tab as the node " + tabNodeName)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)

@@ -1,5 +1,6 @@
-// Shared by the page (terminal.js) and the shared worker (cluster.js): the
-// binary is a row of zstd frames, and it compiles while it arrives.
+// The page (terminal.js) unpacks the binary, a row of zstd frames, and
+// compiles it while it arrives. The shared worker (cluster.js) gets the
+// unpacked bytes from the page and compiles them the same way.
 
 // zstdFrames yields each zstd frame of the stream once all of it is there.
 export async function* zstdFrames(stream, size) {

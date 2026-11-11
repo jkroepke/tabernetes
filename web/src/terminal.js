@@ -110,16 +110,9 @@ export async function startTerminal(el, opts) {
     });
   }
   const dl = await download(opts.wasmURL);
-  let { body } = dl;
-  const { cached } = dl;
+  const { body, cached } = dl;
   // The page knows the exact size of the file (data-size), the header only maybe.
   const total = opts.wasmSize || dl.total;
-  if (cluster?.needBinary) {
-    // The first tab: the worker compiles the same download for the control plane.
-    const [mine, theirs] = body.tee();
-    body = mine;
-    cluster.sendBinary(theirs, total);
-  }
   let loaded = 0;
   // The line must fit into one row: once it wraps, \r only returns to the
   // start of the last row and every update adds a new line.
@@ -142,7 +135,16 @@ export async function startTerminal(el, opts) {
   }));
   const go = new globalThis.Go();
   go.env = { HOME: "/root", USER: "root", PATH: "/usr/bin" };
-  const instance = await instantiate(unpack(opts.wasmURL, counted, total, opts.workerURL), go.importObject);
+  let unpacked = unpack(opts.wasmURL, counted, total, opts.workerURL);
+  if (cluster?.needBinary) {
+    // The first tab: the worker compiles the same binary for the control
+    // plane. It gets the unpacked bytes: a shared worker cannot start
+    // workers, so it would unpack the frames one after the other (~1.5 s).
+    const [mine, theirs] = unpacked.tee();
+    unpacked = mine;
+    cluster.sendBinary(theirs);
+  }
+  const instance = await instantiate(unpacked, go.importObject);
   term.writeln("");
   globalThis.tabernetesStatus(cached ? "compiled WebAssembly from the browser cache" : "downloaded and compiled WebAssembly");
   // The "free" command reads the size of the linear memory from here.

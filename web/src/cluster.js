@@ -6,8 +6,7 @@
 import "./wasm_exec.js";
 import { installFS } from "./fs.js";
 import { clusterState, forget } from "./state.js";
-import { zstdFrames, instantiate } from "./wasm.js";
-import { decompress } from "fzstd";
+import { instantiate } from "./wasm.js";
 
 const tabs = new Map(); // tab id -> MessagePort
 // The docker nodes from join: every tab connects to each of them over WebRTC
@@ -52,21 +51,14 @@ const saved = clusterState();
 globalThis.tabernetesState = saved;
 
 // boot compiles the binary while the tab sends it, then starts the control plane.
-async function boot(stream, size) {
+async function boot(stream) {
   state = "booting";
   try {
     const go = new globalThis.Go();
     go.env = { HOME: "/root", USER: "root", PATH: "/usr/bin" };
-    // No workers in a shared worker: the frames unpack one after the other.
-    const unpacked = new ReadableStream({
-      async start(ctl) {
-        try {
-          for await (const frame of zstdFrames(stream, size)) ctl.enqueue(decompress(frame));
-          ctl.close();
-        } catch (e) { ctl.error(e); }
-      },
-    });
-    const instance = await instantiate(unpacked, go.importObject);
+    // The tab sends the binary unpacked: a shared worker cannot start
+    // workers, so it would unpack the zstd frames one after the other.
+    const instance = await instantiate(stream, go.importObject);
     globalThis.tabernetesMemory = instance.exports.mem;
     started = true;
     go.run(instance).then(() => exited(""), (e) => exited(e?.message ?? String(e)));
@@ -235,11 +227,11 @@ self.onconnect = (e) => {
         break;
       }
       case "binary": {
-        // The tab sends the download as it arrives (compressed, about 30 MB),
-        // in one message per chunk: not every browser can transfer a
+        // The tab sends the binary as it unpacks it (about 290 MB), in one
+        // message per chunk: not every browser can transfer a
         // ReadableStream (Safari).
         if (id !== binary || state !== "new") break;
-        boot(new ReadableStream({ start(ctl) { feed = ctl; } }), data.size);
+        boot(new ReadableStream({ start(ctl) { feed = ctl; } }));
         break;
       }
       case "chunk": {
