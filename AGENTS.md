@@ -81,9 +81,22 @@ that name.
   last release 2019). Kernel: Linux 6.8 i386 `tinyconfig` + `vm/kernel.config`
   with `CONFIG_HIGHMEM4G` (pods up to 2 GiB; v86 caps guest RAM at
   2 GiB - 128 KiB; without highmem the guest used only ~896 MiB).
-- **Saved VM states** (`web/src/vmstate.js`, `vm/init/stage0.go`): init
-  waits in an initramfs for the pod; the first VM per memory size saves its
-  state there, later pods restore it (~0.6 s less per start). After a restore,
+- **PID 1 of the VM is C** (`vm/init/init.c`, static, musl, built in an
+  i386 Alpine in `vm/Dockerfile`). It was Go until 2026-11-11. Measured
+  with the same pod: 77 KB instead of 3.1 MB, 0.2 MiB RSS and 1 thread
+  instead of 3.7 MiB and 5, a saved VM state of 17.9 instead of 23.7 MB, and
+  the pod starts ~80 ms sooner in the browser. Idle CPU did not change on
+  the tickless kernel (Go's sysmon sleeps when nothing runs). Keep it one
+  poll loop without threads, and keep the exec protocol of
+  `k8s/tabernetes/v86exec.go`. `vm/test` runs init on the host
+  (`TABERNETES_INIT_TEST`, no mounts, Linux only) and checks exec, attach,
+  stdin acks, ttys and exit codes. Sandboxes may block the Alpine CDN: for a
+  local build, `pip install ziglang` and
+  `python -m ziglang cc -target x86-linux-musl -static -Os`.
+- **Saved VM states** (`web/src/vmstate.js`, stage 0 in
+  `vm/init/init.c`): init waits in an initramfs for the pod; the first VM
+  per memory size saves its state there, later pods restore it (~0.6 s less
+  per start). After a restore,
   init must set the clock and reseed the RNG (else all pods share the random
   numbers), and v86 needs `preserve_mac_from_state_image` (else the network
   adapter has the wrong MAC and port-forward hangs). `fastUnpack` replaces

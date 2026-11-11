@@ -169,17 +169,18 @@ browser tab (single wasm binary)                     docker run tabernetes
   `vm/kernel.config` (serial console, virtio-net, virtio-9p, highmem, so that
   it uses more than 896 MiB), built with clang
   in `vm/Dockerfile` (`mise run vm`, needs Docker). PID 1
-  (`vm/init`) does what runc does: it mounts `/proc`, `/sys` and `/dev`,
-  writes `/etc/hosts` and `/etc/resolv.conf`, sets the hostname and starts
-  the entrypoint with the environment, working directory and user of the
-  image and the pod. The first serial port is the log of the container; the
-  second one tells the kubelet `started`, `exit <code>`, or why the
-  entrypoint did not start (`StartError`, exit code 128). The exit code goes
-  through the restart policy (`Completed`, `Error`, `CrashLoopBackOff`).
+  (`vm/init/init.c`, a static C program with musl) does what runc does: it
+  mounts `/proc`, `/sys` and `/dev`, writes `/etc/hosts` and
+  `/etc/resolv.conf`, sets the hostname and starts the entrypoint with the
+  environment, working directory and user of the image and the pod. The first
+  serial port is the log of the container; the second one tells the kubelet
+  `started`, `exit <code>`, or why the entrypoint did not start (`StartError`,
+  exit code 128). The exit code goes through the restart policy (`Completed`,
+  `Error`, `CrashLoopBackOff`).
   `kubectl port-forward` reaches the pod through the virtio network card of
   the VM. So does the kubelet for `kubectl exec` and `attach`: init listens
   on port 60250 and starts the command in the container, with a pty for
-  `-t` (`vm/init/exec.go`, `k8s/tabernetes/v86exec.go`). With `stdin` and
+  `-t` (`vm/init/init.c`, `k8s/tabernetes/v86exec.go`). With `stdin` and
   `tty` in the pod (`kubectl run -it`), the entrypoint gets a pty, too, and
   `kubectl attach` connects to it.
   The VM boots while the image is pulled. init starts in an initramfs and
@@ -187,7 +188,7 @@ browser tab (single wasm binary)                     docker run tabernetes
   at that point (`web/src/vmstate.js`, OPFS), and later pods restore it
   instead of booting the kernel. init then sets the clock, seeds the random
   number generator, mounts the 9p root and sets up eth0
-  (`vm/init/stage0.go`). With the image present, the container of
+  (stage 0 in `vm/init/init.c`). With the image present, the container of
   nginx:alpine starts about 0.5 s after the kubelet asks for it.
 - The terminal has no tty device, but kubectl gets one: the js variant of
   `github.com/moby/term` (`k8s/_overlay/`) reports the terminal of the page
@@ -239,7 +240,7 @@ container images needs Docker.
 
 ```bash
 mise run build       # everything into dist/
-mise run test        # etcd shim tests, shell tests, go vet of the agent and the VM init
+mise run test        # etcd shim tests, shell tests, VM init tests, go vet of the agent
 mise run dist        # dist/ packed into .build/tabernetes.tar.gz, the asset of a release
 mise run node-image  # ghcr.io/jkroepke/tabernetes:latest for the local platform
 ```

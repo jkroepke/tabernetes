@@ -4,7 +4,7 @@
 #   docker build --output type=local,dest=out vm
 #
 # writes bzImage, init and seabios.bin to out/ (mise run vm).
-ARG GO_IMAGE=mirror.gcr.io/library/golang:1.27-trixie
+ARG ALPINE_IMAGE=mirror.gcr.io/library/alpine:3.24
 ARG KERNEL_IMAGE=mirror.gcr.io/library/ubuntu:24.04
 
 # Linux 6.8 from Ubuntu 24.04 (linux-source), for i386, cross-compiled with
@@ -29,12 +29,12 @@ RUN set -eux; \
     mkdir /out; \
     cp arch/x86/boot/bzImage /out/
 
-# PID 1 of the VM, a static binary for linux/386.
-FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS init
-WORKDIR /src
-COPY go.mod ./
-COPY init/ init/
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=386 go build -trimpath -ldflags="-s -w" -o /out/init ./init
+# PID 1 of the VM, a static binary for linux/386 with musl. Built in an
+# i386 Alpine: x86_64 hosts run it natively, others through emulation.
+FROM --platform=linux/386 ${ALPINE_IMAGE} AS init
+RUN apk add --no-cache gcc musl-dev
+COPY init/init.c /src/init.c
+RUN mkdir /out && gcc -static -Os -s -Wall -Wextra -Werror -o /out/init /src/init.c
 
 # The BIOS that comes with v86, from the commit of the npm release in
 # web/package.json (0.5.473+g315b2b0).

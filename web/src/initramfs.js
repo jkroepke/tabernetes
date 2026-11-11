@@ -1,6 +1,6 @@
 // initramfs builds the initramfs of a pod VM: an uncompressed cpio archive
 // (newc) with the init of the pod (vm/init) as /init. The kernel starts it
-// first; it waits there for the pod (vm/init/stage0.go).
+// first; it waits there for the pod (vm/init/init.c).
 
 const enc = new TextEncoder();
 

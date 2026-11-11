@@ -69,7 +69,7 @@ jobs:
 
       - name: VM tests
         if: steps.cache-wasm.outputs.cache-hit == 'true'
-        run: go -C vm test -race ./init
+        run: node --test vm/test/*.test.mjs
 
       - name: Pack
         run: mise run dist

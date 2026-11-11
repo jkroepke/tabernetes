@@ -1,7 +1,7 @@
 // vmstate keeps the saved states of booted pod VMs (vmworker.js) in the
 // origin private file system: tabernetes/vm/<build>-<memory in MiB>.state.
 // A pod boots the kernel only when there is no state for its memory size
-// yet; it saves one when init waits for the pod (vm/init/stage0.go). Every
+// yet; it saves one when init waits for the pod (vm/init/init.c). Every
 // later pod with that memory size restores the state instead, in every tab.
 //
 // build is a hash of v86, the kernel and init: a new release makes new
