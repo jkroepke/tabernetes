@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Guidance for coding agents (and humans) that work on Tabernetes. The
-[README](README.md) explains what Tabernetes is and how it works; this file
+[Readme](README.md) explains what Tabernetes is and how it works; this file
 holds the decisions, constraints and gotchas behind it that are not obvious
 from the code. Read both before you change something.
 
@@ -76,12 +76,12 @@ that name.
   control plane itself.
 - **The kubelet of a tab is like a Virtual Kubelet**: a node for the control
   plane, but no container runtime. Limit of 8 pods per tab (kept on purpose).
-- **Real images in a tab run in v86** (32-bit x86 JIT to wasm, npm `v86`),
+- **Real images in a tab run in v86** (32-bit x86 JIT to Wasm, npm `v86`),
   one worker per pod, `linux/386` image variants. Chosen over TinyEMU (no JIT,
   last release 2019). Kernel: Linux 6.8 i386 `tinyconfig` + `vm/kernel.config`
   with `CONFIG_HIGHMEM4G` (pods up to 2 GiB; v86 caps guest RAM at
   2 GiB - 128 KiB; without highmem the guest used only ~896 MiB).
-- **Node join over WebRTC** with copy-paste signaling and STUN, one UDP mux per
+- **Node join over WebRTC** with copy and paste signaling and STUN, one UDP mux per
   node. The node runs without `--privileged`: the agent re-execs into
   user/mount/net/cgroup namespaces, pasta (built from passt.top at the fixed
   commit `6aa4f88`, no Renovate on purpose) for the network,
@@ -110,9 +110,9 @@ that name.
   option for the binary either.
 - The blog's CSP adds `'wasm-unsafe-eval'` only on pages with the shortcode.
 
-## Runtime gotchas (Go js/wasm and browsers)
+## Runtime gotchas (Go `js/wasm` and browsers)
 
-- No preemption in wasm: busy loops starve everything (APF ensurer needed a
+- No preemption in Wasm: busy loops starve everything (APF ensurer needed a
   sleep); calling JS from a goroutine during apiserver boot is delayed by
   seconds, so invoke synchronously.
 - `runtime.MemProfileRate = 0` and `debug.SetMemoryLimit(3 GiB)` are required:
@@ -128,8 +128,8 @@ that name.
   worker.
 - Wasm tests need `env -i` (else "command line and environment variables
   exceeds limit").
-- Pod proxy through the apiserver (`/proxy/`) fails in wasm; port-forward
-  works. SPDY dialer gives EOF in wasm, use the websocket dialer.
+- Pod proxy through the apiserver (`/proxy/`) fails in Wasm; port-forward
+  works. SPDY dialer gives EOF in Wasm, use the websocket dialer.
 - Lock pitfalls in the OPFS layer store: never delete only the `.json` index
   of a used layer (a re-unpack truncates the tar a pod reads), never queue an
   exclusive Web Lock request on a layer (it blocks new shared requests), use
@@ -155,7 +155,7 @@ that name.
 
 ## Testing without the maintainer's hosts
 
-- Build the wasm without mise: export `KUBERNETES_VERSION` and
+- Build the Wasm binary without mise: export `KUBERNETES_VERSION` and
   `MVDAN_SH_VERSION` from `mise.toml`, `go -C k8s run . $PWD/.build/kubernetes`,
   then `k8s/build.sh .build/kubernetes .build/tabernetes.wasm` (~4 min).
 - Browser tests: serve `dist/` with a small static server plus a Docker Hub
@@ -182,10 +182,10 @@ that name.
   SharedWorker.
 - **64-bit images (x86_64, arm64) via QEMU-wasm** (ktock/qemu-wasm, Wasm TCG
   backend, needs SharedArrayBuffer via coi-serviceworker): a POC worked
-  (x86_64 nginx:alpine HTTP-ready ~28 s, arm64 ~14 s, v86 i386 3-4 s; wasm
+  (x86_64 nginx:alpine HTTP-ready ~28 s, arm64 ~14 s, v86 i386 3-4 s; Wasm
   ~3.4-4.7 MB gzip; ~2.2 GiB RSS per pod). SeaBIOS needs `qboot.rom`, x86 needs
   `no_timer_check`, the pty poll must not block. Revisit when the Wasm TCG
   backend lands upstream, then pick the emulator per image architecture
   (386 -> v86, else QEMU). riscv64 via TinyEMU was rejected (no JIT).
 - Of 37 popular Docker Hub images, 19 have `linux/386`, 24 `riscv64`, 12
-  neither (node, mysql, mariadb, mongo, rabbitmq, grafana, ...).
+  neither (node, MySQL, mariadb, mongo, rabbitmq, grafana, ...).

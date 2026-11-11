@@ -1,3 +1,5 @@
+<!-- markdownlint-disable-file MD041 -->
+
 #### What this PR does / why we need it
 
 #### Which issue this PR fixes
