@@ -289,11 +289,13 @@ class OPFSStore {
         return new Promise(() => {}); // until the worker ends
       }));
     }
-    try {
+    // The time of use only orders the garbage collection. Writing it takes
+    // ~25 ms per layer (createWritable), so the pull does not wait for it.
+    (async () => {
       const w = await (await this.dir.getFileHandle(fileName(digest) + ".used", { create: true })).createWritable();
       await w.write(String(Date.now()));
       await w.close();
-    } catch { /* another pod touches it right now */ }
+    })().catch(() => { /* another pod touches it right now */ });
   }
 
   // gc removes the least recently used layers that no pod uses, once they
