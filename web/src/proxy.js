@@ -26,6 +26,7 @@ export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/ta
   // used it says goodbye, and the worker unregisters when the last one is
   // gone. Tabs it still controls keep it until they close.
   let last = null;
+  let host = null;
   addEventListener("pagehide", () => {
     last?.postMessage({ type: "tabernetes-bye" });
     last = null;
@@ -39,10 +40,25 @@ export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/ta
     }
     return (last = reg.active);
   }
-  // hello tells the worker that this tab answers for ports.
-  const hello = async (ports) => (await activeWorker()).postMessage({ type: "tabernetes-host", ports });
+  // The browser's client ID stays valid when the service worker restarts.
+  async function hello() {
+    const worker = await activeWorker();
+    host = await new Promise((resolve, reject) => {
+      const { port1, port2 } = new MessageChannel();
+      const timer = setTimeout(() => {
+        port1.close();
+        reject(new Error("the proxy worker does not answer"));
+      }, 10000);
+      port1.onmessage = ({ data }) => {
+        clearTimeout(timer);
+        port1.close();
+        resolve(data.id);
+      };
+      worker.postMessage({ type: "tabernetes-host" }, [port2]);
+    });
+  }
 
-  const urlOf = (port) => new URL(`${scope}${port}/`, location.href).href;
+  const urlOf = (port) => new URL(`${scope}${encodeURIComponent(host)}/${port}/`, location.href).href;
 
   // openTab opens localhost:<port> in a new tab. window.open needs the click
   // or key press that started it: open the tab first, the worker is ready
@@ -50,7 +66,7 @@ export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/ta
   async function openTab(port) {
     const tab = window.open("about:blank", "_blank");
     try {
-      await hello([port]);
+      await hello();
     } catch (err) {
       tab?.close();
       throw err;
@@ -61,8 +77,14 @@ export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/ta
 
   // The status line links every port of "kubectl port-forward" while it
   // listens. Go calls this when the list changes (tabernetes/forwards.go).
-  globalThis.tabernetesForwards = (list) => {
+  let render = 0;
+  globalThis.tabernetesForwards = async (list) => {
     if (!status) return;
+    const current = ++render;
+    if (list.length && sw) {
+      try { await hello(); } catch (err) { console.error("tabernetes proxy:", err); return; }
+    }
+    if (current !== render) return;
     status.replaceChildren(...list.map(({ port, target }) => {
       const label = `\u21C4 localhost:${port} \u2192 ${target}`;
       if (!sw) {
@@ -83,9 +105,6 @@ export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/ta
       });
       return a;
     }));
-    // A middle click opens the link without the click handler: have the
-    // worker ready for it.
-    if (list.length && sw) hello(list.map((f) => f.port)).catch(() => {});
   };
 
   return {
@@ -102,7 +121,6 @@ export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/ta
         term.writeln("proxy: this browser offers no service workers here (private mode?)");
         return 1;
       }
-      const url = urlOf(port);
       let tab;
       try {
         tab = await openTab(port);
@@ -110,6 +128,7 @@ export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/ta
         term.writeln(`proxy: ${err.message}`);
         return 1;
       }
+      const url = urlOf(port);
       term.writeln(`${tab ? "Opened" : "Open"} ${url}`);
       term.writeln(DIM(`It shows localhost:${port} of this tab and works while this tab is open.`));
       return 0;

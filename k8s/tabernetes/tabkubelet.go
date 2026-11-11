@@ -30,15 +30,15 @@ const (
 	streamCreationTimeout = 30 * time.Second
 )
 
-func (n *tabNode) serveKubelet() error {
+func (n *tabNode) serveKubelet() (func(), error) {
 	n.ca.issue("tab-kubelet", tabNodeName, nil, true, []string{tabNodeName}, []net.IP{net.ParseIP(tabNodeIP)})
 	cert, err := tls.LoadX509KeyPair(p("tab-kubelet.crt"), p("tab-kubelet.key"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	l, err := net.Listen("tcp", tabNodeIP+":10250")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
@@ -51,7 +51,10 @@ func (n *tabNode) serveKubelet() error {
 	mux.HandleFunc("/attach/{ns}/{pod}/{uid}/{container}", n.serveAttach)
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go srv.Serve(tls.NewListener(l, &tls.Config{Certificates: []tls.Certificate{cert}}))
-	return nil
+	return func() {
+		srv.Close()
+		l.Close()
+	}, nil
 }
 
 // pod finds the pod of a request, also by UID if the request names one.
@@ -79,10 +82,11 @@ func (n *tabNode) serveLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	follow, timestamps := q.Get("follow") == "true", q.Get("timestamps") == "true"
-	lines, next, more := tp.logs.since(0)
 	tp.mu.Lock()
+	logs := tp.logs
 	waiting := tp.status.State.Waiting
 	tp.mu.Unlock()
+	lines, next, more := logs.since(0)
 	if waiting != nil && next == 0 {
 		// as the kubelet says it while the image is pulled
 		http.Error(w, fmt.Sprintf("container %q in pod %q is waiting to start: %s", tp.container.Name, tp.name, waiting.Reason), http.StatusBadRequest)
@@ -117,19 +121,24 @@ func (n *tabNode) serveLogs(w http.ResponseWriter, r *http.Request) {
 			if timestamps {
 				bw.WriteString(l.t.UTC().Format(time.RFC3339Nano) + " ")
 			}
-			bw.WriteString(l.text + "\n")
+			bw.WriteString(l.text)
+			if !l.partial {
+				bw.WriteByte('\n')
+			}
 		}
 		if !flush() || !follow {
 			return
 		}
 		select {
+		case <-logs.done:
+			follow = false
 		case <-more:
 		case <-tp.ctx.Done():
 			return
 		case <-r.Context().Done():
 			return
 		}
-		lines, next, more = tp.logs.since(next)
+		lines, next, more = logs.since(next)
 	}
 }
 

@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -19,23 +18,6 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
-)
-
-const execPort = 60250
-
-// frames to the VM
-const (
-	inData   = 0
-	inClose  = 1 // stdin is closed
-	inResize = 2 // rows and cols, uint16 each
-)
-
-// frames from the VM
-const (
-	outStdout = 1
-	outStderr = 2
-	outExit   = 3 // exit code, int32
-	outError  = 4 // the command did not start
 )
 
 type execRequest struct {
@@ -67,11 +49,14 @@ type process struct {
 
 // proc is one started process with the ends of its stdio that init holds.
 type proc struct {
-	pid   int
-	done  <-chan syscall.WaitStatus
-	stdin io.WriteCloser // nil without stdin
-	pty   *os.File       // the master, with a tty
-	out   []output
+	pid         int
+	done        <-chan syscall.WaitStatus
+	stdin       *os.File // nil without stdin
+	pty         *os.File // the master, with a tty
+	out         []output
+	stdinMu     sync.Mutex
+	inputs      map[*os.File]struct{}
+	stdinClosed bool
 }
 
 type output struct {
@@ -80,8 +65,8 @@ type output struct {
 }
 
 func (p *proc) close() {
-	if p.stdin != nil && p.stdin != io.WriteCloser(p.pty) {
-		p.stdin.Close()
+	if p.stdin != nil && p.stdin != p.pty {
+		p.closeStdin()
 	}
 	for _, o := range p.out {
 		o.r.Close()
@@ -91,12 +76,63 @@ func (p *proc) close() {
 // closeStdin tells the process that stdin ended. A tty has no end of its
 // own, so it gets ^D, as a terminal does.
 func (p *proc) closeStdin() {
-	switch {
-	case p.pty != nil && p.stdin != nil:
-		p.pty.Write([]byte{4})
-	case p.stdin != nil:
-		p.stdin.Close()
+	if p.stdin == nil {
+		return
 	}
+	if p.pty != nil {
+		// A full tty must not hold a disconnected attach open forever.
+		if f, err := duplicateInput(p.stdin); err == nil {
+			defer f.Close()
+			f.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+			f.Write([]byte{4})
+		}
+		return
+	}
+	p.stdinMu.Lock()
+	defer p.stdinMu.Unlock()
+	p.stdinClosed = true
+	p.stdin.Close()
+	for f := range p.inputs {
+		f.Close()
+	}
+}
+
+func (p *proc) input(enabled bool) (*inputStream, error) {
+	s := &inputStream{resize: func(rows, cols uint16) {
+		if p.pty != nil {
+			setSize(p.pty, rows, cols)
+		}
+	}}
+	if !enabled || p.stdin == nil {
+		return s, nil
+	}
+	p.stdinMu.Lock()
+	defer p.stdinMu.Unlock()
+	if p.stdinClosed {
+		return s, nil
+	}
+	f, err := duplicateInput(p.stdin)
+	if err != nil {
+		return nil, err
+	}
+	if p.inputs == nil {
+		p.inputs = make(map[*os.File]struct{})
+	}
+	p.inputs[f] = struct{}{}
+	s.stdin = f
+	s.release = func() {
+		p.stdinMu.Lock()
+		delete(p.inputs, f)
+		p.stdinMu.Unlock()
+	}
+	s.end = func() {
+		if p.pty != nil {
+			f.Write([]byte{4})
+		} else {
+			p.closeStdin()
+		}
+	}
+	return s, nil
 }
 
 // start starts argv in the container: as its user, in its working directory,
@@ -228,11 +264,6 @@ func (c *process) startMain(path string, cfg config, console *os.File) (<-chan s
 	return done, nil
 }
 
-type frame struct {
-	t byte
-	b []byte
-}
-
 type subscriber struct {
 	ch      chan frame
 	dropped bool
@@ -300,13 +331,23 @@ func (c *process) serve(conn net.Conn) {
 		return
 	}
 	if req.Attach {
-		c.attach(req, r, w)
+		c.attach(
+			req,
+			conn,
+			r,
+			w,
+		)
 	} else {
-		c.exec(req, r, w)
+		c.exec(
+			req,
+			conn,
+			r,
+			w,
+		)
 	}
 }
 
-func (c *process) exec(req execRequest, r *bufio.Reader, w *frameWriter) {
+func (c *process) exec(req execRequest, conn net.Conn, r *bufio.Reader, w *frameWriter) {
 	if len(req.Cmd) == 0 {
 		w.write(outError, []byte("exec: no command specified"))
 		return
@@ -328,24 +369,19 @@ func (c *process) exec(req execRequest, r *bufio.Reader, w *frameWriter) {
 			copyFrames(w, o.fd, o.r)
 		}()
 	}
-	gone := make(chan struct{})
-	go func() {
-		defer close(gone)
-		readFrames(r, func(t byte, b []byte) {
-			switch t {
-			case inData:
-				if p.stdin != nil {
-					p.stdin.Write(b)
-				}
-			case inClose:
-				p.closeStdin()
-			case inResize:
-				if p.pty != nil && len(b) == 4 {
-					setSize(p.pty, binary.BigEndian.Uint16(b), binary.BigEndian.Uint16(b[2:]))
-				}
-			}
-		})
-	}()
+	input, err := p.input(req.Stdin)
+	if err != nil {
+		syscall.Kill(-p.pid, syscall.SIGKILL)
+		<-p.done
+		p.close()
+		if p.pty != nil {
+			p.pty.Close()
+		}
+		w.write(outError, []byte(err.Error()))
+		return
+	}
+	gone, stopInput := input.read(conn, r, w)
+	defer stopInput()
 	var ws syscall.WaitStatus
 	select {
 	case ws = <-p.done:
@@ -367,7 +403,7 @@ func (c *process) exec(req execRequest, r *bufio.Reader, w *frameWriter) {
 
 // attach connects to the main process: its output from now on and, if the
 // container has stdin, its input.
-func (c *process) attach(req execRequest, r *bufio.Reader, w *frameWriter) {
+func (c *process) attach(req execRequest, conn net.Conn, r *bufio.Reader, w *frameWriter) {
 	c.attaches.Add(1)
 	defer c.attaches.Done()
 	s, ok := c.subscribe()
@@ -386,24 +422,15 @@ func (c *process) attach(req execRequest, r *bufio.Reader, w *frameWriter) {
 			stdinDone.Do(func() { c.closeOnce.Do(p.closeStdin) })
 		}
 	}
-	gone := make(chan struct{})
-	go func() {
-		defer close(gone)
-		readFrames(r, func(t byte, b []byte) {
-			switch t {
-			case inData:
-				if stdin {
-					p.stdin.Write(b)
-				}
-			case inClose:
-				endStdin()
-			case inResize:
-				if p.pty != nil && len(b) == 4 {
-					setSize(p.pty, binary.BigEndian.Uint16(b), binary.BigEndian.Uint16(b[2:]))
-				}
-			}
-		})
-	}()
+	input, err := p.input(stdin)
+	if err != nil {
+		c.unsubscribe(s)
+		w.write(outError, []byte(err.Error()))
+		return
+	}
+	input.end = endStdin
+	gone, stopInput := input.read(conn, r, w)
+	defer stopInput()
 	for {
 		select {
 		case f, ok := <-s.ch:
@@ -428,53 +455,6 @@ func (c *process) attach(req execRequest, r *bufio.Reader, w *frameWriter) {
 			endStdin()
 			return
 		}
-	}
-}
-
-type frameWriter struct {
-	mu sync.Mutex
-	w  io.Writer
-}
-
-func (f *frameWriter) write(t byte, b []byte) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	buf := make([]byte, 5+len(b))
-	buf[0] = t
-	binary.BigEndian.PutUint32(buf[1:], uint32(len(b)))
-	copy(buf[5:], b)
-	_, err := f.w.Write(buf)
-	return err
-}
-
-func copyFrames(w *frameWriter, t byte, r io.Reader) {
-	buf := make([]byte, 32<<10)
-	for {
-		n, err := r.Read(buf)
-		if n > 0 && w.write(t, buf[:n]) != nil {
-			return
-		}
-		if err != nil {
-			return
-		}
-	}
-}
-
-func readFrames(r *bufio.Reader, fn func(t byte, b []byte)) {
-	var h [5]byte
-	for {
-		if _, err := io.ReadFull(r, h[:]); err != nil {
-			return
-		}
-		n := binary.BigEndian.Uint32(h[1:])
-		if n > 1<<20 {
-			return
-		}
-		b := make([]byte, n)
-		if _, err := io.ReadFull(r, b); err != nil {
-			return
-		}
-		fn(h[0], b)
 	}
 }
 
@@ -505,10 +485,13 @@ func spawn(path string, argv []string, attr *os.ProcAttr) (int, <-chan syscall.W
 	if err != nil {
 		return 0, nil, err
 	}
+	// Release sets p.Pid to -1, so keep the pid first. With -1, a kill of
+	// the process group was kill(1): it hit init, not the command.
+	pid := p.Pid
 	ch := make(chan syscall.WaitStatus, 1)
-	waiters[p.Pid] = ch
+	waiters[pid] = ch
 	p.Release()
-	return p.Pid, ch, nil
+	return pid, ch, nil
 }
 
 func reaper() {

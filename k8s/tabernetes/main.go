@@ -299,7 +299,7 @@ func waitReady(c *cluster, url string, exited <-chan error) error {
 
 // promise wraps fn into a JS Promise.
 func promise(fn func() (any, error)) js.Value {
-	return js.Global().Get("Promise").New(js.FuncOf(func(this js.Value, a []js.Value) any {
+	executor := js.FuncOf(func(this js.Value, a []js.Value) any {
 		resolve, reject := a[0], a[1]
 		go func() {
 			v, err := fn()
@@ -310,7 +310,9 @@ func promise(fn func() (any, error)) js.Value {
 			resolve.Invoke(v)
 		}()
 		return nil
-	}))
+	})
+	defer executor.Release()
+	return js.Global().Get("Promise").New(executor)
 }
 
 func main() {
