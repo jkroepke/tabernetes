@@ -16,8 +16,11 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
 ARG KUBERNETES_VERSION
 ARG CONTAINERD_VERSION=2.4.2
+# renovate: github-releases=opencontainers/runc
 ARG RUNC_VERSION=v1.5.2
+# renovate: github-releases=containernetworking/plugins
 ARG CNI_PLUGINS_VERSION=v1.9.1
+# renovate: github-releases=kubernetes-sigs/cri-tools
 ARG CRICTL_VERSION=v1.37.0
 RUN apt-get update && apt-get install -y --no-install-recommends binutils ca-certificates curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /out
@@ -96,8 +99,8 @@ FROM ${BASE_IMAGE}
 # only while building, not in the image
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates iproute2 iptables mount util-linux \
- && rm -rf /var/lib/apt/lists/*
+  && apt-get install -y --no-install-recommends ca-certificates iproute2 iptables mount util-linux \
+  && rm -rf /var/lib/apt/lists/*
 COPY --from=download /out/ /
 COPY --from=passt /out/ /
 COPY --from=images /out/ /

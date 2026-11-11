@@ -1,0 +1,3 @@
+{
+  "Exclude": ["\\.go$", "\\.md$", "^vm/kernel\\.config$", "^web/package-lock\\.json$", "^LICENSE$"]
+}

@@ -1,0 +1,42 @@
+name: Pull Request
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - labeled
+      - unlabeled
+      - edited
+
+permissions: {}
+
+jobs:
+  # The labels come from the title (.github/labeler.yml) and sort the release
+  # notes (.github/release.yml). Labels added with GITHUB_TOKEN start no new
+  # run, so the check below looks at the title, not at the labels.
+  add-labels:
+    runs-on: ubuntu-latest
+    if: github.repository == github.event.pull_request.head.repo.full_name
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: srvaroa/labeler@bf262763a8a8e191f5847873aecc0f29df84f957 # v1.14.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          config_path: '.github/labeler.yml'
+          fail_on_error: true
+
+  validate-title:
+    name: check title prefix
+    runs-on: ubuntu-latest
+    steps:
+      - name: check
+        if: >-
+          !startsWith(github.event.pull_request.title, 'fix') &&
+          !startsWith(github.event.pull_request.title, 'feat') &&
+          !startsWith(github.event.pull_request.title, 'chore') &&
+          !startsWith(github.event.pull_request.title, 'docs')
+        run: >-
+          echo "PR title must start with feat, fix, chore or docs" && exit 1

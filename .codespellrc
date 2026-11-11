@@ -1,0 +1,3 @@
+[codespell]
+skip = */.gitignores,*/package-lock.json,*/go.mod,*/go.sum,*.log,.git
+ignore-words-list = passt,flate,ans,te

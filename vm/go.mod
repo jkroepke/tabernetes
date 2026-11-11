@@ -1,3 +1,3 @@
-module github.com/jkroepke/blog/tabernetes/vm
+module github.com/jkroepke/tabernetes/vm
 
 go 1.27.3

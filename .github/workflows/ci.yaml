@@ -1,0 +1,253 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-26.04-arm
+    permissions:
+      contents: read
+    env:
+      # A release prints docker run with the node image of its own version.
+      TABERNETES_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup mise
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+
+      # The binary takes minutes to build (Kubernetes checkout, patch, compile),
+      # so it is only rebuilt when something it is built from changed.
+      - name: Cache wasm
+        id: cache-wasm
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            dist/tabernetes.wasm.zst
+            .build/wasm_exec.js
+          key: wasm-${{ hashFiles('mise.toml', 'k8s/**') }}
+
+      # The kernel, init and BIOS for container images on tab nodes. The vm
+      # task rebuilds them (with docker) only when vm/ changed.
+      - name: Cache VM
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist/vm
+          key: vm-${{ hashFiles('vm/**') }}
+
+      - name: Build
+        run: mise run "${TARGET}"
+        env:
+          # on a cache hit only the (cheap) web part is rebuilt
+          TARGET: ${{ steps.cache-wasm.outputs.cache-hit == 'true' && 'web' || 'build' }}
+
+      # Only when the wasm was rebuilt: the cache key covers everything the
+      # tests check (k8s/**, mise.toml).
+      - name: Test
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
+        run: mise run test
+
+      - name: Pack
+        run: mise run dist
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tabernetes
+          path: |
+            .build/tabernetes.tar.gz
+            .build/tabernetes.tar.gz.sha256
+          if-no-files-found: error
+
+  image:
+    name: Node image
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Versions
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          echo "kubernetes=$(sed -n 's/^KUBERNETES_VERSION = "\(.*\)"$/\1/p' mise.toml)" >> "${GITHUB_OUTPUT}"
+          if [ "${REF_TYPE}" = "tag" ]; then
+            echo "tags=ghcr.io/jkroepke/tabernetes:${REF_NAME#v},ghcr.io/jkroepke/tabernetes:latest" >> "${GITHUB_OUTPUT}"
+          else
+            echo "tags=ghcr.io/jkroepke/tabernetes:latest" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to ghcr.io
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: node
+          # the images of the addons are preloaded into the node image
+          build-contexts: |
+            addons=k8s/tabernetes/addons
+          platforms: linux/amd64,linux/arm64
+          # zstd layers are about 20 % smaller than gzip and unpack faster.
+          # Docker 23+, containerd 1.5+ and Podman pull them.
+          outputs: type=image,push=${{ github.ref_type == 'tag' }},compression=zstd,compression-level=19,force-compression=true
+          build-args: |
+            KUBERNETES_VERSION=${{ steps.version.outputs.kubernetes }}
+          # Build provenance and an SBOM as attestations next to the image:
+          # docker buildx imagetools inspect --format '{{ json .SBOM }}' <image>
+          provenance: mode=max
+          sbom: true
+          # Only a release pushes: <version> for the bundle of that release,
+          # latest for local builds.
+          tags: ${{ steps.version.outputs.tags }}
+
+  super-lint:
+    name: super-lint
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Lint Code Base
+        uses: super-linter/super-linter/slim@2da136927bd4a73596db63044b504547c62cb854 # v9.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MULTI_STATUS: false
+          LINTER_RULES_PATH: .
+          GITHUB_ACTIONS_ZIZMOR_CONFIG_FILE: ./.github/zizmor.yml
+          ENABLE_GITHUB_ACTIONS_STEP_SUMMARY: true
+          ENABLE_GITHUB_PULL_REQUEST_SUMMARY_COMMENT: false
+          SAVE_SUPER_LINTER_SUMMARY: true
+          VALIDATE_ALL_CODEBASE: false
+          VALIDATE_BASH: true
+          VALIDATE_BASH_EXEC: true
+          VALIDATE_EDITORCONFIG: true
+          VALIDATE_ENV: true
+          VALIDATE_GITHUB_ACTIONS: true
+          VALIDATE_GITHUB_ACTIONS_ZIZMOR: true
+          VALIDATE_GITLEAKS: true
+          VALIDATE_JSON: true
+          VALIDATE_MARKDOWN: true
+          VALIDATE_NATURAL_LANGUAGE: true
+          VALIDATE_RENOVATE: true
+          VALIDATE_SHELL_SHFMT: true
+          VALIDATE_SPELL_CODESPELL: true
+          VALIDATE_YAML: true
+
+  release:
+    if: github.repository_owner == 'jkroepke' && github.ref_name == 'main'
+    name: Release
+    runs-on: ubuntu-26.04
+    concurrency: create-tag
+    needs:
+      - build
+      - image
+      - super-lint
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+
+      # Creates the next tag from the conventional commits since the last one
+      # (.releaserc.json).
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx -y semantic-release
+
+      # A tag created with GITHUB_TOKEN does not trigger the tag push run of CI,
+      # but a workflow_dispatch does. Dispatch CI on the new tag, so it runs
+      # exactly once without a GitHub App token (same as tag.yaml). The tag run
+      # publishes the release.
+      - name: Dispatch CI on the new tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for tag in $(git tag --points-at HEAD --list 'v*'); do
+            gh workflow run ci.yaml --ref "$tag"
+          done
+
+  publish:
+    name: Publish release
+    if: >-
+      github.repository_owner == 'jkroepke'
+      && github.ref_type == 'tag'
+      && startsWith(github.ref_name, 'v')
+    needs:
+      - build
+      - image
+      - super-lint
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tabernetes
+          path: dist
+
+      - name: Attest bundle
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/tabernetes.tar.gz
+
+      # The notes come from the pull requests since the last release, sorted
+      # by their labels (.github/release.yml).
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "${TAG}" --verify-tag --generate-notes --title "${TAG}" dist/tabernetes.tar.gz dist/tabernetes.tar.gz.sha256
