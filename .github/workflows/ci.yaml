@@ -132,6 +132,10 @@ jobs:
           # docker buildx imagetools inspect --format '{{ json .SBOM }}' <image>
           provenance: mode=max
           sbom: true
+          # Layers in the GitHub Actions cache: runs on main and tags write it,
+          # pull requests read it (and write their own, scoped to the branch).
+          cache-from: type=gha,scope=node-image
+          cache-to: type=gha,mode=max,scope=node-image
           # Only a release pushes: <version> for the bundle of that release,
           # latest for local builds.
           tags: ${{ steps.version.outputs.tags }}
