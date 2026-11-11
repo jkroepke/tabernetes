@@ -1,5 +1,7 @@
 # kubectl apply -f deployment.yaml, then
-# kubectl port-forward deploy/spring-boot 8080:8080 & and wget -qO- localhost:8080
+# kubectl port-forward deploy/spring-boot 8080:8080 &
+# wget -qO- localhost:8080
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:

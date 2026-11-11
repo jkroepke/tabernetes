@@ -20,17 +20,17 @@ COPY pom.xml .
 RUN --mount=type=cache,target=/root/.m2 mvn -B -q dependency:go-offline
 COPY src src
 RUN --mount=type=cache,target=/root/.m2 mvn -B -q package -DskipTests \
- && java -Djarmode=tools -jar target/demo.jar extract --destination /app
+  && java -Djarmode=tools -jar target/demo.jar extract --destination /app
 
 FROM --platform=$BUILDPLATFORM ${UBUNTU_IMAGE} AS jre
 ARG DEBIAN_FRONTEND=noninteractive
 WORKDIR /tmp/deb
 RUN dpkg --add-architecture i386 \
- && apt-get update \
- && apt-get install -y --no-install-recommends binutils openjdk-21-jdk-headless \
- && apt-get download openjdk-21-jdk-headless:i386 openjdk-21-jre-headless:i386 \
- && for d in *.deb; do dpkg -x "$d" /i386; done \
- && rm -rf /var/lib/apt/lists/*
+  && apt-get update \
+  && apt-get install -y --no-install-recommends binutils openjdk-21-jdk-headless \
+  && apt-get download openjdk-21-jdk-headless:i386 openjdk-21-jre-headless:i386 \
+  && for d in *.deb; do dpkg -x "$d" /i386; done \
+  && rm -rf /var/lib/apt/lists/*
 # The modules that jdeps finds for Spring Boot, plus jdk.management (the GC
 # metrics of Micrometer) and jdk.crypto.ec and jdk.zipfs.
 RUN jlink --module-path /i386/usr/lib/jvm/java-21-openjdk-i386/jmods \
@@ -49,7 +49,7 @@ WORKDIR /app
 # for the JDK, a training run that stops after the context refresh for the
 # app.
 RUN java -Xshare:dump >/dev/null \
- && java -XX:TieredStopAtLevel=1 -XX:+UseSerialGC -Dspring.aot.enabled=true \
+  && java -XX:TieredStopAtLevel=1 -XX:+UseSerialGC -Dspring.aot.enabled=true \
       -XX:ArchiveClassesAtExit=/app/demo.jsa -Dspring.context.exit=onRefresh -jar /app/demo.jar
 EXPOSE 8080
 ENTRYPOINT ["java", "-XX:TieredStopAtLevel=1", "-XX:+UseSerialGC", "-XX:SharedArchiveFile=/app/demo.jsa", "-Dspring.aot.enabled=true", "-jar", "/app/demo.jar"]
