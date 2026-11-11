@@ -86,6 +86,14 @@ func run() (int, error) {
 	// programs open /dev/ptmx, the pairs are in the instance of /dev/pts
 	os.Remove("/dev/ptmx")
 	os.Symlink("pts/ptmx", "/dev/ptmx")
+	// What a container runtime puts into /dev: the log files of nginx are
+	// links to /dev/stdout and /dev/stderr. A container that does not run as
+	// root opens the console through them, too.
+	os.Symlink("/proc/self/fd", "/dev/fd")
+	os.Symlink("/proc/self/fd/0", "/dev/stdin")
+	os.Symlink("/proc/self/fd/1", "/dev/stdout")
+	os.Symlink("/proc/self/fd/2", "/dev/stderr")
+	os.Chmod("/dev/console", 0o666)
 	// /dev was mounted after the open above
 	if control == nil {
 		control, _ = os.OpenFile("/dev/ttyS1", os.O_WRONLY, 0)

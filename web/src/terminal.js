@@ -64,8 +64,8 @@ export async function startTerminal(el, opts) {
   });
 
   term.writeln("\x1b[1mTabernetes\x1b[0m: a real Kubernetes control plane, compiled to WebAssembly, running in your browser.");
-  term.writeln(DIM("kube-apiserver, kube-controller-manager, kube-scheduler and kubectl are the unmodified upstream"));
-  term.writeln(DIM("components. etcd is replaced by a tiny in-memory implementation. Nothing leaves your browser."));
+  term.writeln(DIM("kube-apiserver, kube-controller-manager, kube-scheduler and kubectl are the upstream"));
+  term.writeln(DIM("components. etcd is replaced by a tiny in-memory implementation. All of it runs in this browser, not on a server."));
   term.writeln("");
 
   // ---- download + boot ----
@@ -76,15 +76,28 @@ export async function startTerminal(el, opts) {
   // With a shared worker, the control plane runs there and this tab joins it
   // as a node (tabs.js). The worker reports how far it is.
   const cluster = opts.cluster;
+  let ended = false; // the worker said why already
   if (cluster) {
     // Another tab started the control plane: its boot steps are old news.
     if (cluster.state === "ready") globalThis.tabernetesStatus("the control plane runs in a shared worker that another tab started");
     else for (const s of cluster.status) globalThis.tabernetesStatus(s);
     cluster.on("status", ({ text }) => globalThis.tabernetesStatus(text));
-    cluster.on("failed", ({ error }) => term.writeln(`\r\n\x1b[31mthe control plane did not start: ${error}\x1b[0m`));
-    cluster.on("exited", ({ why, crash }) => {
+    // The worker ends after both, so that a reload boots a new control plane
+    // even while other tabs are still open.
+    const again = () => { ended = true; term.writeln(DIM("Reload the page to boot a new cluster.")); };
+    cluster.on("failed", ({ error }) => {
+      term.writeln(`\r\n\x1b[31mthe control plane did not start: ${error}\x1b[0m`);
+      again();
+    });
+    cluster.on("exited", ({ why, crash: trace }) => {
       term.writeln(`\r\n\x1b[31mthe control plane exited${why ? `: ${why}` : ""}\x1b[0m`);
-      if (crash) term.writeln(crash);
+      if (trace) {
+        crash.push(trace);
+        // The first lines name the cause and the crashing goroutine.
+        term.writeln(trace.split("\n").slice(0, 30).join("\n"));
+        term.writeln(DIM("The full trace is in tabernetesCrash in the DevTools console."));
+      }
+      again();
     });
   }
   const dl = await download(opts.wasmURL);
@@ -139,7 +152,7 @@ export async function startTerminal(el, opts) {
     try {
       info = await cluster.rpc("joinTab");
     } catch (e) {
-      term.writeln(`\r\n\x1b[31mthe cluster did not start: ${e.message}\x1b[0m`);
+      if (!ended) term.writeln(`\r\n\x1b[31mthe cluster did not start: ${e.message}\x1b[0m`);
       return { term };
     }
     globalThis.tabernetesRole = "tab";
@@ -218,9 +231,11 @@ export async function startTerminal(el, opts) {
       const from = Math.max(0, history.length - n);
       write(history.slice(from).map((l, i) => `${String(from + i + 1).padStart(5)}  ${l}`).join("\n"));
     },
-    logs(args, { write }) {
+    async logs(args, { write }) {
       const n = Number(args[0]) || 40;
-      write(logs.join("").split("\n").slice(-n - 1).join("\n"));
+      // With a shared worker, the control plane logs there.
+      const all = cluster ? await cluster.rpc("logs", n + 1).catch(() => "") : logs.join("");
+      write(all.split("\n").slice(-n - 1).join("\n"));
     },
     ...(opts.builtins || {}),
   };

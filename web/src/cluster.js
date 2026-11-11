@@ -13,7 +13,8 @@ const tabs = new Map(); // tab id -> MessagePort
 // (web/src/join.js), and the node lives as long as one of these connections.
 const peers = new Map(); // node name -> Set of tab ids with a connected peer
 const statusLines = [];
-let binary = null; // a tab hands over the binary once
+let binary = null; // the tab that hands over the binary, once
+let feed = null; // the controller of the stream its chunks go to, while they arrive
 let state = "new"; // new, booting, ready, failed, exited
 let failure = "";
 let resolveReady, rejectReady;
@@ -26,7 +27,9 @@ globalThis.tabernetesStatus = (text) => {
   statusLines.push(text);
   broadcast({ type: "status", text });
 };
-// The logs of the control plane: the console of this worker (chrome://inspect/#workers).
+// The logs of the control plane: the console of this worker
+// (chrome://inspect/#workers), and "logs" in the terminal of a tab.
+const logs = [];
 const crash = [];
 let crashing = false;
 installFS((fd, s) => {
@@ -35,6 +38,11 @@ installFS((fd, s) => {
     console.error(s);
     if (crash.length < 2000) crash.push(s);
   } else console.debug(s.replace(/\n$/, ""));
+  // Expected in a single-threaded control plane: a controller found its
+  // informer a few versions behind its own write and retries.
+  if (s.includes("is not as new as written version")) return;
+  logs.push(s);
+  if (logs.length > 5000) logs.splice(0, logs.length - 5000);
 });
 
 // boot compiles the binary while the tab sends it, then starts the control plane.
@@ -56,21 +64,30 @@ async function boot(stream, size) {
     globalThis.tabernetesMemory = instance.exports.mem;
     go.run(instance).then(() => exited(""), (e) => exited(e?.message ?? String(e)));
     await globalThis.tabernetes.ready;
+    if (state !== "booting") return; // it exited meanwhile
     state = "ready";
     resolveReady();
   } catch (e) {
-    state = "failed";
-    failure = e.message;
-    broadcast({ type: "failed", error: failure });
-    rejectReady(e);
+    end("failed", e.message);
   }
 }
 
 function exited(why) {
-  state = "exited";
+  end("exited", why);
+}
+
+// end is the end of this control plane: it did not start, or it exited. The
+// tabs say so. A worker cannot boot a second time, so it closes: the next tab
+// that loads the page gets a new worker, and with it a new cluster. Without
+// that, a reload would find the dead one for as long as another tab is open.
+function end(how, why) {
+  if (state === "failed" || state === "exited") return;
+  state = how;
   failure = why;
-  broadcast({ type: "exited", why, crash: crash.join("").split("\n").slice(0, 30).join("\n") });
-  rejectReady(new Error("the control plane exited"));
+  broadcast(how === "failed" ? { type: "failed", error: why } : { type: "exited", why, crash: crash.join("") });
+  rejectReady(new Error(how === "failed" ? why : `the control plane exited${why ? `: ${why}` : ""}`));
+  // after the answers to the tabs that wait in joinTab
+  setTimeout(() => self.close(), 1000);
 }
 
 // open opens a connection to a tab. extra.dc names a node that joined with
@@ -131,7 +148,9 @@ const methods = {
   async joinTab(id) {
     await ready;
     const info = await globalThis.tabernetes.prepareTab((label) => open(id, label));
-    tabs.get(id)?.nodes.push(info.name);
+    const tab = tabs.get(id);
+    if (tab) tab.nodes.push(info.name);
+    else globalThis.tabernetes.dropNode(info.name); // closed meanwhile
     return info;
   },
   // prepareJoin is "join" (docker) in a tab: the WebRTC connections live in
@@ -163,6 +182,10 @@ const methods = {
   meshOffer(id, name, sdp) {
     return signal(id, name, sdp);
   },
+  // logs: the last n lines of the control plane logs, for "logs" in a tab.
+  logs(id, n) {
+    return logs.join("").split("\n").slice(-n - 1).join("\n");
+  },
 };
 
 self.onconnect = (e) => {
@@ -181,6 +204,13 @@ self.onconnect = (e) => {
           // Its node, and the docker nodes that no other tab is connected to.
           for (const name of port.nodes) globalThis.tabernetes?.dropNode(name);
           leave(id, port.joined);
+          // It was to hand over the binary and did not get to the end of it:
+          // the other tabs would wait for this control plane forever.
+          const gone = "the tab that downloaded the control plane was closed";
+          if (id !== binary || !(feed || state === "new")) return;
+          end("failed", gone);
+          feed?.error(new Error(gone));
+          feed = null;
         });
         const needBinary = binary === null;
         if (needBinary) binary = id;
@@ -188,8 +218,20 @@ self.onconnect = (e) => {
         break;
       }
       case "binary": {
-        // The tab sends the download as it arrives (compressed, about 30 MB).
-        if (data.stream) boot(data.stream, data.size);
+        // The tab sends the download as it arrives (compressed, about 30 MB),
+        // in one message per chunk: not every browser can transfer a
+        // ReadableStream (Safari).
+        if (id !== binary || state !== "new") break;
+        boot(new ReadableStream({ start(ctl) { feed = ctl; } }), data.size);
+        break;
+      }
+      case "chunk": {
+        if (id !== binary || !feed) break;
+        const ctl = feed;
+        if (data.done || data.error) feed = null;
+        if (data.error) ctl.error(new Error(data.error));
+        else if (data.done) ctl.close();
+        else ctl.enqueue(new Uint8Array(data.data));
         break;
       }
       case "connect":

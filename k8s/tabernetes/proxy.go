@@ -15,9 +15,13 @@ import (
 // Redirects go back to the browser tab, which keeps them inside the proxy.
 var proxyClient = &http.Client{
 	Transport:     localClient.Transport,
-	Timeout:       55 * time.Second,
+	Timeout:       proxyTimeout,
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 }
+
+// proxyTimeout is below the timeout of the service worker (sw.js). A model in
+// a tab may need minutes for an answer on the chat page of llm.
+const proxyTimeout = 290 * time.Second
 
 const proxyMaxBody = 64 << 20
 

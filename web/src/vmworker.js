@@ -17,6 +17,8 @@ const PLATFORM = { os: "linux", architecture: "386" };
 const INDEX_TYPES = ["application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"];
 const MANIFEST_TYPES = ["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"];
 
+const MAX_MEMORY = 2048; // MiB, of the VM of a pod
+
 class PullError extends Error {}
 
 // parseRef normalizes an image reference as Docker does: nginx is
@@ -177,10 +179,17 @@ async function start(m) {
     ".tabernetes/config.json": { mode: modes.S_IFREG | 0o644, data: new TextEncoder().encode(JSON.stringify(conf)) },
   });
   img.layers = null;
-  // The initramfs is unpacked into the root file system, a tmpfs of half the
-  // RAM, next to the kernel and the running container. A memory limit of the
-  // pod can give the VM more room, not less than that.
-  const memory = Math.max(m.memory || 0, Math.min(2048, Math.max(256, Math.ceil((initrd.length * 2.5) / 2 ** 20) + 96)) * 2 ** 20);
+  // The initramfs is unpacked into the root file system, a tmpfs. Its limit
+  // is half of the RAM that is left next to the initramfs itself, and a file
+  // takes whole pages there. So the VM needs a bit more than three times the
+  // initramfs, plus room for the kernel and the running container. A memory
+  // limit of the pod can give the VM more room, not less than that.
+  const need = Math.ceil((initrd.length * 3.4) / 2 ** 20) + 96;
+  if (need > MAX_MEMORY) {
+    post({ type: "error", message: `the image is too large for a tab: ${Math.round(initrd.length / 2 ** 20)} MiB unpacked, the VM of a pod has room for about ${Math.floor((MAX_MEMORY - 96) / 3.4)} MiB` });
+    return;
+  }
+  const memory = Math.max(m.memory || 0, Math.max(256, need) * 2 ** 20);
   emulator = new V86({
     wasm_path: m.wasmURL,
     bios: { url: m.biosURL },
@@ -196,8 +205,16 @@ async function start(m) {
     net_device: { type: "virtio", relay_url: "fetch", vm_ip: m.ip, router_ip: m.gateway },
   });
   // The console is stdout and stderr of the container. Batch the bytes.
+  // A character of several bytes may be split between two batches.
+  const utf8 = new TextDecoder();
   let out = [], timer = 0;
-  const flush = () => { timer = 0; if (out.length) post({ type: "console", data: String.fromCharCode(...out) }); out = []; };
+  const flush = () => {
+    clearTimeout(timer);
+    timer = 0;
+    const data = utf8.decode(new Uint8Array(out), { stream: true });
+    out = [];
+    if (data) post({ type: "console", data });
+  };
   emulator.add_listener("serial0-output-byte", (b) => {
     out.push(b);
     if (out.length >= 4096) flush();

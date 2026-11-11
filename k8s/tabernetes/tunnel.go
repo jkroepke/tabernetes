@@ -89,6 +89,10 @@ func (c *dcConn) Write(p []byte) (int, error) {
 			return written, io.ErrClosedPipe
 		}
 		for c.dc.Get("bufferedAmount").Int() > dcHighWater {
+			// A closed channel never drains.
+			if c.dc.Get("readyState").String() != "open" {
+				return written, io.ErrClosedPipe
+			}
 			time.Sleep(5 * time.Millisecond)
 		}
 		n := min(len(p), dcChunk)

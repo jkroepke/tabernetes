@@ -56,8 +56,10 @@ browser tab (single wasm binary)                     docker run tabernetes
 - `proxy 8080` opens `localhost:8080` of the Wasm in a new browser tab. A
   service worker under `/tabernetes-proxy/` (`static/tabernetes-proxy/sw.js`) hands
   every request of that tab to the terminal tab, which sends it to the
-  in-process network. The tab works as long as the terminal tab is open;
-  leaving the terminal page unregisters the worker. While
+  in-process network. The tab works as long as the terminal tab is open.
+  Every terminal tab has its own `localhost`, so the worker remembers which
+  tab answers for a port, and it unregisters when the last terminal tab that
+  used it is gone. While
   `kubectl port-forward` runs, the status line under the terminal links each
   of its local ports the same way (`k8s/tabernetes/forwards.go`).
 - `vnc <port>` shows a VNC server on `localhost` of the Wasm (a
@@ -71,8 +73,11 @@ browser tab (single wasm binary)                     docker run tabernetes
   (`web/src/cluster.js`, `k8s/tabernetes/tabs.go`) that all tabs of the page
   share, and it lives as long as one of them is open: open a second tab, and
   it joins as `tab-2`; close the first one, and the cluster keeps running. The
-  first tab hands its download to the worker, which compiles a second instance
-  of the binary for the control plane. Each tab runs the binary for its shell,
+  first tab hands its download to the worker chunk by chunk (Safari cannot
+  transfer a stream), and the worker compiles a second instance of the binary
+  for the control plane. When the control plane fails or exits, the worker
+  ends, so a reload boots a new one even while other tabs are open. `logs`
+  reads the log of the worker. Each tab runs the binary for its shell,
   kubectl and kubelet, and every connection between a tab and the worker is a
   MessagePort of its own. A tab holds a Web Lock while it is open; the worker
   waits for that lock, so it learns when a tab closes, deletes its node and

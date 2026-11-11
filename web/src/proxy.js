@@ -22,21 +22,25 @@ export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/ta
     sw.startMessages();
   }
 
-  // The worker only serves the tabs of this page. When the page goes away,
-  // so does the worker. Tabs it still controls keep it until they close.
-  let registration = null;
+  // The worker only serves the terminal tabs of this page. Every tab that
+  // used it says goodbye, and the worker unregisters when the last one is
+  // gone. Tabs it still controls keep it until they close.
+  let last = null;
   addEventListener("pagehide", () => {
-    registration?.unregister();
-    registration = null;
+    last?.postMessage({ type: "tabernetes-bye" });
+    last = null;
   });
+  // Register each time: the worker may have unregistered in the meantime.
   async function activeWorker() {
-    registration ||= await sw.register(worker, { scope });
-    const reg = registration;
-    if (reg.active) return reg.active;
-    const w = reg.installing || reg.waiting;
-    await new Promise((resolve) => w.addEventListener("statechange", () => w.state === "activated" && resolve()));
-    return reg.active;
+    const reg = await sw.register(worker, { scope });
+    if (!reg.active) {
+      const w = reg.installing || reg.waiting;
+      await new Promise((resolve) => w.addEventListener("statechange", () => w.state === "activated" && resolve()));
+    }
+    return (last = reg.active);
   }
+  // hello tells the worker that this tab answers for ports.
+  const hello = async (ports) => (await activeWorker()).postMessage({ type: "tabernetes-host", ports });
 
   const urlOf = (port) => new URL(`${scope}${port}/`, location.href).href;
 
@@ -46,7 +50,7 @@ export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/ta
   async function openTab(port) {
     const tab = window.open("about:blank", "_blank");
     try {
-      (await activeWorker()).postMessage({ type: "tabernetes-host" });
+      await hello([port]);
     } catch (err) {
       tab?.close();
       throw err;
@@ -81,7 +85,7 @@ export function proxyBuiltins({ worker = "/tabernetes-proxy/sw.js", scope = "/ta
     }));
     // A middle click opens the link without the click handler: have the
     // worker ready for it.
-    if (list.length && sw) activeWorker().then((w) => w.postMessage({ type: "tabernetes-host" })).catch(() => {});
+    if (list.length && sw) hello(list.map((f) => f.port)).catch(() => {});
   };
 
   return {

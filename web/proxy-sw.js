@@ -6,16 +6,31 @@
 // request to the terminal tab, which runs it against its in-process network
 // and posts the response back.
 const scope = new URL(self.registration.scope).pathname; // "/tabernetes-proxy/"
-const TIMEOUT = 60_000;
+// A model in a tab may need minutes for an answer on the chat page of llm.
+// The terminal tab gives up a little earlier (k8s/tabernetes/proxy.go).
+const TIMEOUT = 300_000;
 
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
 
-// The terminal tab says hello when it runs "proxy". The worker may be
-// stopped and started again, so this is only the first guess.
-let host = null;
+// A terminal tab says hello with the ports it answers for: when it runs
+// "proxy", and when its kubectl port-forward listens. Every tab has its own
+// localhost, so the port decides which tab gets a request. The browser may
+// stop the worker and start it again, so this is only the first guess.
+const hosts = new Map(); // port -> client id of the terminal tab
+const terminals = new Set(); // client ids of the terminal tabs
 self.addEventListener("message", (e) => {
-  if (e.data?.type === "tabernetes-host") host = e.source.id;
+  const id = e.source?.id;
+  if (!id) return;
+  if (e.data?.type === "tabernetes-host") {
+    terminals.add(id);
+    for (const p of e.data.ports || []) hosts.set(p, id);
+  } else if (e.data?.type === "tabernetes-bye") {
+    // The tab goes away. The worker goes with the last one.
+    terminals.delete(id);
+    for (const [p, h] of hosts) if (h === id) hosts.delete(p);
+    if (!terminals.size) self.registration.unregister();
+  }
 });
 
 // portOf returns the port of a path below the scope, or 0.
@@ -67,32 +82,56 @@ async function forward(req, port, path) {
   return new Response(nullBody ? null : r.body, { status: r.status, statusText: r.statusText, headers });
 }
 
-// ask sends the request to the terminal tab. Without a known one, every
-// window of the site gets it and the first Tabernetes terminal answers.
+// ask sends the request to the terminal tab of the port. Without a known
+// one, or when nothing listens there anymore, every window of the site gets
+// it: the first Tabernetes terminal with an answer wins.
 async function ask(msg) {
-  let tabs = [];
-  const known = host && (await self.clients.get(host));
-  if (known) tabs = [known];
-  else {
-    const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    tabs = all.filter((c) => !new URL(c.url).pathname.startsWith(scope));
+  const id = hosts.get(msg.port);
+  const known = id && (await self.clients.get(id));
+  let first;
+  if (known) {
+    first = await askTabs([known], msg);
+    if (!first.error) return first;
   }
+  const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  const tabs = all.filter((c) => c.id !== id && !new URL(c.url).pathname.startsWith(scope));
   if (!tabs.length) {
-    // The terminal tab is gone without unregistering (crash, closed browser).
+    if (first) return first;
+    // The terminal tab is gone without a goodbye (crash, closed browser).
     self.registration.unregister();
     throw new Error("the Tabernetes terminal tab is closed");
   }
-  const replies = tabs.map((tab) => new Promise((resolve) => {
-    const { port1, port2 } = new MessageChannel();
-    port1.onmessage = (m) => {
-      if (tab.id !== host && !m.data.error) host = tab.id;
-      resolve(m.data);
-    };
-    tab.postMessage(msg, [port2]);
-  }));
-  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error(
-    "no answer from the Tabernetes terminal tab (is the cluster running?)")), TIMEOUT));
-  return Promise.race([...replies, timeout]);
+  const r = await askTabs(tabs, msg);
+  return r.error && first ? first : r;
+}
+
+// askTabs resolves to the first answer without an error, or to the error
+// when no tab has a better one.
+function askTabs(tabs, msg) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(
+      "no answer from the Tabernetes terminal tab (is the cluster running?)")), TIMEOUT);
+    let open = tabs.length, error = null;
+    for (const tab of tabs) {
+      const { port1, port2 } = new MessageChannel();
+      port1.onmessage = (m) => {
+        port1.close();
+        if (m.data.error) {
+          error ||= m.data;
+          // A page of the site without a terminal never answers: give the
+          // others a moment, then report what the terminal said.
+          if (--open > 0) return setTimeout(() => { clearTimeout(timer); resolve(error); }, 2000);
+        } else {
+          terminals.add(tab.id);
+          hosts.set(msg.port, tab.id);
+        }
+        clearTimeout(timer);
+        resolve(m.data);
+      };
+      // The body goes to every tab: no transfer.
+      tab.postMessage(msg, [port2]);
+    }
+  });
 }
 
 function text(status, s) {

@@ -22,7 +22,7 @@ RUN set -eux; \
     make -s tinyconfig; \
     ./scripts/kconfig/merge_config.sh -m .config /kernel.config >/dev/null; \
     make -s olddefconfig; \
-    for o in X86_32 M686 SERIAL_8250_CONSOLE VIRTIO_PCI VIRTIO_NET BLK_DEV_INITRD DEVTMPFS IP_PNP; do \
+    for o in X86_32 M686 SERIAL_8250_CONSOLE VIRTIO_PCI VIRTIO_NET BLK_DEV_INITRD DEVTMPFS IP_PNP COMPAT_32BIT_TIME; do \
       grep -q "^CONFIG_$o=y" .config || { echo "kernel.config: CONFIG_$o did not make it into .config" >&2; exit 1; }; \
     done; \
     make -s -j"$(nproc)" bzImage; \

@@ -50,7 +50,8 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
   const render = () => {
     if (!status) return;
     if (!nodes.length) {
-      status.textContent = "No nodes. Type join to connect one.";
+      // With a shared worker, every tab is a node already (tabs.js).
+      status.textContent = cluster ? "This tab is a node. Type join to connect a Docker node." : "No nodes. Type join to connect one.";
       return;
     }
     status.replaceChildren(...nodes.map(({ info, pc }) => {
@@ -170,7 +171,9 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
       await pc.setLocalDescription(await pc.createOffer());
       await gatheringComplete(pc, 3000);
       if (!active()) { pc.close(); return; } // Ctrl-C while preparing
-      const port = 50000 + ++seq;
+      // One port per node: the names are unique in the cluster, a counter of
+      // this tab is not, and two containers cannot publish the same port.
+      const port = 50000 + ((Number(info.name.replace(/^\D+/, "")) || ++seq) % 10000);
       const token = await encodeToken({
         v: 1, n: info.name, ip: info.ip, t: info.token, ca: info.ca, sdp: pc.localDescription.sdp, p: port,
       });

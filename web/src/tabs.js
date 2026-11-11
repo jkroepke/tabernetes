@@ -2,7 +2,7 @@
 // connectCluster returns null where the browser has no SharedWorker or no Web
 // Locks (Chrome on Android): the tab then runs the control plane itself.
 
-export async function connectCluster(url) {
+export async function connectCluster(url, tries = 0) {
   if (typeof SharedWorker !== "function" || !navigator.locks?.request) return null;
   const id = crypto.randomUUID();
   const lock = `tabernetes-tab-${id}`;
@@ -50,6 +50,13 @@ export async function connectCluster(url) {
   port.start();
   port.postMessage({ type: "hello", id, lock });
   const h = await greeted;
+  // A control plane that failed or exited: its worker closes in a moment
+  // (cluster.js), and the next one boots a new cluster.
+  if ((h.state === "failed" || h.state === "exited") && tries < 3) {
+    port.close();
+    await new Promise((r) => setTimeout(r, 1500));
+    return connectCluster(url, tries + 1);
+  }
 
   return {
     // needBinary: this tab is the first one and hands the download over.
@@ -58,7 +65,24 @@ export async function connectCluster(url) {
     state: h.state,
     failure: h.failure,
     on(type, fn) { listeners[type].push(fn); },
-    sendBinary(stream, size) { port.postMessage({ type: "binary", stream, size }, [stream]); },
+    // sendBinary hands the download to the worker as it arrives, in one
+    // message per chunk: not every browser can transfer a ReadableStream
+    // (Safari).
+    async sendBinary(stream, size) {
+      port.postMessage({ type: "binary", size });
+      try {
+        for (const r = stream.getReader(); ;) {
+          const { value, done } = await r.read();
+          if (done) break;
+          // a copy: the other branch of the tee reads the same chunk
+          const b = value.slice().buffer;
+          port.postMessage({ type: "chunk", data: b }, [b]);
+        }
+        port.postMessage({ type: "chunk", done: true });
+      } catch (e) {
+        port.postMessage({ type: "chunk", error: String(e?.message || e) });
+      }
+    },
     rpc(method, ...args) {
       return new Promise((resolve, reject) => {
         calls.set(++seq, { resolve, reject });
