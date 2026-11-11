@@ -4,7 +4,7 @@
 #   docker build --output type=local,dest=out vm
 #
 # writes bzImage, init and seabios.bin to out/ (mise run vm).
-ARG ALPINE_IMAGE=mirror.gcr.io/library/alpine:3.24
+ARG PYTHON_IMAGE=mirror.gcr.io/library/python:3.14-alpine
 ARG KERNEL_IMAGE=mirror.gcr.io/library/ubuntu:24.04
 
 # Linux 6.8 from Ubuntu 24.04 (linux-source), for i386, cross-compiled with
@@ -29,12 +29,16 @@ RUN set -eux; \
     mkdir /out; \
     cp arch/x86/boot/bzImage /out/
 
-# PID 1 of the VM, a static binary for linux/386 with musl. Built in an
-# i386 Alpine: x86_64 hosts run it natively, others through emulation.
-FROM --platform=linux/386 ${ALPINE_IMAGE} AS init
-RUN apk add --no-cache gcc musl-dev
+# PID 1 of the VM, a static binary for linux/386 with musl. zig cc comes
+# with musl for i386 and cross-compiles on any build platform (an i386
+# image would need emulation on arm64).
+FROM --platform=$BUILDPLATFORM ${PYTHON_IMAGE} AS init
+# renovate: pypi=ziglang
+ARG ZIG_VERSION=0.17.1
+RUN pip install --no-cache-dir "ziglang==${ZIG_VERSION}"
 COPY init/init.c /src/init.c
-RUN mkdir /out && gcc -static -Os -s -Wall -Wextra -Werror -o /out/init /src/init.c
+RUN mkdir /out \
+  && python -m ziglang cc -target x86-linux-musl -static -Os -s -Wall -Wextra -Werror -o /out/init /src/init.c
 
 # The BIOS that comes with v86, from the commit of the npm release in
 # web/package.json (0.5.473+g315b2b0).
