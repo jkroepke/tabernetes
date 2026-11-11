@@ -5,6 +5,10 @@
 // to WebAssembly, with the merged layers as its root file system over 9p
 // (rootfs.js). The files stay outside the memory of the VM.
 //
+// The VM boots while the image is pulled. init waits in an initramfs for the
+// pod (vm/init/stage0.go): the first VM of each memory size saves its state
+// there, and later ones restore it instead of booting (vmstate.js).
+//
 // Docker Hub sends no CORS headers, so the page cannot pull from it. The
 // mirror is a pull-through cache of Docker Hub that does. The unpacked
 // layers stay in the browser: a second pull finds the image "already present
@@ -13,6 +17,8 @@ import { V86 } from "v86";
 import { Tree, LayerStorage, modes } from "./rootfs.js";
 import { openStore } from "./layers.js";
 import { SHA256 } from "./sha256.js";
+import { initramfs } from "./initramfs.js";
+import { buildID, loadState, saveState, dropState } from "./vmstate.js";
 
 const post = (m, transfer) => self.postMessage(m, transfer || []);
 const CACHE = "tabernetes-configs"; // the configs of the images, small JSON blobs
@@ -209,12 +215,114 @@ function containerSpec(img, c) {
 let emulator;
 const conns = new Map();
 
+// The lines that init writes to the second serial port (vm/init).
+let onControl = () => {};
+
+const fetchBytes = async (url) => new Uint8Array(await (await fetch(url)).arrayBuffer());
+
+// bootVM starts the VM of the pod, without its file system: from a saved
+// state, or by booting the kernel. It resolves once init waits for the pod.
+async function bootVM(m, memory) {
+  const [kernel, init] = await Promise.all([fetchBytes(m.kernelURL), fetchBytes(m.initURL)]);
+  const build = await buildID(m.version || "", kernel, init).catch(() => "");
+  const state = build && (await loadState(build, memory));
+  const base = {
+    wasm_path: m.wasmURL,
+    bios: { url: m.biosURL },
+    // an empty 9p file system; the tree of the pod comes in before "go"
+    filesystem: {},
+    memory_size: memory,
+    uart1: true,
+    autostart: false,
+    disable_keyboard: true,
+    disable_mouse: true,
+    disable_speaker: true,
+    // the network adapter must learn the MAC of a restored VM
+    preserve_mac_from_state_image: true,
+    net_device: { type: "virtio", relay_url: "fetch", vm_ip: m.ip, router_ip: m.gateway },
+  };
+  if (state) {
+    const e = new V86(base);
+    await new Promise((r) => e.add_listener("emulator-loaded", r));
+    fastUnpack(e.v86.cpu);
+    try {
+      await e.restore_state(state);
+      return { emulator: e, init };
+    } catch (err) {
+      console.warn("tabernetes: the saved state of the VM does not restore, booting:", err);
+      e.destroy();
+      dropState(build, memory).catch(() => {});
+    }
+  }
+  const e = new V86({
+    ...base,
+    bzimage: { buffer: kernel.buffer },
+    initrd: { buffer: initramfs(init).buffer },
+    cmdline: "console=ttyS0 quiet loglevel=3",
+  });
+  emulator = e;
+  const ready = new Promise((resolve, reject) => {
+    let error = "";
+    onControl = (l) => {
+      if (l === "ready") resolve();
+      else if (l.startsWith("error ")) error = l.slice(6);
+      else if (l.startsWith("exit ")) reject(new Error(`the VM did not boot: ${error || l}`));
+    };
+  });
+  e.add_listener("emulator-loaded", () => e.run());
+  e.add_listener("serial1-output-byte", control);
+  await ready;
+  if (build && (await opfs())) {
+    // init waits for the line, nothing else runs: save the VM for the next pods
+    await e.stop();
+    const saved = await e.save_state().catch(() => null);
+    e.run();
+    if (saved) saveState(build, memory, saved).catch((err) => console.warn("tabernetes: save the state of the VM:", err));
+  }
+  return { emulator: e, init };
+}
+
+const opfs = () => navigator.storage?.getDirectory?.().then(() => true, () => false) ?? Promise.resolve(false);
+
+// fastUnpack replaces how v86 restores the memory of a state: it zeroes all
+// of the memory first, which takes 160 ms for 256 MiB and makes the browser
+// commit every page. The memory of a new VM is zero already, apart from
+// what v86 put there itself (the BIOS).
+function fastUnpack(cpu) {
+  cpu.unpack_memory = function (bitmap, packed) {
+    const pages = this.memory_size[0] >> 12;
+    let d = 0;
+    for (let p = 0; p < pages; p++) {
+      if (bitmap.get(p)) {
+        this.mem8.set(packed.subarray(d << 12, (d + 1) << 12), p << 12);
+        d++;
+      } else if (!this.is_memory_zeroed(p << 12, 4096)) {
+        this.zero_memory(p << 12, 4096);
+      }
+    }
+  };
+}
+
+let line = "";
+function control(b) {
+  if (b === 13) return; // the tty sends \r\n
+  if (b !== 10) { line += String.fromCharCode(b); return; }
+  const l = line;
+  line = "";
+  onControl(l);
+}
+
 async function start(m) {
   const t0 = Date.now();
+  const memory = Math.min(MAX_MEMORY, Math.max(MIN_MEMORY, m.memory ? Math.ceil(m.memory / 2 ** 20) : DEFAULT_MEMORY)) * 2 ** 20;
+  // the VM boots while the image is pulled
+  const vm = bootVM(m, memory);
+  vm.catch(() => {});
   let img;
   try {
     img = await pullImage(m.registry, m.image, () => post({ type: "pulling" }));
   } catch (e) {
+    vm.then((v) => v.emulator.destroy(), () => {});
     post({ type: "error", pull: true, message: e instanceof PullError ? e.message : `failed to pull and unpack image "${m.image}": ${e.message}` });
     return;
   }
@@ -224,14 +332,14 @@ async function start(m) {
 
   const spec = containerSpec(img.config, m.container);
   if (!spec.args.length) {
+    vm.then((v) => v.emulator.destroy(), () => {});
     post({ type: "exit", code: 128, message: "no command specified" });
     return;
   }
-  const init = new Uint8Array(await (await fetch(m.initURL)).arrayBuffer());
   const c = m.container;
   const conf = { ...spec, hostname: m.hostname, ip: m.ip, gateway: m.gateway, stdin: !!c.stdin, stdinOnce: !!c.stdinOnce, tty: !!c.tty };
-  // The root file system: the layers, and the init of the pod on top. The
-  // mount points must be there for the kernel (devtmpfs) and init.
+  // The root file system: the layers, and the config of the pod on top. The
+  // mount points must be there for init.
   const tree = new Tree();
   img.layers.forEach((l, i) => {
     tree.layer = i;
@@ -241,7 +349,6 @@ async function start(m) {
   const now = Math.floor(Date.now() / 1000);
   const mem = new Map();
   const extra = {
-    ".tabernetes/init": { mode: modes.S_IFREG | 0o755, data: init },
     ".tabernetes/config.json": { mode: modes.S_IFREG | 0o644, data: new TextEncoder().encode(JSON.stringify(conf)) },
   };
   for (const [path, e] of Object.entries(extra)) {
@@ -256,30 +363,8 @@ async function start(m) {
   for (const l of img.layers) layers.set(l.id, await store.layer(l.id));
   const fsJSON = tree.v86();
   img.layers = null;
-  const memory = Math.min(MAX_MEMORY, Math.max(MIN_MEMORY, m.memory ? Math.ceil(m.memory / 2 ** 20) : DEFAULT_MEMORY)) * 2 ** 20;
-  emulator = new V86({
-    wasm_path: m.wasmURL,
-    bios: { url: m.biosURL },
-    bzimage: { url: m.kernelURL },
-    // an empty 9p file system; the tree comes in below, before the boot
-    filesystem: {},
-    // cache=loose: only the guest changes the files, it may keep them
-    cmdline: "console=ttyS0 quiet loglevel=3 root=host9p rootfstype=9p rw " +
-      "rootflags=trans=virtio,version=9p2000.L,cache=loose,msize=262144 init=/.tabernetes/init " +
-      `ip=${m.ip}::${m.gateway}:255.255.255.0:${m.hostname}:eth0:off`,
-    memory_size: memory,
-    uart1: true,
-    autostart: false,
-    disable_keyboard: true,
-    disable_mouse: true,
-    disable_speaker: true,
-    net_device: { type: "virtio", relay_url: "fetch", vm_ip: m.ip, router_ip: m.gateway },
-  });
-  emulator.add_listener("emulator-loaded", () => {
-    emulator.fs9p.storage = new LayerStorage(layers, mem);
-    emulator.fs9p.load_from_json(fsJSON);
-    emulator.run();
-  });
+
+  ({ emulator } = await vm);
   // The console is stdout and stderr of the container. Batch the bytes.
   // A character of several bytes may be split between two batches.
   const utf8 = new TextDecoder();
@@ -297,16 +382,22 @@ async function start(m) {
     else if (!timer) timer = setTimeout(flush, 20);
   });
   // The init of the pod (vm/init) reports on the second serial port.
-  let line = "", error = "";
-  emulator.add_listener("serial1-output-byte", (b) => {
-    if (b === 13) return; // the tty sends \r\n
-    if (b !== 10) { line += String.fromCharCode(b); return; }
-    const l = line;
-    line = "";
+  let error = "";
+  onControl = (l) => {
     if (l === "started") post({ type: "started", memory });
     else if (l.startsWith("error ")) error = l.slice(6);
     else if (l.startsWith("exit ")) { flush(); post({ type: "exit", code: Number(l.slice(5)), message: error }); }
-  });
+  };
+  if (!emulator.is_running()) {
+    // restored: it waits for the pod already
+    emulator.add_listener("serial1-output-byte", control);
+  }
+  emulator.fs9p.storage = new LayerStorage(layers, mem);
+  emulator.fs9p.load_from_json(fsJSON);
+  emulator.run();
+  // A restored VM has the clock and the random numbers of the saved one.
+  const seed = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  emulator.serial_send_bytes(1, new TextEncoder().encode(`go ${Date.now()} ${seed}\n`));
 }
 
 function connect(id, port) {

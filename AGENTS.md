@@ -81,6 +81,16 @@ that name.
   last release 2019). Kernel: Linux 6.8 i386 `tinyconfig` + `vm/kernel.config`
   with `CONFIG_HIGHMEM4G` (pods up to 2 GiB; v86 caps guest RAM at
   2 GiB - 128 KiB; without highmem the guest used only ~896 MiB).
+- **Saved VM states** (`web/src/vmstate.js`, `vm/init/stage0.go`): init
+  waits in an initramfs for the pod; the first VM per memory size saves its
+  state there, later pods restore it (~0.6 s less per start). After a restore,
+  init must set the clock and reseed the RNG (else all pods share the random
+  numbers), and v86 needs `preserve_mac_from_state_image` (else the network
+  adapter has the wrong MAC and port-forward hangs). `fastUnpack` replaces
+  v86's `unpack_memory`, which zeroed all guest RAM (160 ms and 240 MiB more
+  RSS per pod). Kernel options that cost boot time: legacy PTYs (310 ms),
+  gzip (LZ4 unpacks in a third of the time, in-guest zstd is 200 ms slower
+  than LZ4).
 - **Node join over WebRTC** with copy and paste signaling and STUN, one UDP mux per
   node. The node runs without `--privileged`: the agent re-execs into
   user/mount/net/cgroup namespaces, pasta (built from passt.top at the fixed
@@ -89,8 +99,8 @@ that name.
   A `--tmpfs` variant for containerd was discussed and not wanted.
 - **Persistence**: image layers in OPFS (`web/src/layers.js`, served to v86
   over 9p), cluster as an etcd snapshot in IndexedDB (`state.go`,
-  `etcdshim/snapshot.go`), files of `/root` in IndexedDB. `forget` deletes
-  all of it.
+  `etcdshim/snapshot.go`), files of `/root` in IndexedDB, saved VM states
+  in OPFS. `forget` deletes all of it.
 - **Build tooling is mise** (`mise.toml` tasks), not a Makefile.
 - **Terminal**: the shell is mvdan.cc/sh with Go built-ins (coreutils, `wget`,
   `vi`, `kubectl edit` in raw mode). busybox-wasm and vigo were tried and
