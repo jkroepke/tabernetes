@@ -213,6 +213,16 @@ that name.
   `onclose()`, which ends the goroutines of the old tabs. Tab numbers are
   the lowest free ones (tabs.go), else a hibernated cluster counts up
   forever. Firefox and Safari end the worker with the last tab: no image.
+- **poweroff, shutdown, reboot** (`terminal.js`, `cluster.js`): stop the
+  control plane of every tab. The worker broadcasts a wall(1)-like message,
+  waits ~1.5 s for the last etcd snapshot (Go saves once a second) and the
+  files of `/root`, drops a hibernated image and closes like after a crash.
+  The cluster is kept, like the disk of a machine; `forget` is the command
+  that deletes it. reboot then boots a fresh control plane in the same tab,
+  in place (`restart` in `index.js`), not by a reload: the blog page sits
+  behind a start button. The other tabs stay down until Enter. The tabs end
+  the workers of their pods and close their WebRTC connections, so Docker
+  nodes end too. Without a SharedWorker, poweroff and reboot reload the page.
 - **Image pulls** download and unpack up to 3 layers at once, like
   containerd's `max_concurrent_downloads`. On a fast link the browser is
   CPU bound (gunzip, SHA-256, OPFS) and gains little; it saves round trips

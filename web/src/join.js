@@ -130,6 +130,15 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
   if (cluster) {
     cluster.on("mesh", ({ name }) => meshConnect(name));
     cluster.rpc("meshNodes").then((names) => names.forEach(meshConnect), () => {});
+    // The control plane is gone (poweroff, reboot, a crash): close the
+    // connections, so that the docker nodes end like after the last tab.
+    const down = () => {
+      for (const { pc } of nodes) pc.close();
+      pending = null;
+      render();
+    };
+    cluster.on("exited", down);
+    cluster.on("failed", down);
   }
 
   // finish hands the answer of the node to the pending connection.
