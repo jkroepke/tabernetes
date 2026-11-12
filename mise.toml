@@ -11,8 +11,8 @@
 # and fixing whatever k8s/patch.go complains about.
 
 [tools]
-go = "1.27.3"
-node = "26.13.0"
+go = "1.27.4"
+node = "26.13.1"
 
 [env]
 # renovate: github-tags=kubernetes/kubernetes
