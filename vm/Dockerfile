@@ -5,17 +5,18 @@
 #
 # writes bzImage, init and seabios.bin to out/ (mise run vm).
 ARG PYTHON_IMAGE=mirror.gcr.io/library/python:3.15-alpine
-ARG KERNEL_IMAGE=mirror.gcr.io/library/ubuntu:24.04
+ARG KERNEL_IMAGE=mirror.gcr.io/library/ubuntu:26.04
 
-# Linux 6.8 from Ubuntu 24.04 (linux-source), for i386, cross-compiled with
-# clang on any build platform.
+# An upstream stable kernel (gregkh/linux mirrors the stable tree of
+# kernel.org) for i386, cross-compiled with clang on any build platform. The
+# checksum is the commit of the tag: Renovate updates both (renovate.json).
 FROM --platform=$BUILDPLATFORM ${KERNEL_IMAGE} AS kernel
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bc bison bzip2 clang flex libelf-dev libssl-dev lld llvm lz4 make linux-source-6.8.0 \
+  && apt-get install -y --no-install-recommends bc bison clang flex libelf-dev libssl-dev lld llvm lz4 make \
   && rm -rf /var/lib/apt/lists/*
+ADD --checksum=7595a62d45ee1a2297eafa5f2ef5d0a45142d84d https://github.com/gregkh/linux.git#v7.3.4 /src
 WORKDIR /src
-RUN tar xjf /usr/src/linux-source-6.8.0/linux-source-6.8.0.tar.bz2 --strip-components=1
 COPY kernel.config /kernel.config
 ENV ARCH=i386 LLVM=1
 RUN set -eux; \

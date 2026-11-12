@@ -78,9 +78,12 @@ that name.
   plane, but no container runtime. Limit of 8 pods per tab (kept on purpose).
 - **Real images in a tab run in v86** (32-bit x86 JIT to Wasm, npm `v86`),
   one worker per pod, `linux/386` image variants. Chosen over TinyEMU (no JIT,
-  last release 2019). Kernel: Linux 6.8 i386 `tinyconfig` + `vm/kernel.config`
-  with `CONFIG_HIGHMEM4G` (pods up to 2 GiB; v86 caps guest RAM at
-  2 GiB - 128 KiB; without highmem the guest used only ~896 MiB).
+  last release 2019). Kernel: upstream stable Linux (7.3, a tag of
+  `gregkh/linux` pinned by its commit in `vm/Dockerfile`, Renovate bumps both)
+  for i386, `tinyconfig` + `vm/kernel.config` with `CONFIG_HIGHMEM4G` (pods
+  up to 2 GiB; v86 caps guest RAM at 2 GiB - 128 KiB; without highmem the
+  guest used only ~896 MiB). It was Linux 6.8 from Ubuntu's `linux-source`
+  until 2026-11-12.
 - **PID 1 of the VM is C** (`vm/init/init.c`, static, musl, compiled by
   `zig cc -target x86-linux-musl` from pip in `vm/Dockerfile`; an i386
   Alpine fails on the arm64 CI runners). It was Go until 2026-11-11. Measured
@@ -234,9 +237,15 @@ that name.
   `/json/list`, `Runtime.evaluate`) to crash or inspect it. Write test output
   to a file; piping through `tail` hangs because the server keeps the pipe
   open.
-- Kernel builds: `LLVM=1 ARCH=i386` from Ubuntu `linux-source` (cloning kernel
-  trees from GitHub may be blocked in sandboxes). Delete the tree afterwards;
-  sandbox disks are small.
+- Kernel builds: `LLVM=1 ARCH=i386`. Sandboxes may block kernel.org and the
+  tarballs of GitHub, but a git fetch of `gregkh/linux` (what `ADD ...git` in
+  `vm/Dockerfile` does) usually works. Delete the tree afterwards; sandbox
+  disks are small.
+- Boot test: `vm/test/boot.test.mjs` boots `dist/vm` in v86 in Node.js, saves
+  and restores the VM and starts a tiny ELF as the pod. `TABERNETES_VM` points
+  it at another directory. For a real image, export a `linux/386` image
+  (`docker export`) into a `Tree` with the files in memory; nginx (Debian)
+  answered HTTP on 7.3.4.
 - Measure performance in several rounds: run-to-run variance is about one
   second.
 - Crash the control plane on purpose: CDP `Runtime.evaluate` of
