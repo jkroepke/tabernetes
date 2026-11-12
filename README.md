@@ -165,7 +165,7 @@ browser tab (single wasm binary)                     docker run tabernetes
   guest reads it; what the container writes stays in the memory of the
   worker. init mounts it as root, so the image is not in the RAM of the VM (256 MiB, or the memory limit of the pod,
   at most 2 GiB: more is not possible in v86).
-  The kernel is Linux 6.8 from Ubuntu for i386, `tinyconfig` plus
+  The kernel is an upstream stable Linux (7.3) for i386, `tinyconfig` plus
   `vm/kernel.config` (serial console, virtio-net, virtio-9p, highmem, so that
   it uses more than 896 MiB), built with clang
   in `vm/Dockerfile` (`mise run vm`, needs Docker). PID 1

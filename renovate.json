@@ -20,17 +20,29 @@
       "enabled": false
     },
     {
-      "description": "The pod kernel is linux-source-6.8.0, which only Ubuntu 24.04 ships. A new Ubuntu release means a new kernel and a new test of vm/kernel.config, so it is not updated here.",
-      "matchFileNames": [
-        "vm/Dockerfile"
-      ],
+      "description": "A new minor version of the pod kernel may rename or drop options of vm/kernel.config, so it gets a pull request of its own. Patch releases merge when the boot test (vm/test/boot.test.mjs) passes.",
       "matchPackageNames": [
-        "mirror.gcr.io/library/ubuntu"
+        "gregkh/linux"
       ],
       "matchUpdateTypes": [
-        "major"
+        "major",
+        "minor"
       ],
-      "enabled": false
+      "automerge": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The pod kernel in vm/Dockerfile: a tag of the stable tree and its commit as the checksum of ADD.",
+      "managerFilePatterns": [
+        "/(^|/)vm/Dockerfile$/"
+      ],
+      "matchStrings": [
+        "ADD --checksum=(?<currentDigest>[a-f0-9]{40}) https://github\\.com/(?<depName>gregkh/linux)\\.git#(?<currentValue>v\\S+)"
+      ],
+      "datasourceTemplate": "github-tags",
+      "versioningTemplate": "loose"
     }
   ]
 }
