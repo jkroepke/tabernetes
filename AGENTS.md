@@ -146,6 +146,29 @@ that name.
   memory per pod; the boot time gain is below the noise (~50 ms). Most boot
   time is the JIT on cold kernel code, not idle waits. Keep PCI
   configuration type 1 (direct boot needs it).
+- **Work before the save, not after `go`** (2026-11-12): what does not
+  depend on the pod happens in stage 0, so the saved state has it done.
+  Stage 0 brings up `lo` and `eth0` (eth0 fills its receive queue of 1024
+  buffers: 0.8 million instructions) and mounts `/dev` (with `/dev/pts`,
+  `/dev/shm` and the links), `/proc` and `/sys`; after `go` it moves them
+  into the 9p root (`MS_MOVE`). init reads the config once, and the page puts
+  `/etc/hosts` and `/etc/resolv.conf` into the tree instead of init writing
+  them over 9p. An empty `$PIR` table at 0xf0000 (`kernelboot.js`) ends the
+  search of Linux for a BIOS routing table (0.4 million instructions per
+  boot). The kernel is built with `-O2`: -5 % instructions, and v86 runs
+  that code faster. Measured in Node.js (256 MiB): `go` to `started`
+  2.35 -> 0.94 million instructions, ~100 -> ~40 ms; nginx from `go` to
+  HTTP ~2.2 -> ~1.95 s (3 x 4 rounds); boot to `ready` 11.1 -> 11.4
+  million instructions (once per memory size); state 7.6 -> 8.4 MiB.
+- **Where the instructions go now** (Node.js profile, 256 MiB): boot to
+  `ready` is memory init (~19 %, grows with the RAM), alternatives
+  patching (~9 %), sysfs, kobjects and uevents (~15 %), printk into the log
+  buffer even with `quiet` (~6 %) and the random IP IDs of `ip_rt_init`
+  (~5 %). None has a Kconfig switch (`DEFERRED_STRUCT_PAGE_INIT` is 64-bit
+  only). nginx from `go` to HTTP is ~58 million instructions: ~37 % user
+  code, page faults ~15 %, system calls ~18 %; init is ~2 % of it. 9p has
+  a request in flight for only ~10 % of the time. v86 runs ~25-35 million
+  instructions per second here, so instructions are time.
 - **Node join over WebRTC** with copy and paste signaling and STUN, one UDP mux per
   node. The node runs without `--privileged`: the agent re-execs into
   user/mount/net/cgroup namespaces, pasta (built from passt.top at the fixed
@@ -305,6 +328,14 @@ that name.
   answered HTTP on 7.3.4.
 - Measure performance in several rounds: run-to-run variance is about one
   second.
+- Count instructions of the VM with `emulator.get_instruction_counter()`;
+  a listener on `serial1-output-byte` reads it at the exact instruction, so
+  `report()` lines in init work as probes. For a profile, build the kernel
+  with `CONFIG_UNWINDER_FRAME_POINTER=y`, sample `cpu.instruction_pointer`
+  between v86 ticks and walk the EBP chain in `cpu.mem8` (the virtual
+  address minus 0xc0000000) against `System.map`. A tick often ends at an interrupt:
+  then `[esp]` is the interrupted EIP, and an ESP of 0xffc0xxxx (the entry
+  stack) means user mode.
 - Crash the control plane on purpose: CDP `Runtime.evaluate` of
   `globalThis.tabernetes.attachPort(null,'api')` in the SharedWorker. Test
   image GC with a vmworker bundle built with a small `IMAGE_FS` budget.
@@ -315,6 +346,15 @@ that name.
 
 ## Parked ideas (do not reopen without new numbers)
 
+- **Pod kernel knobs without gain** (2026-11-12, Node.js): `INIT_STACK_NONE`
+  (-0.5 % instructions), smaller hash tables on the command line
+  (`thash_entries`, `dhash_entries`, ...), `lpj=`, `nopti`. `PREEMPT_NONE`
+  and `PREEMPT_VOLUNTARY` do not exist for x86 anymore (lazy preemption).
+  `PRINTK=n` would save ~6 % of the first boot, but pods would lose kernel
+  messages (OOM kills, segfaults) in their log.
+- **A JIT threshold for v86**: `JIT_THRESHOLD` is a constant in v86's Rust
+  code (`set_jit_config` sets only the page limit and loop safety); it needs
+  a fork of v86.
 - **Splitting the control plane into more workers** (apiserver / controllers /
   kubelet roles of one binary): measured on 2026-11-11, no gain beyond noise,
   +150 MiB per tab. Parked.
