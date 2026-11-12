@@ -1,9 +1,11 @@
-// The container side of the tab node (k8s/tabernetes/v86.go), as
-// globalThis.tabernetesVM. Every pod with a container image gets its own
+// The container side of the tab node (k8s/tabernetes/v86.go), as host.vm
+// of the session of a tab. Every pod with a container image gets its own
 // worker (vmworker.js) with an x86 emulator in it. Stopping the pod ends the
 // worker, and with it the VM.
 
-export function vmAPI({ version, workerURL, wasmURL, biosURL, kernelURL, initURL, registry }) {
+// spawn starts the worker. In the shared worker it is a worker of the tab
+// (bridge.js), since a shared worker cannot start workers.
+export function vmAPI({ version, workerURL, wasmURL, biosURL, kernelURL, initURL, registry, spawn = (u) => new Worker(u) }) {
   const abs = (u) => new URL(u, location.href).href;
   return {
     version, // of v86, for the container runtime of the node
@@ -15,7 +17,7 @@ export function vmAPI({ version, workerURL, wasmURL, biosURL, kernelURL, initURL
     // console(text), exit(code, message: why the entrypoint did not start),
     // error(message, pull, never: not present with the pull policy Never).
     start(opts, on) {
-      const worker = new Worker(workerURL);
+      const worker = spawn(abs(workerURL));
       const conns = new Map();
       let next = 1;
       worker.onmessage = ({ data: m }) => {

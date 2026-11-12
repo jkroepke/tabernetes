@@ -23,6 +23,7 @@ import (
 // every command is a Go function (kubectl, coreutils) or a JS function
 // (join, accept, logs, ...).
 type shell struct {
+	sess   *session
 	mu     sync.Mutex
 	runner *interp.Runner
 	cancel context.CancelFunc
@@ -31,8 +32,8 @@ type shell struct {
 	jsBuiltins js.Value
 }
 
-func newShell() *shell {
-	s := &shell{}
+func newShell(sess *session) *shell {
+	s := &shell{sess: sess}
 	r, err := interp.New(
 		interp.Interactive(true),
 		interp.Dir("/root"),
@@ -84,11 +85,11 @@ func (s *shell) run(src string, out js.Value, builtins js.Value) int {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), sessionKey{}, s.sess))
 	defer cancel()
 	s.cancel, s.jsBuiltins = cancel, builtins
-	tty.setOutput(w)
-	hw := holdWriter{tty}
+	s.sess.term.setOutput(w)
+	hw := holdWriter{s.sess.term}
 	// Commands get writers bound to their own context in exec: a background
 	// job writes on after this line has ended.
 	interp.StdIO(shellStdin, hw, hw)(s.runner)
@@ -108,7 +109,7 @@ func (s *shell) run(src string, out js.Value, builtins js.Value) int {
 	}
 	if s.runner.Exited() {
 		// "exit" starts a fresh shell, the cluster stays.
-		jobs.stopAll()
+		s.sess.jobs.stopAll()
 		s.runner.Reset()
 	}
 	return code
@@ -166,9 +167,9 @@ func (s *shell) exec(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		name := args[0]
 		switch {
 		case name == "tabernetes-jobs":
-			return jobsCmd(hc)
+			return s.sess.jobs.jobsCmd(hc)
 		case name == "tabernetes-kill":
-			return killCmd(hc, args[1:])
+			return s.sess.jobs.killCmd(hc, args[1:])
 		case name == "tabernetes-help":
 			return s.callJS(ctx, hc, "help", args[1:])
 		case name == "tabernetes-history":
@@ -209,6 +210,16 @@ func (s *shell) kubectl(ctx context.Context, hc interp.HandlerContext, args []st
 	if fromTerminal(hc.Stdin) && wantsTTY(args) {
 		return kubectlTTY(ctx, hc, args)
 	}
+	if kubectlVerb(args) == "edit" {
+		// vi runs on the terminal of this tab (editor.InProcess, vi.go)
+		release, err := ownTTY(ctx, hc.Stderr)
+		if err != nil {
+			return interp.ExitStatus(130)
+		}
+		defer release()
+		editTerm.Store(s.sess.term)
+		defer editTerm.Store(nil)
+	}
 	if a, ok := interactiveExec(args); ok && fromTerminal(hc.Stdin) {
 		return exitCode(execLines(ctx, a))
 	}
@@ -221,6 +232,18 @@ func (s *shell) kubectl(ctx context.Context, hc interp.HandlerContext, args []st
 		// kubectl notices on its next write; don't wait for that.
 		return interp.ExitStatus(130)
 	}
+}
+
+// kubectlVerb is the first argument of kubectl that is no flag. A flag with
+// a value in the next argument (-n default) may hide it; that is fine for
+// what it is used for.
+func kubectlVerb(args []string) string {
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			return a
+		}
+	}
+	return ""
 }
 
 // callJS runs a builtin of the terminal: fn(args, {write, stdin}) -> Promise.

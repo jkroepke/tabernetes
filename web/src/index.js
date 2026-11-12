@@ -3,27 +3,28 @@ import { startTerminal } from "./terminal.js";
 import { joinBuiltins } from "./join.js";
 import { proxyBuiltins } from "./proxy.js";
 import { vncBuiltins } from "./vnc.js";
-import { gpuAPI } from "./gpu.js";
-import { vmAPI } from "./vm.js";
 import { connectCluster } from "./tabs.js";
 
 const el = document.getElementById("tabernetes");
-// llm: the tab node runs language models with WebGPU (k8s/tabernetes/webllm.go).
-if (el.dataset.gpuWorker) globalThis.tabernetesGPU = gpuAPI(el.dataset.gpuWorker);
-// Every other image runs as a container in v86, an x86 emulator
-// (k8s/tabernetes/v86.go), with the image from a mirror of Docker Hub.
-if (el.dataset.vmWorker) {
-  const d = el.dataset;
-  globalThis.tabernetesVM = vmAPI({
+const abs = (u) => u && new URL(u, location.href).href;
+// What the node of this tab runs. llm: language models with WebGPU
+// (k8s/tabernetes/webllm.go). Every other image runs as a container in v86,
+// an x86 emulator (k8s/tabernetes/v86.go), with the image from a mirror of
+// Docker Hub. The workers of the pods run in this tab, also when the
+// kubelet runs in the shared worker (bridge.js).
+const d = el.dataset;
+const pods = {
+  gpu: abs(d.gpuWorker),
+  vm: d.vmWorker ? {
     version: V86_VERSION,
-    workerURL: d.vmWorker,
-    wasmURL: d.vmWasm,
-    biosURL: d.vmBios,
-    kernelURL: d.vmKernel,
-    initURL: d.vmInit,
+    workerURL: abs(d.vmWorker),
+    wasmURL: abs(d.vmWasm),
+    biosURL: abs(d.vmBios),
+    kernelURL: abs(d.vmKernel),
+    initURL: abs(d.vmInit),
     registry: d.registry,
-  });
-}
+  } : undefined,
+};
 // The status line under the terminal: the nodes, then the forwarded ports.
 const status = document.getElementById("tabernetes-status");
 const nodes = document.createElement("span");
@@ -36,6 +37,7 @@ const cluster = el.dataset.cluster
   : null;
 startTerminal(el, {
   cluster,
+  pods,
   wasmURL: el.dataset.wasm,
   workerURL: el.dataset.worker,
   wasmSize: Number(el.dataset.size) || 0,

@@ -225,16 +225,13 @@ func attachChannel(dc js.Value) {
 }
 
 // attach connects a connection that the other side opened to its target:
-// "api" tunnels to the kube-apiserver, "kubelet" to the kubelet API of this
-// tab (tabkubelet.go).
+// "api" tunnels to the kube-apiserver.
 func attach(conn io.ReadWriteCloser, label string) {
 	go func() {
 		var target string
 		switch label {
 		case "api":
 			target = "127.0.0.1:6443"
-		case "kubelet", "kubelet:10250":
-			target = tabNodeIP + ":10250"
 		default:
 			fmt.Fprintln(os.Stderr, "tabernetes: unknown connection", label)
 			conn.Close()

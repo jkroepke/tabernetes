@@ -1,6 +1,7 @@
 // The tab side of the shared control plane (cluster.js, k8s/tabernetes/tabs.go).
 // connectCluster returns null where the browser has no SharedWorker or no Web
 // Locks: the tab then runs the control plane itself.
+import { tabSession } from "./bridge.js";
 
 export async function connectCluster(url, tries = 0) {
   if (typeof SharedWorker !== "function" || !navigator.locks?.request) return null;
@@ -32,6 +33,10 @@ export async function connectCluster(url, tries = 0) {
   port.onmessage = ({ data }) => {
     switch (data.type) {
       case "hello": hello(data); break;
+      case "forwards":
+        // the ports of kubectl port-forward (proxy.js)
+        globalThis.tabernetesForwards?.(data.list);
+        break;
       case "status": case "failed": case "exited": case "mesh":
         if (data.type === "failed" || data.type === "exited") {
           // The worker closes in a moment: nothing answers a call anymore.
@@ -48,17 +53,13 @@ export async function connectCluster(url, tries = 0) {
         data.error ? call.reject(new Error(data.error)) : call.resolve(data.result);
         break;
       }
-      case "connect":
-        if (data.dc !== undefined) {
-          // The kube-apiserver to the kubelet of a docker node: a data channel.
-          const openDC = dataChannels.get(data.dc);
-          if (!openDC) { data.port.postMessage(null); break; }
-          openDC(data.label).then((dc) => pipe(dc, data.port), () => data.port.postMessage(null));
-        } else {
-          // The kube-apiserver to the kubelet of this tab.
-          globalThis.tabernetes.attachPort(data.port, data.label);
-        }
+      case "connect": {
+        // The kube-apiserver to the kubelet of a docker node: a data channel.
+        const openDC = dataChannels.get(data.dc);
+        if (!openDC) { data.port.postMessage(null); break; }
+        openDC(data.label).then((dc) => pipe(dc, data.port), () => data.port.postMessage(null));
         break;
+      }
     }
   };
   port.start();
@@ -96,6 +97,18 @@ export async function connectCluster(url, tries = 0) {
       } catch (e) {
         port.postMessage({ type: "chunk", error: String(e?.message || e) });
       }
+    },
+    // openSession opens the session of this tab in the worker: its shell,
+    // kubectl and its node (bridge.js). cfg says what the tab can run (the
+    // VMs and models of its pods), status gets the status lines of the
+    // session. It resolves to {session, name, ip, forwards} once the control
+    // plane is ready.
+    async openSession(cfg, status) {
+      const ch = new MessageChannel();
+      port.postMessage({ type: "session", port: ch.port2 }, [ch.port2]);
+      const session = tabSession(ch.port1, { status });
+      const info = await this.rpc("joinTab", cfg);
+      return { session, ...info };
     },
     // ended: the last lines of the logs of a control plane that is gone.
     get ended() { return ended; },

@@ -37,6 +37,7 @@ type viState struct {
 }
 
 type vi struct {
+	tty       *terminal
 	path      string
 	lines     [][]rune
 	cy, cx    int
@@ -64,15 +65,15 @@ func viCmd(ctx context.Context, hc interp.HandlerContext, args []string, _ inter
 	if len(args) == 1 {
 		path = abs(hc, args[0])
 	}
-	if err := runVi(ctx, path); err != nil {
+	if err := runVi(ctx, termFrom(ctx), path); err != nil {
 		return fail(hc, 1, "vi: %v", err)
 	}
 	return nil
 }
 
 // runVi edits path until the user quits.
-func runVi(ctx context.Context, path string) error {
-	e := &vi{path: path, lines: [][]rune{{}}}
+func runVi(ctx context.Context, tty *terminal, path string) error {
+	e := &vi{tty: tty, path: path, lines: [][]rune{{}}}
 	if path != "" {
 		b, err := os.ReadFile(path)
 		switch {
@@ -122,7 +123,7 @@ func runVi(ctx context.Context, path string) error {
 // ---- drawing ----
 
 func (e *vi) draw() {
-	cols, rows := tty.size()
+	cols, rows := e.tty.size()
 	h := rows - 1
 	if e.cy < e.top {
 		e.top = e.cy
@@ -179,7 +180,7 @@ func (e *vi) draw() {
 		shape = "\x1b[6 q" // bar
 	}
 	fmt.Fprintf(&b, "\x1b[%d;%dH%s\x1b[?25h", cursorRow, cursorCol, shape)
-	io.WriteString(tty, b.String())
+	io.WriteString(e.tty, b.String())
 }
 
 func stripANSI(s string) string {
@@ -629,7 +630,7 @@ func (e *vi) normalKey(k key) {
 	n := max(e.count, 1)
 	hadCount := e.count > 0
 	e.count = 0
-	_, rows := tty.size()
+	_, rows := e.tty.size()
 	page := max(1, rows-2)
 
 	switch k.name {
@@ -899,7 +900,11 @@ func init() {
 	editor.InProcess = func(args []string) error {
 		switch filepath.Base(args[0]) {
 		case "vi", "vim":
-			return runVi(context.Background(), args[len(args)-1])
+			t := editTerm.Load()
+			if t == nil {
+				return errors.New("unable to launch the editor: no terminal")
+			}
+			return runVi(context.Background(), t, args[len(args)-1])
 		}
 		return fmt.Errorf("unable to launch the editor %q: only vi works in the browser", strings.Join(args[:len(args)-1], " "))
 	}

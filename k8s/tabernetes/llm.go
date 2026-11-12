@@ -65,7 +65,11 @@ func llmCmd(ctx context.Context, hc interp.HandlerContext, args []string) error 
 		fmt.Fprintf(hc.Stderr, "llm: "+format+"\n", a...)
 		return interp.ExitStatus(1)
 	}
-	n, err := startTabNode(ctx)
+	sess := sessionFrom(ctx)
+	if sess == nil {
+		return fail("no tab")
+	}
+	n, err := sess.startNode(ctx)
 	if err != nil {
 		return fail("%v", err)
 	}
@@ -88,7 +92,7 @@ func llmCmd(ctx context.Context, hc interp.HandlerContext, args []string) error 
 			model = strings.Replace(model, "q4f16_1", "q4f32_1", 1)
 		}
 	}
-	manifest := fmt.Sprintf(llmManifest, tabNodeName, model)
+	manifest := fmt.Sprintf(llmManifest, n.name, model)
 	if code := runKubectl(ctx, []string{"apply", "-f", "-"}, strings.NewReader(manifest), hc.Stdout, hc.Stderr); code != 0 {
 		return exitCode(code)
 	}

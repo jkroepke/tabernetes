@@ -1,11 +1,14 @@
-// Browser terminal for Tabernetes: boots the control plane and runs a shell.
-// The shell (mvdan.cc/sh) and kubectl live in the wasm binary. This file
-// only does the line editing and the builtins that need the browser.
+// Browser terminal for Tabernetes: boots the control plane, or joins the one
+// in the shared worker, and runs a shell. The shell (mvdan.cc/sh) and
+// kubectl live in the wasm binary, in the shared worker or in this tab. This
+// file only does the line editing and the builtins that need the browser.
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { installFS } from "./fs.js";
 import { clusterState, loadHome, saveHome, forget, sweepLayers, keepStorage } from "./state.js";
 import { zstdFrames, instantiate, runGo } from "./wasm.js";
+import { vmAPI } from "./vm.js";
+import { gpuAPI } from "./gpu.js";
 
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
 
@@ -41,162 +44,51 @@ export async function startTerminal(el, opts) {
   }
   new ResizeObserver(() => fit.fit()).observe(el);
 
-  const logs = [];
-  globalThis.tabernetesLogs = logs;
-  // A crash trace is kept apart from the rotating log buffer, which would drop
-  // its beginning while the runtime prints thousands of goroutines.
-  const crash = [];
-  globalThis.tabernetesCrash = crash;
-  let crashing = false;
-  // The files of /root from the last visit (state.js).
-  const home = { records: await loadHome(), save: saveHome };
-  // The images that forget left to the pods that still ran with them.
-  sweepLayers().catch(() => {});
-  installFS((fd, s) => {
-    if (crashing || /^(panic:|fatal error:)/m.test(s)) {
-      crashing = true;
-      console.error(s);
-      if (crash.length < 2000) crash.push(s);
-    }
-    // Control plane logs: visible with the "Verbose" level in the DevTools console.
-    else console.debug(s.replace(/\n$/, ""));
-    // Expected in a single-threaded control plane: a controller found its
-    // informer a few versions behind its own write and retries. Kept in the
-    // console, left out of "logs".
-    if (s.includes("is not as new as written version")) return;
-    logs.push(s);
-    if (logs.length > 5000) logs.splice(0, logs.length - 5000);
-  }, home);
-
   term.writeln("\x1b[1mTabernetes\x1b[0m: a real Kubernetes control plane, compiled to WebAssembly, running in your browser.");
   term.writeln(DIM("kube-apiserver, kube-controller-manager, kube-scheduler and kubectl are the upstream"));
   term.writeln(DIM("components. etcd is replaced by a tiny in-memory implementation. All of it runs in this browser, not on a server."));
   term.writeln(DIM("The browser keeps the cluster and your files in ~ for the next visit; forget deletes them."));
   term.writeln("");
 
-  // ---- download + boot ----
-  // Download, decompression (in a worker) and compilation run at the same time.
   const t0 = performance.now();
   const since = () => ((performance.now() - t0) / 1000).toFixed(1).padStart(5);
   globalThis.tabernetesStatus = (s) => term.writeln(`${DIM(`[${since()}s]`)} ${s}`);
-  // With a shared worker, the control plane runs there and this tab joins it
-  // as a node (tabs.js). The worker reports how far it is.
+  // The images that forget left to the pods that still ran with them.
+  sweepLayers().catch(() => {});
+  // With a shared worker, the control plane runs there, and so do the shell,
+  // kubectl and the kubelet of this tab (tabs.js, bridge.js): the tab needs
+  // no Go. Without one, the tab runs all of it itself.
   const cluster = opts.cluster;
-  // Without a shared worker the control plane of this tab keeps the cluster.
-  const saved = cluster ? null : clusterState();
-  if (saved) globalThis.tabernetesState = saved;
-  let ended = false; // the worker said why already
-  if (cluster) {
-    // Another tab started the control plane: its boot steps are old news.
-    if (cluster.state === "ready") globalThis.tabernetesStatus("the control plane runs in a shared worker that another tab started");
-    else for (const s of cluster.status) globalThis.tabernetesStatus(s);
-    cluster.on("status", ({ text }) => globalThis.tabernetesStatus(text));
-    // The worker ends after both, so that a reload boots a new control plane
-    // even while other tabs are still open.
-    const again = () => { ended = true; term.writeln(DIM("Reload the page to start the control plane again.")); };
-    cluster.on("failed", ({ error }) => {
-      term.writeln(`\r\n\x1b[31mthe control plane did not start: ${error}\x1b[0m`);
-      again();
-    });
-    cluster.on("exited", ({ why, crash: trace }) => {
-      term.writeln(`\r\n\x1b[31mthe control plane exited${why ? `: ${why}` : ""}\x1b[0m`);
-      if (trace) {
-        crash.push(trace);
-        // The first lines name the cause and the crashing goroutine.
-        term.writeln(trace.split("\n").slice(0, 30).join("\n"));
-        term.writeln(DIM("The full trace is in tabernetesCrash in the DevTools console."));
-      }
-      again();
-    });
-  }
-  const dl = await download(opts.wasmURL);
-  const { body, cached } = dl;
-  // The page knows the exact size of the file (data-size), the header only maybe.
-  const total = opts.wasmSize || dl.total;
-  let loaded = 0;
-  // The line must fit into one row: once it wraps, \r only returns to the
-  // start of the last row and every update adds a new line.
-  const progress = (n, t) => {
-    const mb = `${(n / 1048576).toFixed(1)}${t ? "/" + (t / 1048576).toFixed(1) : ""} MB`;
-    let what = cached ? "compiling from the browser cache" : "downloading and compiling";
-    const room = () => term.cols - 1 - what.length - mb.length - 4; // spaces and brackets
-    if (room() < 10) what = cached ? "compiling" : "downloading";
-    const w = Math.max(0, Math.min(30, room()));
-    const f = t ? Math.min(w, Math.round((n / t) * w)) : 0;
-    const line = `${DIM(what)} ${w ? `[${"#".repeat(f)}${" ".repeat(w - f)}] ` : ""}${mb}`;
-    return `\r\x1b[K${line}`;
-  };
-  const counted = body.pipeThrough(new TransformStream({
-    transform(chunk, ctl) {
-      loaded += chunk.length;
-      term.write(progress(loaded, total));
-      ctl.enqueue(chunk);
-    },
-  }));
-  const go = new globalThis.Go();
-  go.env = { HOME: "/root", USER: "root", PATH: "/usr/bin" };
-  let unpacked = unpack(opts.wasmURL, counted, total, opts.workerURL);
-  if (cluster?.needBinary) {
-    // The first tab: the worker compiles the same binary for the control
-    // plane. It gets the unpacked bytes: a shared worker cannot start
-    // workers, so it would unpack the frames one after the other (~1.5 s).
-    const [mine, theirs] = unpacked.tee();
-    unpacked = mine;
-    cluster.sendBinary(theirs);
-  }
-  const instance = await instantiate(unpacked, go);
-  term.writeln("");
-  globalThis.tabernetesStatus(cached ? "compiled WebAssembly from the browser cache" : "downloaded and compiled WebAssembly");
-  // The "free" command reads the size of the linear memory from here.
-  globalThis.tabernetesMemory = instance.exports.mem;
-  let booted = false;
-  const exited = (why) => {
-    // A saved cluster that crashes the control plane while it boots would
-    // do so after every reload: the next one starts a new cluster.
-    if (!booted) saved?.drop();
-    term.writeln(`\r\n\x1b[31m${cluster ? "this tab" : "the control plane"} exited${why ? `: ${why}` : ""}\x1b[0m`);
-    if (crash.length) {
-      // The first lines name the cause and the crashing goroutine.
-      term.writeln(crash.join("").split("\n").slice(0, 30).join("\n"));
-      term.writeln(DIM("The full trace is in tabernetesCrash in the DevTools console."));
-    }
-  };
-  if (cluster) {
-    // This tab: shell, kubectl and the kubelet of its node (k8s/tabernetes/tabs.go).
-    let info;
-    try {
-      info = await cluster.rpc("joinTab");
-    } catch (e) {
-      if (!ended) term.writeln(`\r\n\x1b[31mthe cluster did not start: ${e.message}\x1b[0m`);
-      return { term };
-    }
-    globalThis.tabernetesRole = "tab";
-    globalThis.tabernetesCluster = { info, open: (label) => cluster.open(label) };
-  }
-  runGo(go, instance).then(() => exited(), (e) => exited(e?.message ?? String(e)));
-  try {
-    await globalThis.tabernetes.ready;
-    booted = true;
-    keepStorage();
-  } catch (e) {
-    // A saved cluster that does not boot would not boot after a reload either.
-    await saved?.drop();
-    term.writeln(`\r\n\x1b[31mthe cluster did not start: ${e.message}\x1b[0m`);
-    term.writeln(DIM("The control plane logs are in tabernetesLogs in the DevTools console. Reload to try again."));
-    return { term };
-  }
+  const logs = [];
+  const crash = [];
+  globalThis.tabernetesCrash = crash;
+  const started = cluster ? joinCluster(term, cluster, opts, crash) : bootHere(term, opts, logs, crash);
+  const joined = await started.catch((e) => {
+    if (e) term.writeln(`\r\n\x1b[31mthe cluster did not start: ${e.message}\x1b[0m`);
+    return null;
+  });
+  if (!joined) return { term };
+  const { session } = joined;
+  globalThis.tabernetesNode = joined.name;
+  keepStorage();
+  // tabernetes.shell for tests and the DevTools console, as before.
+  globalThis.tabernetes ??= {};
+  globalThis.tabernetes.shell = (src, write, fns) => session.shell(src, write, fns);
+  globalThis.tabernetesSession = session;
   term.writeln("");
   term.writeln(`Try ${"\x1b[1m"}k version${"\x1b[0m"}, ${"\x1b[1m"}join${"\x1b[0m"}, ${"\x1b[1m"}doom${"\x1b[0m"}, ${"\x1b[1m"}llm${"\x1b[0m"} or ${"\x1b[1m"}help${"\x1b[0m"}.`);
 
   // ---- shell ----
-  globalThis.tabernetes.resize(term.cols, term.rows);
-  term.onResize(({ cols, rows }) => globalThis.tabernetes.resize(cols, rows));
+  session.resize(term.cols, term.rows);
+  term.onResize(({ cols, rows }) => session.resize(cols, rows));
+  // The working directory for the prompt, after every command line.
+  let cwd = await session.cwd();
   const history = [];
   let hpos = 0, line = "", cursor = 0, busy = false, pending = "";
   let search = null; // { query, at, failed, saved: [line, cursor] }
 
   const builtins = {
-    help(args, { write }) {
+    async help(args, { write }) {
       // Wrap a list of names to the terminal width, indented.
       const list = (names) => {
         const out = [];
@@ -207,7 +99,7 @@ export async function startTerminal(el, opts) {
         }
         return [...out, row];
       };
-      const { tools, builtins: shell } = globalThis.tabernetes.commands();
+      const { tools, builtins: shell } = await session.commands();
       const terminal = Object.keys(builtins).filter((n) => n !== "help").sort();
       write([
         "A POSIX shell (mvdan.cc/sh) inside the wasm binary: pipes, variables, loops,",
@@ -315,12 +207,13 @@ export async function startTerminal(el, opts) {
   }]));
 
   // exec runs a command line in the shell and resolves to its exit status.
-  const exec = (src) => globalThis.tabernetes.shell(src, (s) => term.write(s), shellBuiltins);
+  const exec = (src) => Promise.resolve(session.shell(src, (s) => term.write(s), shellBuiltins))
+    .finally(async () => { cwd = await session.cwd(); });
 
   const prompt = () => {
     if (search) return `(${search.failed ? "failed " : ""}reverse-i-search)\`${search.query}': `;
     if (pending) return "> ";
-    const dir = globalThis.tabernetes.cwd().replace(/^\/root(?=\/|$)/, "~");
+    const dir = cwd.replace(/^\/root(?=\/|$)/, "~");
     return `\x1b[1;34mjkroepke.de\x1b[0m:\x1b[1;32m${dir}\x1b[0m$ `;
   };
   // redraw renders prompt and line, also when the line wraps over several rows.
@@ -346,7 +239,7 @@ export async function startTerminal(el, opts) {
     hpos = history.length;
     const src = pending ? pending + "\n" + input : input;
     // Open quotes, here-documents, loops without "done": read more lines.
-    if (globalThis.tabernetes.incomplete(src)) {
+    if (await session.incomplete(src)) {
       pending = src;
       redraw();
       return;
@@ -372,13 +265,15 @@ export async function startTerminal(el, opts) {
     // Keys typed while a completion is running wait for it.
     if (completing) { queued += data; return; }
     if (!busy) return feed(data);
-    // A full screen program (vi, kubectl edit) gets every key.
-    if (globalThis.tabernetes.rawMode()) return globalThis.tabernetes.input(data);
-    if (data === "\x03") {
+    // A full screen program (vi, kubectl edit) gets every key. Else Ctrl-C
+    // cancels the command line.
+    const id = run;
+    Promise.resolve(session.key(data)).then((raw) => {
+      if (raw || data !== "\x03" || !busy || id !== run) return;
       run++;
-      globalThis.tabernetes.cancel();
+      session.cancel();
       term.write("^C\r\n");
-    }
+    });
   });
   // edit applies a change to the line and redraws it.
   const edit = (newLine, newCursor) => { line = newLine; cursor = newCursor; redraw(); };
@@ -453,7 +348,7 @@ export async function startTerminal(el, opts) {
   async function complete() {
     completing = true;
     try {
-      const { word, items, noSpace } = await globalThis.tabernetes.complete(line.slice(0, cursor), Object.keys(shellBuiltins));
+      const { word, items, noSpace } = await session.complete(line.slice(0, cursor), Object.keys(shellBuiltins));
       if (!items.length) return term.write("\x07");
       let insert = items[0];
       if (items.length === 1) insert += noSpace ? "" : " ";
@@ -531,6 +426,154 @@ export async function startTerminal(el, opts) {
   }
   term.focus();
   return { term, exec };
+}
+
+// joinCluster joins the control plane in the shared worker: the session of
+// this tab runs there (bridge.js). The first tab downloads the binary for
+// the worker, which cannot start the workers that unpack it. It rejects
+// with null when the worker has said why already.
+async function joinCluster(term, cluster, opts, crash) {
+  let ended = false;
+  // Another tab started the control plane: its boot steps are old news.
+  if (cluster.state === "ready") globalThis.tabernetesStatus("the control plane runs in a shared worker that another tab started");
+  else for (const s of cluster.status) globalThis.tabernetesStatus(s);
+  cluster.on("status", ({ text }) => globalThis.tabernetesStatus(text));
+  // The worker ends after both, so that a reload boots a new control plane
+  // even while other tabs are still open.
+  const again = () => { ended = true; term.writeln(DIM("Reload the page to start the control plane again.")); };
+  cluster.on("failed", ({ error }) => {
+    term.writeln(`\r\n\x1b[31mthe control plane did not start: ${error}\x1b[0m`);
+    again();
+  });
+  cluster.on("exited", ({ why, crash: trace }) => {
+    term.writeln(`\r\n\x1b[31mthe control plane exited${why ? `: ${why}` : ""}\x1b[0m`);
+    if (trace) {
+      crash.push(trace);
+      // The first lines name the cause and the crashing goroutine.
+      term.writeln(trace.split("\n").slice(0, 30).join("\n"));
+      term.writeln(DIM("The full trace is in tabernetesCrash in the DevTools console."));
+    }
+    again();
+  });
+  if (cluster.needBinary) {
+    // The worker compiles it while it arrives.
+    const { stream, cached } = await fetchBinary(term, opts);
+    cluster.sendBinary(stream).then(() => {
+      term.writeln("");
+      globalThis.tabernetesStatus(cached ? "read WebAssembly from the browser cache" : "downloaded WebAssembly");
+    });
+  }
+  let joined;
+  try {
+    joined = await cluster.openSession(opts.pods, (s) => globalThis.tabernetesStatus(s));
+  } catch (e) {
+    throw ended ? null : e;
+  }
+  // proxy.js and vnc.js reach localhost of the Go through the session.
+  globalThis.tabernetes = { proxy: joined.session.proxy, dial: joined.session.dial };
+  if (joined.forwards?.length) globalThis.tabernetesForwards?.(joined.forwards);
+  return joined;
+}
+
+// bootHere runs the control plane in this tab, where the browser has no
+// shared worker, and opens the session of the tab on it.
+async function bootHere(term, opts, logs, crash) {
+  // The control plane of this tab keeps the cluster.
+  const saved = clusterState();
+  globalThis.tabernetesState = saved;
+  globalThis.tabernetesLogs = logs;
+  // A crash trace is kept apart from the rotating log buffer, which would drop
+  // its beginning while the runtime prints thousands of goroutines.
+  let crashing = false;
+  // The files of /root from the last visit (state.js).
+  const home = { records: await loadHome(), save: saveHome };
+  installFS((fd, s) => {
+    if (crashing || /^(panic:|fatal error:)/m.test(s)) {
+      crashing = true;
+      console.error(s);
+      if (crash.length < 2000) crash.push(s);
+    }
+    // Control plane logs: visible with the "Verbose" level in the DevTools console.
+    else console.debug(s.replace(/\n$/, ""));
+    // Expected in a single-threaded control plane: a controller found its
+    // informer a few versions behind its own write and retries. Kept in the
+    // console, left out of "logs".
+    if (s.includes("is not as new as written version")) return;
+    logs.push(s);
+    if (logs.length > 5000) logs.splice(0, logs.length - 5000);
+  }, home);
+
+  const { stream, cached } = await fetchBinary(term, opts);
+  const go = new globalThis.Go();
+  go.env = { HOME: "/root", USER: "root", PATH: "/usr/bin" };
+  const instance = await instantiate(stream, go);
+  term.writeln("");
+  globalThis.tabernetesStatus(cached ? "compiled WebAssembly from the browser cache" : "downloaded and compiled WebAssembly");
+  // The "free" command reads the size of the linear memory from here.
+  globalThis.tabernetesMemory = instance.exports.mem;
+  let booted = false;
+  runGo(go, instance).then(() => exited(), (e) => exited(e?.message ?? String(e)));
+  function exited(why) {
+    // A saved cluster that crashes the control plane while it boots would
+    // do so after every reload: the next one starts a new cluster.
+    if (!booted) saved.drop();
+    term.writeln(`\r\n\x1b[31mthe control plane exited${why ? `: ${why}` : ""}\x1b[0m`);
+    if (crash.length) {
+      // The first lines name the cause and the crashing goroutine.
+      term.writeln(crash.join("").split("\n").slice(0, 30).join("\n"));
+      term.writeln(DIM("The full trace is in tabernetesCrash in the DevTools console."));
+    }
+  }
+  try {
+    await globalThis.tabernetes.ready;
+    booted = true;
+  } catch (e) {
+    // A saved cluster that does not boot would not boot after a reload either.
+    await saved.drop();
+    term.writeln(`\r\n\x1b[31mthe cluster did not start: ${e.message}\x1b[0m`);
+    term.writeln(DIM("The control plane logs are in tabernetesLogs in the DevTools console. Reload to try again."));
+    throw null;
+  }
+  // The node of this tab runs its pods in workers of this tab.
+  const p = opts.pods || {};
+  const host = {
+    status: (s) => globalThis.tabernetesStatus(s),
+    vm: p.vm ? vmAPI(p.vm) : undefined,
+    gpu: p.gpu ? gpuAPI(p.gpu) : undefined,
+  };
+  const session = await globalThis.tabernetes.openTab(host);
+  return { session, name: session.name, ip: session.ip };
+}
+
+// fetchBinary downloads the binary, or reads it from the Cache Storage, and
+// unpacks it. The progress goes to the terminal.
+async function fetchBinary(term, opts) {
+  // Download, decompression (in a worker) and compilation run at the same time.
+  const dl = await download(opts.wasmURL);
+  const { body, cached } = dl;
+  // The page knows the exact size of the file (data-size), the header only maybe.
+  const total = opts.wasmSize || dl.total;
+  let loaded = 0;
+  // The line must fit into one row: once it wraps, \r only returns to the
+  // start of the last row and every update adds a new line.
+  const progress = (n, t) => {
+    const mb = `${(n / 1048576).toFixed(1)}${t ? "/" + (t / 1048576).toFixed(1) : ""} MB`;
+    let what = cached ? "compiling from the browser cache" : "downloading and compiling";
+    const room = () => term.cols - 1 - what.length - mb.length - 4; // spaces and brackets
+    if (room() < 10) what = cached ? "compiling" : "downloading";
+    const w = Math.max(0, Math.min(30, room()));
+    const f = t ? Math.min(w, Math.round((n / t) * w)) : 0;
+    const line = `${DIM(what)} ${w ? `[${"#".repeat(f)}${" ".repeat(w - f)}] ` : ""}${mb}`;
+    return `\r\x1b[K${line}`;
+  };
+  const counted = body.pipeThrough(new TransformStream({
+    transform(chunk, ctl) {
+      loaded += chunk.length;
+      term.write(progress(loaded, total));
+      ctl.enqueue(chunk);
+    },
+  }));
+  return { stream: unpack(opts.wasmURL, counted, total, opts.workerURL), cached };
 }
 
 // escape returns the escape sequence at the start of s: CSI (ESC [ params

@@ -14,6 +14,8 @@ import (
 
 // Background jobs, such as "k port-forward deploy/web 8080:80 &".
 //
+// Every tab has its own jobs (session.go).
+//
 // mvdan.cc/sh hands a job the context of its command line, and that context
 // ends with the line, so every job would stop right away. k8s/patch.go adds
 // the hook interp.BackgroundContext, and a job gets its own context here:
@@ -30,9 +32,14 @@ type jobTable struct {
 	list []*job // by id
 }
 
-var jobs jobTable
-
-func init() { interp.BackgroundContext = jobs.start }
+func init() {
+	interp.BackgroundContext = func(ctx context.Context, stmt *syntax.Stmt) (context.Context, func()) {
+		if s := sessionFrom(ctx); s != nil {
+			return s.jobs.start(ctx, stmt)
+		}
+		return ctx, func() {}
+	}
+}
 
 // start registers a job and returns its context and the func the shell calls
 // when the job ends.
@@ -47,7 +54,7 @@ func (t *jobTable) start(ctx context.Context, stmt *syntax.Stmt) (context.Contex
 	}
 	t.list = append(t.list, j)
 	t.mu.Unlock()
-	fmt.Fprintf(holdWriter{tty}, "[%d] %s\n", j.id, j.cmd)
+	fmt.Fprintf(holdWriter{termFrom(ctx)}, "[%d] %s\n", j.id, j.cmd)
 	return ctx, func() { t.stop(j) }
 }
 
@@ -90,10 +97,10 @@ func (t *jobTable) find(spec string) *job {
 	return nil
 }
 
-func jobsCmd(hc interp.HandlerContext) error {
-	jobs.mu.Lock()
-	defer jobs.mu.Unlock()
-	for _, j := range jobs.list {
+func (t *jobTable) jobsCmd(hc interp.HandlerContext) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, j := range t.list {
 		fmt.Fprintf(hc.Stdout, "[%d]  Running  %s\n", j.id, j.cmd)
 	}
 	return nil
@@ -101,7 +108,7 @@ func jobsCmd(hc interp.HandlerContext) error {
 
 // killCmd ends jobs. Signals do not exist here, so "-9" and the like are
 // accepted and ignored.
-func killCmd(hc interp.HandlerContext, args []string) error {
+func (t *jobTable) killCmd(hc interp.HandlerContext, args []string) error {
 	var specs []string
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; {
@@ -118,13 +125,13 @@ func killCmd(hc interp.HandlerContext, args []string) error {
 	}
 	code := 0
 	for _, spec := range specs {
-		j := jobs.find(spec)
+		j := t.find(spec)
 		if j == nil {
 			fmt.Fprintf(hc.Stderr, "kill: %s: no such job (see jobs)\n", spec)
 			code = 1
 			continue
 		}
-		jobs.stop(j)
+		t.stop(j)
 	}
 	return exitCode(code)
 }

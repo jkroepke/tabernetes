@@ -6,11 +6,10 @@ import (
 	"sync/atomic"
 )
 
-// tty is the terminal for full screen programs (vi, kubectl edit). Normally
-// the browser does the line editing and the shell gets complete lines. In raw
-// mode every key goes straight to the running program instead.
-var tty = &terminal{keys: make(chan string, 256)}
-
+// terminal is the terminal of a tab for full screen programs (vi, kubectl
+// edit). Normally the browser does the line editing and the shell gets
+// complete lines. In raw mode every key goes straight to the running program
+// instead. Every session (session.go) has one.
 type terminal struct {
 	mu   sync.Mutex
 	out  io.Writer // the terminal itself, also when stdout is redirected
@@ -20,6 +19,8 @@ type terminal struct {
 	cols atomic.Int32
 	rows atomic.Int32
 }
+
+func newTerminal() *terminal { return &terminal{keys: make(chan string, 256)} }
 
 // resizeKey is sent to a raw mode program when the terminal changes size.
 const resizeKey = "\x00resize"

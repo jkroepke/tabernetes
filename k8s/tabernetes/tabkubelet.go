@@ -21,8 +21,8 @@ import (
 
 // The kubelet API of the tab node, as far as kubectl uses it: logs, exec,
 // port-forward and, for container images, attach. The apiserver reaches it on
-// tabNodeIP:10250 in the in-process network, or from the shared worker
-// through a MessagePort (tabs.go). It does not check the client: only the
+// <node IP>:10250 in the in-process network: the kubelet runs in the same Go
+// as the control plane, in the shared worker or in the tab. It does not check the client: only the
 // apiserver gets there.
 
 const (
@@ -31,12 +31,12 @@ const (
 )
 
 func (n *tabNode) serveKubelet() (func(), error) {
-	n.ca.issue("tab-kubelet", tabNodeName, nil, true, []string{tabNodeName}, []net.IP{net.ParseIP(tabNodeIP)})
-	cert, err := tls.LoadX509KeyPair(p("tab-kubelet.crt"), p("tab-kubelet.key"))
+	n.ca.issue(n.name+"-kubelet", n.name, nil, true, []string{n.name}, []net.IP{net.ParseIP(n.ip)})
+	cert, err := tls.LoadX509KeyPair(p(n.name+"-kubelet.crt"), p(n.name+"-kubelet.key"))
 	if err != nil {
 		return nil, err
 	}
-	l, err := net.Listen("tcp", tabNodeIP+":10250")
+	l, err := net.Listen("tcp", n.ip+":10250")
 	if err != nil {
 		return nil, err
 	}

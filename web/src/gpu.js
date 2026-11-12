@@ -1,12 +1,15 @@
 // The GPU side of the tab node (k8s/tabernetes/tabnode.go, webllm.go), as
-// globalThis.tabernetesGPU. Every webllm pod gets its own worker with WebLLM
+// host.gpu of the session of a tab. Every webllm pod gets its own worker with WebLLM
 // in it (gpuworker.js). Stopping the pod ends the worker, which frees the GPU
 // memory for sure.
 
-export function gpuAPI(workerURL) {
+// In the shared worker, spawn starts the worker in the tab and adapter asks
+// the tab (bridge.js).
+export function gpuAPI(workerURL, { spawn = (u) => new Worker(u), adapter } = {}) {
   return {
     // adapter resolves to null without WebGPU.
     async adapter() {
+      if (adapter) return adapter();
       if (!navigator.gpu) return null;
       const a = await navigator.gpu.requestAdapter().catch(() => null);
       if (!a) return null;
@@ -21,7 +24,7 @@ export function gpuAPI(workerURL) {
 
     // start loads model. onProgress gets a line about once a second.
     start(model, onProgress) {
-      const worker = new Worker(workerURL);
+      const worker = spawn(new URL(workerURL, location.href).href);
       const pending = new Map();
       let next = 1;
       let loaded, failed;

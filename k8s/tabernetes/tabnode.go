@@ -33,30 +33,19 @@ import (
 )
 
 // The tab node: the browser tab joins the cluster as the node "tab-1", or
-// tab-<n> next to other tabs (tabs.go). Its kubelet (this file,
-// tabkubelet.go) runs huggingface.co/mlc-ai/<model> as a language model on
-// the GPU with WebGPU (webllm.go; the page provides
-// globalThis.tabernetesGPU, web/src/gpu.js), and every other image as a container: the linux/386
-// variant of the image boots in v86, an x86 emulator (v86.go; the page
-// provides globalThis.tabernetesVM, web/src/vm.js).
+// tab-<n> next to other tabs (session.go). Its kubelet (this file,
+// tabkubelet.go) runs in the same Go as the control plane, in the shared
+// worker or in the tab. It runs huggingface.co/mlc-ai/<model> as a language
+// model on the GPU with WebGPU (webllm.go; the tab provides host.gpu,
+// web/src/gpu.js), and every other image as a container: the linux/386
+// variant of the image boots in v86, an x86 emulator (v86.go; the tab
+// provides host.vm, web/src/vm.js).
 //
 // The node has the taint tabernetes.dev/tab with PreferNoSchedule: a pod
 // goes to a node from join if there is one, and to the tab if not. Its label
 // kubernetes.io/os=browser keeps the DaemonSets (which select linux) away.
 // Its role label node-role.kubernetes.io/browser shows as ROLES browser in
 // kubectl get nodes.
-
-// The name and the address of this tab as a node. With the control plane in
-// a SharedWorker (tabs.go), every tab of the page is a node: tab-1, tab-2 and
-// so on, with 10.0.1.<n>. Joined nodes have 10.0.0.2 to .250 (tunnel.go).
-var (
-	tabNodeName = "tab-1"
-	tabNodeIP   = "10.0.1.1"
-	// leaseByCluster is set when the control plane renews the lease of this
-	// node for as long as the tab holds its Web Lock (tabs.go). Timers of a
-	// hidden tab may fire only once a minute, too late for a lease.
-	leaseByCluster bool
-)
 
 const (
 	tabTaint       = "tabernetes.dev/tab"
@@ -74,9 +63,9 @@ type gpuInfo struct {
 	f16                               bool
 }
 
-// gpuAdapter asks the page for a WebGPU adapter. It returns nil without one.
-func gpuAdapter(ctx context.Context) (*gpuInfo, error) {
-	gpu := js.Global().Get("tabernetesGPU")
+// gpuAdapter asks the tab for a WebGPU adapter. It returns nil without one.
+func gpuAdapter(ctx context.Context, host js.Value) (*gpuInfo, error) {
+	gpu := host.Get("gpu")
 	if gpu.Type() != js.TypeObject {
 		return nil, errors.New("this page has no GPU support")
 	}
@@ -101,44 +90,33 @@ func (g *gpuInfo) String() string {
 	return "unknown GPU"
 }
 
+// tabNode is the node of a tab. Every tab of the page is one: tab-1, tab-2
+// and so on, with 10.0.1.<n>. Joined nodes have 10.0.0.2 to .250 (tunnel.go).
 type tabNode struct {
-	cs      kubernetes.Interface
-	gpu     *gpuInfo
-	rec     record.EventRecorder
-	events  chan tabEvent
-	ca      *pki
-	podCIDR *net.IPNet
+	name, ip string
+	host     js.Value // of the session: vm, gpu
+	cs       kubernetes.Interface
+	gpu      *gpuInfo
+	rec      record.EventRecorder
+	events   chan tabEvent
+	ca       *pki
+	podCIDR  *net.IPNet
 
 	mu     sync.Mutex
 	pods   map[types.UID]*tabPod
 	nextIP int
+
+	stop     chan struct{} // closed when the tab is gone
+	shutdown func()        // the kubelet API and the event recorder
 }
 
-var (
-	tabOnce sync.Once
-	tab     *tabNode
-	tabErr  error
-)
-
-// startTabNode registers the tab as a node, once.
-func startTabNode(ctx context.Context) (*tabNode, error) {
-	tabOnce.Do(func() { tab, tabErr = newTabNode(ctx) })
-	if tabErr != nil {
-		// let the next call try again, for example after a reload of the GPU
-		err := tabErr
-		tabOnce = sync.Once{}
-		return nil, err
-	}
-	return tab, nil
-}
-
-func newTabNode(ctx context.Context) (*tabNode, error) {
+func newTabNode(ctx context.Context, name, ip string, host js.Value) (*tabNode, error) {
 	if current == nil {
 		return nil, errors.New("the cluster is not ready yet")
 	}
 	// Without WebGPU, the tab is a node without the resource
 	// tabernetes.dev/webgpu: it runs nothing, but it is there.
-	gpu, err := gpuAdapter(ctx)
+	gpu, err := gpuAdapter(ctx, host)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "tab node: no GPU:", err)
 		gpu = nil
@@ -155,12 +133,16 @@ func newTabNode(ctx context.Context) (*tabNode, error) {
 	b := record.NewBroadcaster(record.WithContext(context.Background()))
 	b.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: cs.CoreV1().Events("")})
 	n := &tabNode{
+		name:   name,
+		ip:     ip,
+		host:   host,
 		cs:     cs,
 		gpu:    gpu,
-		rec:    b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "kubelet", Host: tabNodeName}),
+		rec:    b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "kubelet", Host: name}),
 		ca:     current.ca,
 		pods:   map[types.UID]*tabPod{},
 		events: make(chan tabEvent, 256),
+		stop:   make(chan struct{}),
 	}
 	closeKubelet, err := n.serveKubelet()
 	if err != nil {
@@ -172,10 +154,28 @@ func newTabNode(ctx context.Context) (*tabNode, error) {
 		b.Shutdown()
 		return nil, err
 	}
+	n.shutdown = func() {
+		closeKubelet()
+		b.Shutdown()
+	}
 	go n.recordEvents()
 	go n.heartbeat()
 	n.watchPods()
 	return n, nil
+}
+
+// close stops the node of a tab that is gone: its informer, its heartbeat,
+// its kubelet API and its pods. The VMs of the pods ended with the tab.
+func (n *tabNode) close() {
+	close(n.stop)
+	n.shutdown()
+	n.mu.Lock()
+	pods := n.pods
+	n.pods = map[types.UID]*tabPod{}
+	n.mu.Unlock()
+	for _, tp := range pods {
+		go tp.stop("", "")
+	}
 }
 
 func (n *tabNode) node() *corev1.Node {
@@ -190,7 +190,7 @@ func (n *tabNode) node() *corev1.Node {
 		corev1.ResourcePods:   *resource.NewQuantity(8, resource.DecimalSI),
 		webgpuResource:        *resource.NewQuantity(0, resource.DecimalSI),
 	}
-	runtime := vmRuntime()
+	runtime := n.vmRuntime()
 	if n.gpu != nil {
 		capacity[webgpuResource] = *resource.NewQuantity(1, resource.DecimalSI)
 		if runtime == "" {
@@ -206,9 +206,9 @@ func (n *tabNode) node() *corev1.Node {
 	}
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: tabNodeName,
+			Name: n.name,
 			Labels: map[string]string{
-				"kubernetes.io/hostname":           tabNodeName,
+				"kubernetes.io/hostname":           n.name,
 				"node-role.kubernetes.io/browser":  "",
 				"kubernetes.io/os":                 "browser",
 				"kubernetes.io/arch":               "wasm",
@@ -229,8 +229,8 @@ func (n *tabNode) node() *corev1.Node {
 				cond(corev1.NodeReady, corev1.ConditionTrue, "KubeletReady", "the tab is open"),
 			},
 			Addresses: []corev1.NodeAddress{
-				{Type: corev1.NodeInternalIP, Address: tabNodeIP},
-				{Type: corev1.NodeHostName, Address: tabNodeName},
+				{Type: corev1.NodeInternalIP, Address: n.ip},
+				{Type: corev1.NodeHostName, Address: n.name},
 			},
 			DaemonEndpoints: corev1.NodeDaemonEndpoints{KubeletEndpoint: corev1.DaemonEndpoint{Port: 10250}},
 			NodeInfo: corev1.NodeSystemInfo{
@@ -269,10 +269,10 @@ func (n *tabNode) register(ctx context.Context) error {
 	want := n.node()
 	got, err := n.cs.CoreV1().Nodes().Create(ctx, want, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
-		got, err = n.cs.CoreV1().Nodes().Get(ctx, tabNodeName, metav1.GetOptions{})
+		got, err = n.cs.CoreV1().Nodes().Get(ctx, n.name, metav1.GetOptions{})
 	}
 	if err != nil {
-		return fmt.Errorf("registering node %s: %w", tabNodeName, err)
+		return fmt.Errorf("registering node %s: %w", n.name, err)
 	}
 	if err := n.updateStatus(ctx); err != nil {
 		return err
@@ -284,7 +284,7 @@ func (n *tabNode) register(ctx context.Context) error {
 			return errors.New("the node got no pod CIDR")
 		}
 		time.Sleep(100 * time.Millisecond)
-		if got, err = n.cs.CoreV1().Nodes().Get(ctx, tabNodeName, metav1.GetOptions{}); err != nil {
+		if got, err = n.cs.CoreV1().Nodes().Get(ctx, n.name, metav1.GetOptions{}); err != nil {
 			return err
 		}
 	}
@@ -294,7 +294,7 @@ func (n *tabNode) register(ctx context.Context) error {
 
 func (n *tabNode) updateStatus(ctx context.Context) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		node, err := n.cs.CoreV1().Nodes().Get(ctx, tabNodeName, metav1.GetOptions{})
+		node, err := n.cs.CoreV1().Nodes().Get(ctx, n.name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -318,21 +318,24 @@ func (n *tabNode) updateStatus(ctx context.Context) error {
 }
 
 // heartbeat renews the node lease and the status for as long as the tab is
-// open. A hidden tab gets fewer timers, the whole cluster slows down with it.
+// open. It runs where the control plane runs: in the shared worker, whose
+// timers do not slow down with a hidden tab, or in the tab itself.
 func (n *tabNode) heartbeat() {
 	ctx := context.Background()
 	for i := 0; ; i++ {
-		if !leaseByCluster {
-			if err := renewLease(ctx, n.cs, tabNodeName); err != nil {
-				fmt.Fprintln(os.Stderr, "tab node: lease:", err)
-			}
+		if err := renewLease(ctx, n.cs, n.name); err != nil && !apierrors.IsNotFound(err) {
+			fmt.Fprintln(os.Stderr, "tab node: lease:", err)
 		}
 		if i%30 == 29 {
 			if err := n.updateStatus(ctx); err != nil {
 				fmt.Fprintln(os.Stderr, "tab node: status:", err)
 			}
 		}
-		time.Sleep(tabHeartbeat)
+		select {
+		case <-n.stop:
+			return
+		case <-time.After(tabHeartbeat):
+		}
 	}
 }
 
@@ -371,7 +374,7 @@ func renewLease(ctx context.Context, cs kubernetes.Interface, name string) error
 // watchPods runs the pods the scheduler binds to the tab.
 func (n *tabNode) watchPods() {
 	f := informers.NewSharedInformerFactoryWithOptions(n.cs, 0, informers.WithTweakListOptions(func(o *metav1.ListOptions) {
-		o.FieldSelector = "spec.nodeName=" + tabNodeName
+		o.FieldSelector = "spec.nodeName=" + n.name
 	}))
 	inf := f.Core().V1().Pods().Informer()
 	inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -386,7 +389,7 @@ func (n *tabNode) watchPods() {
 			}
 		},
 	})
-	f.Start(make(chan struct{}))
+	f.Start(n.stop)
 }
 
 func (n *tabNode) sync(pod *corev1.Pod) {
@@ -558,7 +561,13 @@ func (n *tabNode) event(ref *corev1.ObjectReference, typ, reason, message string
 // the same name, and the second one would be lost.
 func (n *tabNode) recordEvents() {
 	var last time.Time
-	for e := range n.events {
+	for {
+		var e tabEvent
+		select {
+		case e = <-n.events:
+		case <-n.stop:
+			return
+		}
 		for !time.Now().Truncate(time.Millisecond).After(last) {
 			time.Sleep(time.Millisecond)
 		}
