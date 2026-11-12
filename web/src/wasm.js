@@ -42,12 +42,50 @@ function frameEnd(b) {
   return p <= b.length ? p : 0;
 }
 
-// instantiate compiles while the bytes still arrive.
-export async function instantiate(stream, imports) {
+// instantiate compiles while the bytes still arrive. go is the Go of
+// wasm_exec.js that will run the instance; a binary with a snapshot of the
+// heap after init (k8s/snapshot.mjs) puts its description on go.snapshot.
+export async function instantiate(stream, go) {
+  let result;
   if (WebAssembly.instantiateStreaming) {
     const resp = new Response(stream, { headers: { "Content-Type": "application/wasm" } });
-    return (await WebAssembly.instantiateStreaming(resp, imports)).instance;
+    result = await WebAssembly.instantiateStreaming(resp, go.importObject);
+  } else {
+    const bytes = await new Response(stream).arrayBuffer();
+    result = await WebAssembly.instantiate(bytes, go.importObject);
   }
-  const bytes = await new Response(stream).arrayBuffer();
-  return (await WebAssembly.instantiate(bytes, imports)).instance;
+  const [sec] = WebAssembly.Module.customSections(result.module, "tabernetes.snapshot");
+  if (sec) go.snapshot = JSON.parse(new TextDecoder().decode(sec));
+  return result.instance;
+}
+
+// runGo runs the Go program like go.run(instance). With a snapshot, the
+// memory and the globals of the instance already are those of the program
+// paused in main: this sets up the JavaScript side of wasm_exec.js as
+// go.run would have left it at that point, and resumes the program.
+export async function runGo(go, instance) {
+  const s = go.snapshot;
+  if (!s) return go.run(instance);
+  // Go read these during init and keeps what it read.
+  if (JSON.stringify(go.env) !== JSON.stringify(s.env)) throw new Error("the environment differs from the snapshot");
+  if (JSON.stringify(globalThis.fs?.constants) !== s.constants) throw new Error("fs.constants differ from the snapshot");
+  go._inst = instance;
+  go.mem = new DataView(instance.exports.mem.buffer);
+  // the values that wasm_exec.js always has, see Go.run
+  go._values = [NaN, 0, null, true, false, globalThis, go];
+  go._goRefCounts = new Array(go._values.length).fill(Infinity);
+  go._ids = new Map([[0, 1], [null, 2], [true, 3], [false, 4], [globalThis, 5], [go, 6]]);
+  s.values.forEach((path, i) => {
+    const id = go._values.length;
+    const v = path && path.reduce((o, k) => o?.[k], globalThis);
+    if (path && v === undefined) throw new Error(`the snapshot needs globalThis.${path.join(".")}`);
+    go._values.push(v);
+    go._goRefCounts.push(s.refs[i]);
+    if (path) go._ids.set(v, id);
+  });
+  go._idPool = [...s.idPool];
+  go._nextCallbackTimeoutID = s.nextTimeout; // Go still knows the timer of its sleep
+  go.exited = false;
+  go._resume();
+  return go._exitPromise;
 }

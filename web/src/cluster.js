@@ -7,7 +7,7 @@
 import "./wasm_exec.js";
 import { installFS } from "./fs.js";
 import { clusterState, forget } from "./state.js";
-import { instantiate } from "./wasm.js";
+import { instantiate, runGo } from "./wasm.js";
 
 const tabs = new Map(); // tab id -> MessagePort
 // The docker nodes from join: every tab connects to each of them over WebRTC
@@ -60,10 +60,10 @@ async function boot(stream) {
     go.env = { HOME: "/root", USER: "root", PATH: "/usr/bin" };
     // The tab sends the binary unpacked: a shared worker cannot start
     // workers, so it would unpack the zstd frames one after the other.
-    const instance = await instantiate(stream, go.importObject);
+    const instance = await instantiate(stream, go);
     globalThis.tabernetesMemory = instance.exports.mem;
     started = true;
-    go.run(instance).then(() => exited(""), (e) => exited(e?.message ?? String(e)));
+    runGo(go, instance).then(() => exited(""), (e) => exited(e?.message ?? String(e)));
     await globalThis.tabernetes.ready;
     if (state !== "booting") return; // it exited meanwhile
     state = "ready";

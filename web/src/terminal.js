@@ -5,7 +5,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { installFS } from "./fs.js";
 import { clusterState, loadHome, saveHome, forget, sweepLayers, keepStorage } from "./state.js";
-import { zstdFrames, instantiate } from "./wasm.js";
+import { zstdFrames, instantiate, runGo } from "./wasm.js";
 
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
 
@@ -144,7 +144,7 @@ export async function startTerminal(el, opts) {
     unpacked = mine;
     cluster.sendBinary(theirs);
   }
-  const instance = await instantiate(unpacked, go.importObject);
+  const instance = await instantiate(unpacked, go);
   term.writeln("");
   globalThis.tabernetesStatus(cached ? "compiled WebAssembly from the browser cache" : "downloaded and compiled WebAssembly");
   // The "free" command reads the size of the linear memory from here.
@@ -173,7 +173,7 @@ export async function startTerminal(el, opts) {
     globalThis.tabernetesRole = "tab";
     globalThis.tabernetesCluster = { info, open: (label) => cluster.open(label) };
   }
-  go.run(instance).then(() => exited(), (e) => exited(e?.message ?? String(e)));
+  runGo(go, instance).then(() => exited(), (e) => exited(e?.message ?? String(e)));
   try {
     await globalThis.tabernetes.ready;
     booted = true;

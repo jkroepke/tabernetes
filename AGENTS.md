@@ -117,6 +117,25 @@ that name.
 - **Terminal**: the shell is mvdan.cc/sh with Go built-ins (coreutils, `wget`,
   `vi`, `kubectl edit` in raw mode). busybox-wasm and vigo were tried and
   rejected.
+- **Go heap snapshot** (`k8s/snapshot.mjs`, run by `k8s/build.sh`): Node.js
+  runs the binary until `main` sleeps (`tabernetesSnapshot`), and the memory
+  and Wasm globals become the data and globals of the shipped binary.
+  `runGo` in `web/src/wasm.js` rebuilds the JavaScript values that Go holds
+  (8, all found by name: `Object`, `fs`, ...) and resumes. Saves ~0.9 s of
+  package init per Go start (0.4 s init, 0.5 s lazy compile of init code),
+  +0.6 MB zst. The build fails if init leaves a value that cannot be found
+  by name or an open file. The env and `fs.constants` of the page must
+  match the build (checked at start). All starts share the random state of
+  the build: `main` reseeds `util/rand`; map order and `math/rand` repeat,
+  `crypto/rand` does not. The sleep must be long (100 ms): with 1 ms, work
+  left over from init lets the timer expire and Go never pauses. In-process
+  reloads gain less, Chrome reuses the compiled code of the same bytes.
+- **Image pulls** download and unpack up to 3 layers at once, like
+  containerd's `max_concurrent_downloads`. On a fast link the browser is
+  CPU bound (gunzip, SHA-256, OPFS) and gains little; it saves round trips
+  through the mirror.
+- **kubectl translations are off** (patch.go): loading them zipped and parsed
+  the `.po` files during init (~0.1 s), and the terminal sets no `LANG`.
 - **Persistence rules**: the etcd snapshot is saved only after boot, and a
   change of lease keys alone does not trigger a save. A snapshot of another
   Kubernetes minor version, or one that fails to boot, is dropped. `forget`
@@ -136,12 +155,13 @@ that name.
   COOP/COEP, only `max-age=600`, and its CDN gzips the `.zst` again (so
   `Content-Length` is useless for progress; the page gets the exact size from
   the shortcode). Hence the binary is shipped as 32 MiB zstd frames and
-  decoded in a worker with fzstd; Chromium's `DecompressionStream` has no
-  zstd. ghcr.io answers the CORS preflight with 405, so OCI artifacts are no
+  decoded in workers with zstddec (zstd in Wasm, 2.5x faster than fzstd,
+  which `layers.js` still uses for streamed layers); Chromium's
+  `DecompressionStream` has no zstd. ghcr.io answers the CORS preflight with 405, so OCI artifacts are no
   option for the binary either.
 - The blog's CSP adds `'wasm-unsafe-eval'` only on pages with the shortcode.
 - Native `Content-Encoding: zstd` would need a proxy in front of Pages (for
-  example Cloudflare). Not wanted: the fzstd frames already decode in
+  example Cloudflare). Not wanted: the zstd frames already decode in
   parallel with download and compile.
 
 ## Runtime gotchas (Go `js/wasm` and browsers)
@@ -238,6 +258,8 @@ that name.
 - **Trimming controllers or APIs**: rejected (-0.4 s boot only).
   The `providerless` build tag of k0s/k3s is a no-op in v1.37.
 - **wasm-opt -Oz**: -0.6 % zst, no faster boot. Rejected.
+- **`GOWASM=satconv,signext`**: no-op, Go 1.27 always emits both.
+- **Eager Wasm compile** (no lazy compile): 2.9 s instead of 0.4 s.
 - **Leader/follower etcd replication between tabs**: moot with the
   SharedWorker.
 - **64-bit images (x86_64, arm64) via QEMU-wasm** (ktock/qemu-wasm, Wasm TCG
