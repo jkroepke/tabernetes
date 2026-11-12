@@ -221,7 +221,7 @@ that name.
   that deletes it. reboot then boots a fresh control plane in the same tab,
   in place (`restart` in `index.js`), not by a reload: the blog page sits
   behind a start button. The other tabs stay down until Enter. The tabs end
-  the workers of their pods and close their WebRTC connections, so docker
+  the workers of their pods and close their WebRTC connections, so Docker
   nodes end too. Without a SharedWorker, poweroff and reboot reload the page.
 - **Image pulls** download and unpack up to 3 layers at once, like
   containerd's `max_concurrent_downloads`. On a fast link the browser is
