@@ -90,6 +90,14 @@ func main() {
 		"return syscallExec(executablePath,",
 	)
 	dropUnusedImport("staging/src/k8s.io/kubectl/pkg/cmd/plugin.go", "syscall")
+	// kubectl translations: the first i18n.T() call, in the package init of
+	// kubectl/pkg/cmd/options, zips the .po and .mo files and parses them
+	// (~0.1 s in Wasm). The terminal sets no LANG, so kubectl always speaks
+	// English anyway. Without a loaded locale, i18n.T returns the English text.
+	edit("staging/src/k8s.io/kubectl/pkg/util/i18n/i18n.go",
+		"\t\treturn LoadTranslations(\"kubectl\", nil)\n",
+		"\t\treturn nil\n",
+	)
 
 	// RSA key generation is painfully slow in single-threaded wasm: use ECDSA
 	// for self-signed certificates.

@@ -294,12 +294,17 @@ gh attestation verify tabernetes.tar.gz --repo jkroepke/tabernetes
 The binary is around 290 MB, or 28 MB with zstd (gzip: 45 MB). GitHub Pages
 does not send `Content-Encoding` for it, and `DecompressionStream` has no
 zstd. The page fetches the `.zst` file and unpacks it with
-[fzstd](https://github.com/101arrowz/fzstd) in a Web Worker, block by block
-while it downloads. The browser compiles the WebAssembly while the bytes
+[zstddec](https://github.com/donmccurdy/zstddec) (zstd compiled to
+WebAssembly) in Web Workers, frame by frame while it downloads. The browser compiles the WebAssembly while the bytes
 arrive, so download, unpacking and compiling overlap. The first tab hands
 the unpacked bytes on to the shared worker of the control plane: a shared
 worker cannot start workers of its own and would unpack the frames one after
 the other, about 1.5 s longer.
+
+The binary holds a snapshot of its own heap after the init of all Go
+packages (`k8s/snapshot.mjs`, at build time). That init takes about 0.9 s in
+the browser. The page starts the program from the snapshot instead, in the
+tab and in the shared worker, so `main` runs after a few milliseconds.
 
 The blog fingerprints the files with Hugo, so the name of the binary
 changes with its content. The page keeps the binary in the Cache Storage of
