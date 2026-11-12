@@ -46,7 +46,13 @@ func adminClient() (kubernetes.Interface, error) {
 func dropNode(name string) {
 	sessionsMu.Lock()
 	s := sessions[name]
+	droppingTabs[name] = true
 	sessionsMu.Unlock()
+	defer func() {
+		sessionsMu.Lock()
+		delete(droppingTabs, name)
+		sessionsMu.Unlock()
+	}()
 	if s != nil {
 		s.close()
 	}

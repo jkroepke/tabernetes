@@ -31,7 +31,7 @@ const isLink = (n) => (n.mode & S_IFMT) === S_IFLNK;
 // persist: {prefix, skip: [paths], save(put, del)} keeps the files below
 // prefix, except the ones below skip.
 export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}) {
-  const root = newNode(S_IFDIR | 0o755, { children: new Map() });
+  let root = newNode(S_IFDIR | 0o755, { children: new Map() });
   const fds = new Map();
   let nextFd = 10;
   const dec = new TextDecoder();
@@ -313,6 +313,18 @@ export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}
       } catch { /* its parent is gone */ }
     }
     persist = keep;
+  };
+  // dump and load carry the files and the open file descriptors over to
+  // another instance, for the hibernation of the control plane
+  // (hibernate.js). structuredClone keeps hard links one node.
+  fs.dump = () => structuredClone({ root, fds, nextFd, ino: inoCounter, cwd });
+  fs.load = (d) => {
+    root = d.root;
+    fds.clear();
+    for (const [k, v] of d.fds) fds.set(k, v);
+    nextFd = d.nextFd;
+    inoCounter = Math.max(inoCounter, d.ino);
+    cwd = d.cwd;
   };
   return fs;
 }

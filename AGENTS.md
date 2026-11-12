@@ -164,6 +164,23 @@ that name.
   `crypto/rand` does not. The sleep must be long (100 ms): with 1 ms, work
   left over from init lets the timer expire and Go never pauses. In-process
   reloads gain less, Chrome reuses the compiled code of the same bytes.
+- **Hibernation** (`web/src/hibernate.js`, `cluster.js`): when the last tab
+  closes, the worker copies memory, Wasm globals (the build exports them as
+  `g<i>`), the fs and `go._values` in one JavaScript task, gzips the memory
+  (~360 MiB -> ~40 MB, ~5 s, CompressionStream) and puts it into IndexedDB
+  (`cluster` store, key `hibernated`). The next worker takes it (read and
+  delete), unpacks it while the tab sends the binary, and resumes instead of
+  `runGo`: prompt ~3.4 s instead of ~9 s (Chromium, 2026-11-12). Measured
+  stable over 8 chained resumes and after a faked 30 h and 60 h gap.
+  Rules: the image matches only its build (`build` in the snapshot section);
+  a joining tab voids it; the etcd saves pause while hibernated; a failed
+  resume does not drop the etcd snapshot. Stand-ins of tab objects must stay
+  recognisable (`standIns`): a Proxy looked like a plain object to the next
+  capture, and the second resume of a chain crashed on `postMessage`. On
+  resume the stand-ins' Go handlers get `onmessage({data: null})` and
+  `onclose()`, which ends the goroutines of the old tabs. Tab numbers are
+  the lowest free ones (tabs.go), else a hibernated cluster counts up
+  forever. Firefox and Safari end the worker with the last tab: no image.
 - **Image pulls** download and unpack up to 3 layers at once, like
   containerd's `max_concurrent_downloads`. On a fast link the browser is
   CPU bound (gunzip, SHA-256, OPFS) and gains little; it saves round trips

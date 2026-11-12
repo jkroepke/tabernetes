@@ -1,7 +1,9 @@
 // What Tabernetes keeps in the browser, so that a reload finds it again:
 //
 //   the cluster    IndexedDB "tabernetes", store "cluster": one record with
-//                  the PKI and an etcd snapshot (k8s/tabernetes/state.go)
+//                  the PKI and an etcd snapshot (k8s/tabernetes/state.go),
+//                  and, after the last tab closed, the hibernated control
+//                  plane (hibernate.js, ~40 MB)
 //   /root          IndexedDB "tabernetes", store "home": a record per file of
 //                  the terminal (fs.js)
 //   the images     OPFS tabernetes/layers (layers.js), their configs in the
@@ -63,9 +65,9 @@ let forgotten = false;
 // newer one replaces a waiting one. drop() deletes a cluster that did not
 // boot, so that the next reload starts a new one.
 export function clusterState() {
-  let running = null, next = null, dropped = false;
+  let running = null, next = null, dropped = false, paused = false;
   const write = async () => {
-    while (next) {
+    while (next && !paused) {
       const b = next;
       next = null;
       if (forgotten || dropped) return;
@@ -83,8 +85,15 @@ export function clusterState() {
     },
     save(bytes) {
       next = bytes;
+      if (paused) return Promise.resolve();
       running ??= write().finally(() => { running = null; });
       return running;
+    },
+    // pause(true) holds the saves back while the control plane is
+    // hibernated (cluster.js); pause(false) writes the last one held back.
+    pause(on) {
+      paused = on;
+      if (!on && next) this.save(next);
     },
     async drop() {
       dropped = true;
@@ -92,6 +101,34 @@ export function clusterState() {
       await tx("cluster", "readwrite", (s) => s.delete("cluster")).catch(() => {});
     },
   };
+}
+
+// The hibernated control plane (hibernate.js) is a second record of the
+// store "cluster": the image of the running program, its memory as a
+// gzipped Blob. It is newer than the etcd snapshot, and good for one start
+// only: takeHibernated deletes it as it reads it, and so does a tab that
+// joins the running control plane, which may change the cluster after the
+// image was taken.
+export async function saveHibernated(image) {
+  if (forgotten) return;
+  await tx("cluster", "readwrite", (s) => s.put(image, "hibernated"));
+}
+
+export async function takeHibernated() {
+  try {
+    return (await tx("cluster", "readwrite", (s) => {
+      const r = s.get("hibernated");
+      s.delete("hibernated");
+      return r;
+    })) ?? null;
+  } catch (e) {
+    console.warn("tabernetes: no hibernated control plane:", e);
+    return null;
+  }
+}
+
+export async function dropHibernated() {
+  await tx("cluster", "readwrite", (s) => s.delete("hibernated")).catch(() => {});
 }
 
 // loadHome returns the records of the files in /root:
