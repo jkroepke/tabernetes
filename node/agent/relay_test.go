@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -62,13 +64,18 @@ func TestRelay(t *testing.T) {
 	f := &fakeNtfy{subs: map[string][]chan string{}, msgs: map[string][]string{}}
 	srv := httptest.NewServer(f)
 	defer srv.Close()
-	key := "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8" // 32 bytes
+	newKey := func() string {
+		b := make([]byte, 32)
+		rand.Read(b)
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	key := newKey()
 	node, err := newRelay(srv.URL, "tabernetes-node", key)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tab, _ := newRelay(srv.URL, "tabernetes-reply", key)
-	other, _ := newRelay(srv.URL, "tabernetes-reply", "Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA")
+	other, _ := newRelay(srv.URL, "tabernetes-reply", newKey())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
