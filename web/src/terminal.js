@@ -113,6 +113,7 @@ export async function startTerminal(el, opts) {
         "  join                     connect a real node via WebRTC (needs docker)",
         "  accept <answer>          finish a join later (join asks for it)",
         "  join --keep              a node that stays and reconnects after a reload",
+        "  join --kubectl           use kubectl outside the browser (join --help)",
         "  unjoin <node>            remove a node from join --keep",
         "  proxy <port>             open localhost:<port> (kubectl port-forward) in a new tab",
         "  vnc <port> [password]    show the VNC server on localhost:<port> on top of the terminal",

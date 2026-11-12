@@ -253,7 +253,7 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
   // joinPaired is join --keep: the token has no offer but the relay, the
   // topic and the key of the node. The container starts the node at once
   // and waits for offers; this tab sends one until the node answers.
-  const joinPaired = async (via, { term, active }) => {
+  const joinPaired = async (via, { term, active }, kubectl = false) => {
     let url;
     try { url = new URL(via); } catch { url = null; }
     if (url?.protocol !== "https:" && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(url?.hostname ?? "")) {
@@ -261,15 +261,21 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
       return;
     }
     const noOpen = () => Promise.reject(new Error("no tab is connected to the node"));
+    const href = url.href.replace(/\/+$/, "");
     let info;
-    if (cluster) info = await cluster.rpc("prepareJoin", url.href.replace(/\/+$/, ""));
-    else info = await globalThis.tabernetes.prepareJoin(noOpen, url.href.replace(/\/+$/, ""));
+    if (kubectl) info = cluster ? await cluster.rpc("prepareKubectl", href) : await globalThis.tabernetes.prepareKubectl(href);
+    else if (cluster) info = await cluster.rpc("prepareJoin", href);
+    else info = await globalThis.tabernetes.prepareJoin(noOpen, href);
     const p = info.pairing;
-    const port = 50000 + ((Number(info.name.replace(/^\D+/, "")) || ++seq) % 10000);
+    // kubectl-<n> gets the ports above the nodes: 59000 + n
+    const port = kubectl ? 59000 + (Number(info.name.replace(/^\D+/, "")) % 1000)
+      : 50000 + ((Number(info.name.replace(/^\D+/, "")) || ++seq) % 10000);
     const token = await encodeToken({
       v: 1, n: info.name, ip: info.ip, t: info.token, ca: info.ca, p: port, ru: p.relay, rt: p.topic, k: p.key,
+      ...(kubectl ? { kind: "kubectl" } : {}),
     });
     globalThis.tabernetesLastJoin = { token, port, name: info.name, paired: true };
+    if (kubectl) return showKubectl(info, p, port, token, { term, active });
     const run = (ports) => `docker run -d --restart unless-stopped ${ports} --name tabernetes-${info.name}`;
     term.writeln(`Start the node on a machine with docker. It stays in the cluster: when this page`);
     term.writeln(`reloads, the tabs find it again through ${p.relay} (end to end encrypted).`);
@@ -298,18 +304,74 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
     }
   };
 
+  const help = (term) => {
+    for (const l of [
+      `usage: join [--keep | --kubectl] [--relay <ntfy URL>]`,
+      "",
+      `${B("join")}            connect a docker node for this visit. Copy and paste: the`,
+      `                docker run carries the offer, and join asks for the ${B("accept ...")} line`,
+      `                the node prints. The node ends with the last tab of this page.`,
+      `${B("join --keep")}     a node that stays: it reconnects after a reload and after its`,
+      `                container restarts, and nothing is pasted back. The tabs find it`,
+      `                through a relay (ntfy), end to end encrypted. A server needs no`,
+      `                open port. ${B("unjoin <node>")} removes it.`,
+      `${B("join --kubectl")}  run kubectl outside the browser: the same node image forwards`,
+      `                127.0.0.1:6443 to the cluster and prints a kubeconfig.`,
+      `                ${B("unjoin kubectl-<n>")} takes the access back.`,
+      `${B("--relay <URL>")}   the ntfy server for --keep and --kubectl (default ${relay}).`,
+      "",
+      `Docker on another machine: publish the UDP port on all interfaces (${B("-p <port>:<port>/udp")}).`,
+      `A server with a public IP needs nothing else. In your network, add`,
+      `${B("--advertise <LAN IP>")} before the token.`,
+    ]) term.writeln(l);
+  };
+
+  // showKubectl prints the docker run of join --kubectl and waits for it.
+  const showKubectl = async (info, p, port, token, { term, active }) => {
+    const cmd = `docker run -d --restart unless-stopped -p 127.0.0.1:6443:6443 -p 127.0.0.1:${port}:${port}/udp --name tabernetes-${info.name} ${image} kubectl ${token}`;
+    term.writeln(`Run kubectl on this machine against the cluster in this browser. With docker:`);
+    term.writeln("");
+    term.writeln(B(`docker run -d --restart unless-stopped -p 127.0.0.1:6443:6443 \\`));
+    term.writeln(B(`  -p 127.0.0.1:${port}:${port}/udp --name tabernetes-${info.name} \\`));
+    term.writeln(B(`  ${image} kubectl \\`));
+    term.writeln(B(`  ${token}`));
+    term.writeln(B(`docker logs tabernetes-${info.name} 2>/dev/null > tabernetes.kubeconfig`));
+    term.writeln(B(`KUBECONFIG=tabernetes.kubeconfig kubectl get nodes`));
+    term.writeln("");
+    term.writeln(`The container prints the kubeconfig: https://127.0.0.1:6443, the CA and a token`);
+    term.writeln(`of the ServiceAccount kube-system/tabernetes-${info.name} (${B("cluster-admin")}, valid for a year).`);
+    term.writeln(`Keep it like a password. It reconnects through ${p.relay} after a reload.`);
+    term.writeln(`${B(`unjoin ${info.name}`)} takes the access back.`);
+    term.writeln("");
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(cmd).then(() => term.writeln(DIM("(the docker command was copied to your clipboard)")), () => {});
+    }
+    keep(p, true);
+    term.writeln(`Waiting for ${info.name}... Ctrl-C stops waiting, the tab keeps trying.`);
+    while (active()) {
+      if (nodes.some((n) => n.info.name === info.name && n.pc?.connectionState === "connected")) {
+        term.writeln(`${info.name} is connected.`);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  };
+
   return {
     async join(args, { term, ask, active }) {
-      let keepIt = false, via = relay;
+      let keepIt = false, kubectl = false, via = relay;
       for (let i = 0; i < args.length; i++) {
+        if (args[i] === "--help" || args[i] === "-h") { help(term); return; }
         if (args[i] === "--keep") keepIt = true;
+        else if (args[i] === "--kubectl") kubectl = true;
         else if (args[i] === "--relay" && args[i + 1]) { keepIt = true; via = args[++i]; }
         else if (args[i].startsWith("--relay=")) { keepIt = true; via = args[i].slice(8); }
         else {
-          term.writeln(`usage: join [--keep] [--relay <ntfy URL>]`);
+          term.writeln(`usage: join [--keep | --kubectl] [--relay <ntfy URL>], or join --help`);
           return;
         }
       }
+      if (kubectl) return joinPaired(via, { term, active }, true);
       if (keepIt) return joinPaired(via, { term, active });
       if (pending) {
         // The node never answered (docker run failed, accept line lost): start over.
@@ -373,6 +435,10 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
     },
 
     async unjoin(args, { term }) {
+      if (args[0] === "--help" || args[0] === "-h") {
+        term.writeln(`usage: unjoin <name>   remove a node of join --keep, or the access of join --kubectl`);
+        return;
+      }
       const name = args[0];
       if (!name) { term.writeln(`usage: unjoin <node>`); return; }
       try {
@@ -383,6 +449,10 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
         return;
       }
       unkeep(name);
+      if (name.startsWith("kubectl-")) {
+        term.writeln(`The token of ${name} is void. Remove its container: ${B(`docker rm -f tabernetes-${name}`)}`);
+        return;
+      }
       term.writeln(`${name} is gone from the cluster. Its container still waits for the browser: ${B(`docker rm -f tabernetes-${name}`)}`);
     },
 

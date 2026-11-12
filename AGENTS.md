@@ -184,7 +184,11 @@ that name.
   hibernation the worker calls `restoreNode` again: the old `open`
   functions are dead stand-ins. Tested with a fake ntfy (POST, `/json`,
   `/sse`, `since=`) and the agent with `--no-kubelet`; a sealed offer is
-  ~700 bytes (ntfy.sh takes 4096).
+  ~700 bytes (ntfy.sh takes 4096). `join --kubectl` uses the same pairing
+  (kind `kubectl`, no node, no IP) for a kubectl outside the browser; the
+  agent prints the kubeconfig on stdout and logs on stderr, on Joe's wish.
+  Tested with a real kubectl v1.37.2 (get, create, auth whoami, after a
+  reload).
 - **Persistence**: image layers in OPFS (`web/src/layers.js`, served to v86
   over 9p), cluster as an etcd snapshot in IndexedDB (`state.go`,
   `etcdshim/snapshot.go`), files of `/root` in IndexedDB, saved VM states

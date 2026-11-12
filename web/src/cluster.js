@@ -281,6 +281,11 @@ const methods = {
   meshDown(id, name) {
     peers.get(name)?.delete(id);
   },
+  // prepareKubectl is join --kubectl: a paired kubectl outside the browser.
+  async prepareKubectl(id, relay) {
+    await ready;
+    return globalThis.tabernetes.prepareKubectl(relay);
+  },
   // pairedNodes: the paired docker nodes, every tab dials them (join.js).
   async pairedNodes() {
     await ready;

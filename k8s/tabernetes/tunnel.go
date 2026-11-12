@@ -310,7 +310,7 @@ stringData:
 		// The topic is the address of the node on the relay, the key
 		// encrypts what goes through it: the relay sees neither the offers
 		// nor the addresses in them.
-		pair = &pairing{Name: name, IP: ip, Relay: relay, Topic: "tabernetes-" + randToken(24), Key: randKey()}
+		pair = &pairing{Kind: "node", Name: name, IP: ip, Relay: relay, Topic: "tabernetes-" + randToken(24), Key: randKey()}
 		if err := savePairing(context.Background(), *pair); err != nil {
 			return nil, fmt.Errorf("saving the pairing: %w", err)
 		}

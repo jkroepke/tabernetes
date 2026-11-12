@@ -248,6 +248,17 @@ browser tab (single wasm binary)                     docker run tabernetes
   after a restart the kubelet keeps its certificate; the tabs see the
   connection drop and dial again (about 12 s). `unjoin <node>` removes the
   pairing, the node and its pods.
+- `join --kubectl` pairs a kubectl outside the browser the same way. The
+  node image runs as `<image> kubectl <token>`: no kubelet and no
+  namespaces, it only forwards port 6443 (`-p 127.0.0.1:6443:6443`) to the
+  kube-apiserver in the browser and prints a kubeconfig on stdout, the logs
+  go to stderr. So `docker logs tabernetes-kubectl-1 2>/dev/null` is the
+  kubeconfig. Its user is the ServiceAccount
+  `kube-system/tabernetes-kubectl-<n>`, bound to `cluster-admin`, with a
+  token for a year. The certificate of the kube-apiserver is valid for
+  `127.0.0.1`. `unjoin kubectl-<n>` deletes the ServiceAccount, which voids
+  the token. Everything runs on the one thread of the control plane, so a
+  busy kubectl slows the cluster down.
 
 ## Patches
 

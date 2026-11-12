@@ -391,7 +391,18 @@ func main() {
 			return current.prepareJoin(open, relay)
 		})
 	}))
-	// pairedNodes(): [{name, ip, relay, topic, key}] of the paired docker nodes.
+	// prepareKubectl(relay: string): Promise<{name, token, ca, pairing}> pairs
+	// a kubectl outside the browser (join --kubectl, paired.go).
+	api.Set("prepareKubectl", js.FuncOf(func(this js.Value, a []js.Value) any {
+		relay := a[0].String()
+		return promise(func() (any, error) {
+			if current == nil {
+				return nil, fmt.Errorf("cluster is not ready yet")
+			}
+			return current.prepareKubectl(context.Background(), relay)
+		})
+	}))
+	// pairedNodes(): [{kind, name, ip, relay, topic, key}] of the paired docker nodes.
 	api.Set("pairedNodes", js.FuncOf(func(this js.Value, a []js.Value) any {
 		list := []any{}
 		for _, p := range pairings() {
