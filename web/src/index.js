@@ -19,7 +19,6 @@ const pods = {
     version: V86_VERSION,
     workerURL: abs(d.vmWorker),
     wasmURL: abs(d.vmWasm),
-    biosURL: abs(d.vmBios),
     kernelURL: abs(d.vmKernel),
     initURL: abs(d.vmInit),
     registry: d.registry,

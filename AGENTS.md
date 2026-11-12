@@ -118,15 +118,34 @@ that name.
   v86's `unpack_memory`, which zeroed all guest RAM (160 ms and 240 MiB more
   RSS per pod). Kernel options that cost boot time: legacy PTYs (310 ms),
   gzip (LZ4 unpacks in a third of the time, in-guest zstd is 200 ms slower
-  than LZ4).
+  than LZ4); now the kernel ships unpacked (next point).
+- **Direct kernel boot, no SeaBIOS** (`web/src/kernelboot.js`, since
+  2026-11-12): the worker loads the segments of `vmlinux` (ELF, stripped),
+  the initramfs and the zero page (E820, cmdline, initrd) into the VM and
+  sets the CPU to `startup_32` in flat protected mode, like Firecracker.
+  Without a BIOS, Linux finds no PCI routing table: `routePCI` programs the
+  PIIX3 PIRQs (10, 10, 11, 11), the interrupt lines and the ELCR like
+  SeaBIOS, else virtio fails with "can't find IRQ for PCI INT A". Measured
+  in Node.js, run() to init `ready`, 3 x 6 rounds (medians): SeaBIOS +
+  bzImage ~300 ms (256 MiB) / ~400 ms (2 GiB), a bzImage without BIOS the
+  same, `vmlinux` ~280 / ~330 ms. So the BIOS was cheap; unpacking the
+  kernel on the emulated CPU was not. The worker also boots in the VM it
+  made for the state instead of a second one (`new V86` ~40 ms). In
+  headless Chromium, start to `started` of a pod without a saved state
+  (image present, 3 x 7 rounds): ~975 -> ~915 ms. Only the
+  first boot per memory size gains; restoring a state and nginx after `go`
+  did not change. Side effects: the state is 15.8 instead of 17.1 MiB, and
+  the guest gets 16 MiB more RAM (SeaBIOS reserved the top 16 MiB). GitHub
+  Pages gzips `vmlinux` (5.6 MB, 2 MB gzip).
   v86 saves all VGA memory in a state: pods use the smallest size (256 KiB
-  instead of 8 MiB), which halves every state (16.5 -> 8.8 MiB).
+  instead of 8 MiB), which halves every state (15.8 -> 7.6 MiB).
 - **Kernel config trimmed** (2026-11-12): other CPU vendors, PCI quirks and
   PCI serial cards, PTP, ethtool netlink, wireless, the crypto API, legacy
-  virtio and a 4 KiB log buffer are off. bzImage -188 KiB, -10 % emulated
-  instructions to "ready", +876 KiB free memory per pod; the boot time
-  gain is below the noise (~50 ms). Most boot time is the JIT on cold kernel
-  code, not idle waits. Keep PCI configuration type 1 (direct boot needs it).
+  virtio and a 4 KiB log buffer are off. `vmlinux` 5.6 -> 4.7 MB (gzip
+  1.97 -> 1.81 MB), -10 % emulated instructions to "ready", +876 KiB free
+  memory per pod; the boot time gain is below the noise (~50 ms). Most boot
+  time is the JIT on cold kernel code, not idle waits. Keep PCI
+  configuration type 1 (direct boot needs it).
 - **Node join over WebRTC** with copy and paste signaling and STUN, one UDP mux per
   node. The node runs without `--privileged`: the agent re-execs into
   user/mount/net/cgroup namespaces, pasta (built from passt.top at the fixed

@@ -1,24 +1,25 @@
-// Boot test of the pod VM: v86 boots the kernel, init and BIOS of dist/vm
-// (mise run vm) in Node.js, the way web/src/vmworker.js does in the
-// browser. It checks the parts of the kernel that a pod needs: the
+// Boot test of the pod VM: v86 boots the kernel and init of dist/vm (mise
+// run vm) in Node.js without a BIOS, the way web/src/vmworker.js does in
+// the browser (web/src/kernelboot.js). It checks the parts of the kernel that a pod needs: the
 // initramfs, ttyS1 for init, virtio-net, the 9p root file system, devtmpfs,
 // devpts and an ELF program as the container. It also saves the booted VM
 // and starts the pod from the restored state, like the page does.
 //
 //   node --test vm/test
 //
-// TABERNETES_VM sets another directory with bzImage, init and seabios.bin.
+// TABERNETES_VM sets another directory with vmlinux and init.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { V86 } from "../../web/node_modules/v86/build/libv86.mjs";
 import { initramfs } from "../../web/src/initramfs.js";
+import { bootKernel } from "../../web/src/kernelboot.js";
 import { Tree, LayerStorage, modes } from "../../web/src/rootfs.js";
 
 const root = new URL("../..", import.meta.url).pathname;
 const dir = process.env.TABERNETES_VM || path.join(root, "dist/vm");
-const files = ["bzImage", "init", "seabios.bin"];
+const files = ["vmlinux", "init"];
 const missing = files.filter((f) => !fs.existsSync(path.join(dir, f)));
 // CI builds the VM before the tests: there a missing file is an error.
 const skip = missing.length && !process.env.CI ? `no ${missing.join(", ")} in ${dir} (mise run vm)` : false;
@@ -32,7 +33,6 @@ const GATEWAY = "192.168.86.1";
 function options(extra) {
   return {
     wasm_path: path.join(root, "web/node_modules/v86/build/v86.wasm"),
-    bios: { buffer: read("seabios.bin").buffer },
     filesystem: {},
     memory_size: MEMORY,
     uart1: true,
@@ -40,6 +40,8 @@ function options(extra) {
     disable_keyboard: true,
     disable_mouse: true,
     disable_speaker: true,
+    // like web/src/vmworker.js: a small VGA memory keeps the state small
+    vga_memory_size: 256 << 10,
     preserve_mac_from_state_image: true,
     net_device: { type: "virtio", relay_url: "fetch", vm_ip: IP, router_ip: GATEWAY },
     ...extra,
@@ -146,19 +148,16 @@ async function startPod(e, control, t) {
 }
 
 test("the kernel boots, init starts a pod, the saved VM restores", { skip, timeout: 300_000 }, async (t) => {
-  const kernel = read("bzImage");
+  const kernel = read("vmlinux");
   const init = read("init");
 
   // boot: init waits for the pod in the initramfs and says "ready"
-  const e = new V86(options({
-    bzimage: { buffer: kernel.buffer },
-    initrd: { buffer: initramfs(init).buffer },
-    cmdline: "console=ttyS0 quiet loglevel=3",
-  }));
+  const e = new V86(options({}));
   const boot = lines(e, 0);
   const control = lines(e, 1);
   await new Promise((r) => e.add_listener("emulator-loaded", r));
   const t0 = Date.now();
+  bootKernel(e.v86.cpu, { kernel, initrd: initramfs(init), cmdline: "console=ttyS0 quiet loglevel=3" });
   e.run();
   try {
     await until("ready", () => control.includes("ready") || control.some((l) => l.startsWith("exit ")));

@@ -18,6 +18,7 @@ import { Tree, LayerStorage, modes } from "./rootfs.js";
 import { openStore } from "./layers.js";
 import { SHA256 } from "./sha256.js";
 import { initramfs } from "./initramfs.js";
+import { bootKernel } from "./kernelboot.js";
 import { buildID, loadState, saveState, dropState } from "./vmstate.js";
 
 const post = (m, transfer) => self.postMessage(m, transfer || []);
@@ -283,7 +284,7 @@ const fetchBytes = async (url) => new Uint8Array(await (await fetch(url)).arrayB
 async function bootVM(m, memory) {
   const base = {
     wasm_path: m.wasmURL,
-    bios: { url: m.biosURL },
+    // No BIOS: the page starts the kernel itself (kernelboot.js).
     // an empty 9p file system; the tree of the pod comes in before "go"
     filesystem: {},
     memory_size: memory,
@@ -294,37 +295,37 @@ async function bootVM(m, memory) {
     disable_speaker: true,
     // The pod has no screen. v86 saves all VGA memory in the state: the
     // smallest size (256 KiB) instead of the default 8 MiB halves every
-    // saved state (16.5 -> 8.8 MiB with 256 MiB of RAM).
+    // saved state (15.8 -> 7.6 MiB with 256 MiB of RAM).
     vga_memory_size: 256 << 10,
     // the network adapter must learn the MAC of a restored VM
     preserve_mac_from_state_image: true,
     net_device: { type: "virtio", relay_url: "fetch", vm_ip: m.ip, router_ip: m.gateway },
   };
   // Most pods restore a state: v86 compiles its wasm while the state loads.
-  const blank = new V86(base);
-  const loaded = new Promise((r) => blank.add_listener("emulator-loaded", r));
+  const loaded = (v) => new Promise((r) => v.add_listener("emulator-loaded", r));
+  let e = new V86(base);
+  let ok = loaded(e);
   const [kernel, init] = await Promise.all([fetchBytes(m.kernelURL), fetchBytes(m.initURL)]);
   const build = await buildID(m.version || "", kernel, init).catch(() => "");
   const state = build && (await loadState(build, memory));
   if (state) {
-    await loaded;
-    fastUnpack(blank.v86.cpu);
+    await ok;
+    fastUnpack(e.v86.cpu);
     try {
-      await blank.restore_state(state);
-      return { emulator: blank, init };
+      await e.restore_state(state);
+      return { emulator: e, init };
     } catch (err) {
       console.warn("tabernetes: the saved state of the VM does not restore, booting:", err);
       dropState(build, memory).catch(() => {});
+      e.destroy();
+      e = new V86(base);
+      ok = loaded(e);
     }
   }
-  blank.destroy();
-  const e = new V86({
-    ...base,
-    bzimage: { buffer: kernel.buffer },
-    initrd: { buffer: initramfs(init).buffer },
-    cmdline: "console=ttyS0 quiet loglevel=3",
-  });
+  // No state: the kernel starts in this VM, which has run nothing yet.
   emulator = e;
+  await ok;
+  bootKernel(e.v86.cpu, { kernel, initrd: initramfs(init), cmdline: "console=ttyS0 quiet loglevel=3" });
   const ready = new Promise((resolve, reject) => {
     let error = "";
     onControl = (l) => {
@@ -333,8 +334,8 @@ async function bootVM(m, memory) {
       else if (l.startsWith("exit ")) reject(new Error(`the VM did not boot: ${error || l}`));
     };
   });
-  e.add_listener("emulator-loaded", () => e.run());
   e.add_listener("serial1-output-byte", control);
+  e.run();
   await ready;
   if (build && (await opfs())) {
     // init waits for the line, nothing else runs: save the VM for the next pods
@@ -350,10 +351,10 @@ const opfs = () => navigator.storage?.getDirectory?.().then(() => true, () => fa
 
 // fastUnpack replaces how v86 restores the memory of a state: it zeroes all
 // of the memory first, which takes 160 ms for 256 MiB and makes the browser
-// commit every page. The memory of a new VM is zero already, apart from
-// what v86 put there itself: the BIOS and the VGA BIOS, below 1 MiB (checked
-// with v86 0.5.473: 29 pages, all below 0x100000). Checking every page
-// would take 80 ms.
+// commit every page. The memory of a new VM is zero already: without a
+// BIOS, v86 puts nothing there. The first MiB is checked anyway, as it was
+// when v86 loaded SeaBIOS there (29 pages, v86 0.5.473). Checking every
+// page would take 80 ms.
 const LOW_PAGES = (1 << 20) >> 12;
 function fastUnpack(cpu) {
   cpu.unpack_memory = function (bitmap, packed) {

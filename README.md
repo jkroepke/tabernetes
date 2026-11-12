@@ -182,7 +182,10 @@ browser tab (single wasm binary)                     docker run tabernetes
   The kernel is an upstream stable Linux (7.3) for i386, `tinyconfig` plus
   `vm/kernel.config` (serial console, virtio-net, virtio-9p, highmem, so that
   it uses more than 896 MiB), built with clang
-  in `vm/Dockerfile` (`mise run vm`, needs Docker). PID 1
+  in `vm/Dockerfile` (`mise run vm`, needs Docker). There is no BIOS: like
+  Firecracker, the worker puts the unpacked kernel (`vmlinux`), the
+  initramfs and the boot parameters into the memory of the VM and starts the
+  kernel in protected mode (`web/src/kernelboot.js`). PID 1
   (`vm/init/init.c`, a static C program with musl) does what runc does: it
   mounts `/proc`, `/sys` and `/dev`, writes `/etc/hosts` and
   `/etc/resolv.conf`, sets the hostname and starts the entrypoint with the
@@ -275,7 +278,7 @@ To try a local build on the blog, unpack `.build/tabernetes.tar.gz` into
 | `tabernetes.wasm.zst` | the binary, concatenated zstd frames of 32 MiB |
 | `tabernetes.js` | the terminal, an ES module |
 | `unzstd.js`, `cluster.js`, `gpuworker.js`, `vmworker.js` | the workers |
-| `v86.wasm`, `vm/{bzImage,init,seabios.bin}` | v86 and the VM that it boots for a pod |
+| `v86.wasm`, `vm/{vmlinux,init}` | v86 and the VM that it boots for a pod |
 | `xterm.css` | the style of the terminal |
 | `proxy-sw.js` | the service worker of `proxy <port>`, served as `/tabernetes-proxy/sw.js` |
 

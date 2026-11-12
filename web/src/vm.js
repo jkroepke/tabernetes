@@ -5,7 +5,7 @@
 
 // spawn starts the worker. In the shared worker it is a worker of the tab
 // (bridge.js), since a shared worker cannot start workers.
-export function vmAPI({ version, workerURL, wasmURL, biosURL, kernelURL, initURL, registry, spawn = (u) => new Worker(u) }) {
+export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, registry, spawn = (u) => new Worker(u) }) {
   const abs = (u) => new URL(u, location.href).href;
   return {
     version, // of v86, for the container runtime of the node
@@ -44,7 +44,6 @@ export function vmAPI({ version, workerURL, wasmURL, biosURL, kernelURL, initURL
         registry,
         version,
         wasmURL: abs(wasmURL),
-        biosURL: abs(biosURL),
         kernelURL: abs(kernelURL),
         initURL: abs(initURL),
       });
