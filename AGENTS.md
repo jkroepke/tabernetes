@@ -175,6 +175,20 @@ that name.
   commit `6aa4f88`, no Renovate on purpose) for the network,
   `KubeletInUserNamespace`. Keep `VOLUME /var/lib/containerd`.
   A `--tmpfs` variant for containerd was discussed and not wanted.
+- **Paired nodes** (`join --keep`, 2026-11-12): signaling through an ntfy
+  relay (`https://ntfy.sh` by default, it sends CORS), sealed with AES-GCM
+  and a key per node, so a node on a server needs no open port and comes
+  back after a reload. Chosen over an HTTPS endpoint in the agent (every
+  visitor would need a reachable URL with TLS). The pairing is a Secret in
+  kube-system; `dropNode` and `dropOldNodes` skip paired nodes. After a
+  hibernation the worker calls `restoreNode` again: the old `open`
+  functions are dead stand-ins. Tested with a fake ntfy (POST, `/json`,
+  `/sse`, `since=`) and the agent with `--no-kubelet`; a sealed offer is
+  ~700 bytes (ntfy.sh takes 4096). `join --kubectl` uses the same pairing
+  (kind `kubectl`, no node, no IP) for a kubectl outside the browser; the
+  agent prints the kubeconfig on stdout and logs on stderr, on Joe's wish.
+  Tested with a real kubectl v1.37.2 (get, create, auth whoami, after a
+  reload).
 - **Persistence**: image layers in OPFS (`web/src/layers.js`, served to v86
   over 9p), cluster as an etcd snapshot in IndexedDB (`state.go`,
   `etcdshim/snapshot.go`), files of `/root` in IndexedDB, saved VM states

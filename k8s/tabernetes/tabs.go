@@ -44,6 +44,11 @@ func adminClient() (kubernetes.Interface, error) {
 // The pods on the node go with it, as the pod garbage collector would do a
 // minute later; a Deployment starts them on another node.
 func dropNode(name string) {
+	// A paired node stays (join --keep, paired.go): it is NotReady until a
+	// tab connects to it again. unjoin removes it.
+	if isPaired(name) {
+		return
+	}
 	sessionsMu.Lock()
 	s := sessions[name]
 	droppingTabs[name] = true

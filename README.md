@@ -231,6 +231,44 @@ browser tab (single wasm binary)                     docker run tabernetes
   also advertises `127.0.0.1` for the `-p 127.0.0.1:<port>:<port>/udp`
   mapping. That way it works on Docker Desktop, where the browser cannot
   reach container IPs.
+- A node of `join` leaves the cluster with its pods when its agent stops
+  (Ctrl-C, `docker stop`): before it ends, it opens a data channel `bye`
+  to every tab, and the tab drops the node. Without it, the node stayed
+  `NotReady` until the last tab closed. A node of `join --keep` sends no
+  goodbye, because a `docker stop` or a reboot of the host is no reason to
+  leave.
+- `join --keep` pairs the node instead (`k8s/tabernetes/paired.go`,
+  `web/src/relay.js`, `node/agent/relay.go`). The node stays in the cluster
+  when its tabs close and when the page reloads, and nothing is pasted back.
+  Signaling goes through a relay that both sides reach with outgoing HTTPS:
+  an [ntfy](https://ntfy.sh) server, `https://ntfy.sh` by default
+  (`join --relay <URL>` or `data-relay` for another one). The token has no
+  offer, but a random topic of the node and an AES-256 key. A tab posts its
+  offer to the topic and waits on a reply topic of its own; the agent
+  answers there. Both are sealed with AES-GCM, so the relay sees neither the
+  SDP nor the addresses in it, and an offer older than two minutes is
+  ignored. The agent reads the offers of the last 30 seconds too, so the
+  tab that ran `join` connects as soon as the container is up.
+  The pairing is a Secret `kube-system/tabernetes-pairing-<node>`: it lives
+  in the etcd snapshot, and `forget` removes it. On boot, the control plane
+  keeps the paired nodes (the other nodes of the last visit go), and every
+  tab dials them, every 5 s while the node is unreachable, then less often
+  (up to once a minute). A node with no tab is `NotReady`, its pods stay.
+  The container runs with `--restart unless-stopped` and without `--rm`, so
+  after a restart the kubelet keeps its certificate; the tabs see the
+  connection drop and dial again (about 12 s). `unjoin <node>` removes the
+  pairing, the node and its pods.
+- `join --kubectl` pairs a kubectl outside the browser the same way. The
+  node image runs as `<image> kubectl <token>`: no kubelet and no
+  namespaces, it only forwards port 6443 (`-p 127.0.0.1:6443:6443`) to the
+  kube-apiserver in the browser and prints a kubeconfig on stdout, the logs
+  go to stderr. So `docker logs tabernetes-kubectl-1 2>/dev/null` is the
+  kubeconfig. Its user is the ServiceAccount
+  `kube-system/tabernetes-kubectl-<n>`, bound to `cluster-admin`, with a
+  token for a year. The certificate of the kube-apiserver is valid for
+  `127.0.0.1`. `unjoin kubectl-<n>` deletes the ServiceAccount, which voids
+  the token. Everything runs on the one thread of the control plane, so a
+  busy kubectl slows the cluster down.
 
 ## Patches
 
@@ -416,7 +454,8 @@ still works, too. Real isolation from the host needs rootless Docker or Podman.
 
 - Wasm runs on one thread. The boot takes about 15 seconds. Everything shares
   one CPU core.
-- A reload keeps the cluster, but not the nodes and pods of the last visit,
+- A reload keeps the cluster, but not the nodes and pods of the last visit
+  (except the nodes of `join --keep`),
   and not what a pod wrote. Another tab sees a new file in `~` after its next
   reload.
 - The kubelet of a tab is not the real one. It runs pods with one container
@@ -434,5 +473,13 @@ still works, too. Real isolation from the host needs rootless Docker or Podman.
   `--advertise <LAN IP>` before the token. The browser hides its own addresses
   behind mDNS names, and the container cannot resolve them, so the browser has
   to reach the container.
-- Across different networks, WebRTC needs a port forward or TURN. There is no
-  TURN server.
+- A server with a public IP (a cloud VM) works without `--advertise` and
+  without a firewall rule: publish the port on all interfaces
+  (`-p 50001:50001/udp`). STUN tells both sides their public address, and
+  both send UDP to each other during the ICE checks. The packet of the node
+  opens the stateful firewall of the server (tested with an Oracle Cloud VM,
+  whose public IP is a 1:1 NAT), so the packets of the browser get in. With
+  `-p 127.0.0.1:...`, Docker drops them.
+- When both sides sit behind NAT, WebRTC needs a port forward or TURN. A
+  browser behind a symmetric NAT (mobile networks, some company networks)
+  cannot reach a node without TURN. There is no TURN server.

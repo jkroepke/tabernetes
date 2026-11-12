@@ -20,7 +20,7 @@ export async function connectCluster(url, tries = 0) {
   const worker = new SharedWorker(url, { name: "tabernetes", extendedLifetime: true });
   const port = worker.port;
   const calls = new Map();
-  const listeners = { status: [], failed: [], exited: [], mesh: [], shutdown: [] };
+  const listeners = { status: [], failed: [], exited: [], mesh: [], shutdown: [], closed: [] };
   const dataChannels = new Map(); // docker node name -> open(label) of join.js
   let seq = 0;
   let hello;
@@ -122,6 +122,7 @@ export async function connectCluster(url, tries = 0) {
       session?.stop();
       port.close();
       release();
+      listeners.closed.forEach((fn) => fn());
     },
     // ended: the last lines of the logs of a control plane that is gone.
     get ended() { return ended; },

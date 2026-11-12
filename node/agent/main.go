@@ -43,7 +43,18 @@ type offerToken struct {
 	SDP    string `json:"sdp"`
 	Port   int    `json:"p"`
 	Server string `json:"s,omitempty"`
+	// A paired node (join --keep) has no offer: the tabs send theirs
+	// through the relay (relay.go), to the topic, sealed with the key.
+	Relay string `json:"ru,omitempty"`
+	Topic string `json:"rt,omitempty"`
+	Key   string `json:"k,omitempty"`
+	// Kind "kubectl": no node, the agent forwards a port to the
+	// kube-apiserver for a kubectl outside the browser (join --kubectl).
+	Kind string `json:"kind,omitempty"`
 }
+
+// paired: the node stays when its tabs are gone and waits for new offers.
+func (t offerToken) paired() bool { return t.SDP == "" && t.Key != "" }
 
 type answerToken struct {
 	V   int    `json:"v"`
@@ -83,8 +94,9 @@ func main() {
 	stun := flag.String("stun", "stun:stun.l.google.com:19302", "STUN server, empty to disable")
 	noKubelet := flag.Bool("no-kubelet", false, "only run the tunnel (for testing)")
 	advertise := flag.String("advertise", "127.0.0.1", "extra host ICE candidate addresses, comma separated (for docker -p port mappings), empty to disable")
+	listen := flag.String("listen", "", "kubectl: the address for kubectl (default :6443 in a container, else 127.0.0.1:6443)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: tabernetes [flags] join <token>\n")
+		fmt.Fprintf(os.Stderr, "usage: tabernetes [flags] join <token>\n       tabernetes [flags] kubectl <token>\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -92,7 +104,7 @@ func main() {
 	if len(args) == 1 {
 		args = []string{"join", args[0]}
 	}
-	if len(args) != 2 || args[0] != "join" {
+	if len(args) != 2 || args[0] != "join" && args[0] != "kubectl" {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -102,6 +114,15 @@ func main() {
 	}
 	if tok.V != 1 {
 		log.Fatalf("unsupported token version %d", tok.V)
+	}
+	if (args[0] == "kubectl") != (tok.Kind == "kubectl") {
+		log.Fatalf("this token is for %q, not %q", map[bool]string{true: "kubectl", false: "join"}[tok.Kind == "kubectl"], args[0])
+	}
+	if tok.Kind == "kubectl" {
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer cancel()
+		runKubectl(ctx, cancel, tok, *stun, *advertise, *listen)
+		return
 	}
 
 	if inUserNS {
@@ -120,6 +141,10 @@ func main() {
 		log.Fatal(err)
 	}
 	defer m.close()
+	if tok.paired() {
+		runPaired(ctx, m, tok, !*noKubelet)
+		return
+	}
 	pc, err := m.newPeer()
 	if err != nil {
 		log.Fatal(err)
@@ -146,8 +171,44 @@ func main() {
 		return
 	}
 	log.Printf("connected to the control plane in the browser, joining as %s (%s)", tok.Name, tok.IP)
+	startNode(ctx, m, tok, !*noKubelet)
+	<-ctx.Done()
+	// Ctrl-C or docker stop: the node leaves the cluster now, not when the
+	// last tab closes. A paired node (join --keep) stays: docker stop and
+	// a restart of the host are no goodbye.
+	m.bye()
+}
 
-	if !*noKubelet {
+// bye tells the tabs that the node stops: a data channel "bye" to each.
+// The tab removes the node and its pods (join.js).
+func (m *mesh) bye() {
+	var wg sync.WaitGroup
+	for _, pc := range m.connected() {
+		dc, err := pc.CreateDataChannel("bye", nil)
+		if err != nil {
+			continue
+		}
+		wg.Add(1)
+		opened := make(chan struct{})
+		dc.OnOpen(func() { close(opened) })
+		go func() {
+			defer wg.Done()
+			select {
+			case <-opened:
+				// let the tab see it open before the connection closes
+				time.Sleep(200 * time.Millisecond)
+			case <-time.After(2 * time.Second):
+			}
+		}()
+	}
+	wg.Wait()
+	log.Print("left the cluster")
+}
+
+// startNode forwards the kube-apiserver addresses to the browser and starts
+// containerd and the kubelet.
+func startNode(ctx context.Context, m *mesh, tok offerToken, kubelet bool) {
+	if kubelet {
 		for _, ip := range []string{apiserverIP, tok.IP} {
 			if err := addLoopbackIP(ip); err != nil {
 				log.Fatalf("adding %s to lo: %v", ip, err)
@@ -162,13 +223,92 @@ func main() {
 		}
 		go m.serve(ctx, l)
 	}
-
-	if !*noKubelet {
+	if kubelet {
 		if err := runNode(ctx, tok); err != nil {
 			log.Fatal(err)
 		}
 	}
-	<-ctx.Done()
+}
+
+// runKubectl forwards a local port to the kube-apiserver in the browser and
+// prints a kubeconfig for it on stdout (the logs go to stderr), so that
+// "docker logs <name> 2>/dev/null" is the kubeconfig. The certificate of
+// the kube-apiserver is valid for 127.0.0.1.
+func runKubectl(ctx context.Context, cancel context.CancelFunc, tok offerToken, stun, advertise, listen string) {
+	if !tok.paired() {
+		log.Fatal("a kubectl token needs a relay")
+	}
+	if listen == "" {
+		listen = "127.0.0.1:6443"
+		if _, err := os.Stat("/.dockerenv"); err == nil {
+			listen = ":6443" // docker -p reaches the container, not its 127.0.0.1
+		}
+	}
+	m, err := newMesh(ctx, cancel, tok, stun, advertise)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer m.close()
+	r, err := newRelay(tok.Relay, tok.Topic, tok.Key)
+	if err != nil {
+		log.Fatal(err)
+	}
+	l, err := net.Listen("tcp", listen)
+	if err != nil {
+		log.Fatal(err)
+	}
+	go m.serve(ctx, l)
+	fmt.Print(kubeconfig(tok))
+	log.Printf("%s forwards %s to the kube-apiserver in the browser, offers come through %s", tok.Name, listen, tok.Relay)
+	r.serve(ctx, m.answerRelay(ctx))
+}
+
+func kubeconfig(tok offerToken) string {
+	ca := base64.StdEncoding.EncodeToString([]byte(tok.CA))
+	return fmt.Sprintf(`apiVersion: v1
+kind: Config
+clusters:
+- name: tabernetes
+  cluster:
+    server: https://127.0.0.1:6443
+    certificate-authority-data: %s
+contexts:
+- name: tabernetes
+  context: {cluster: tabernetes, user: %s}
+current-context: tabernetes
+users:
+- name: %s
+  user: {token: %s}
+`, ca, tok.Name, tok.Name, tok.Token)
+}
+
+// answerRelay answers an offer from the relay with a new peer.
+func (m *mesh) answerRelay(ctx context.Context) func(string) (string, error) {
+	return func(offer string) (string, error) {
+		pc, err := m.newPeer()
+		if err != nil {
+			return "", err
+		}
+		m.add(pc, nil)
+		sdp, err := answerOffer(ctx, pc, offer)
+		if err != nil {
+			pc.Close()
+		}
+		return sdp, err
+	}
+}
+
+// runPaired runs a paired node: it starts at once and lives on without a
+// tab. The kubelet retries until a tab connects; the container restarts
+// with the same token (docker run --restart) and keeps its certificate.
+func runPaired(ctx context.Context, m *mesh, tok offerToken, kubelet bool) {
+	r, err := newRelay(tok.Relay, tok.Topic, tok.Key)
+	if err != nil {
+		log.Fatal(err)
+	}
+	startNode(ctx, m, tok, kubelet)
+	log.Printf("%s (%s) waits for the browser, offers come through %s", tok.Name, tok.IP, tok.Relay)
+	r.serve(ctx, m.answerRelay(ctx))
 }
 
 // mesh is the set of WebRTC peer connections to the browser: one to every
@@ -186,15 +326,23 @@ type mesh struct {
 	mu    sync.Mutex
 	peers map[*webrtc.PeerConnection]bool // connected
 	next  int
+
+	// paired: the agent does not end without tabs (join --keep).
+	paired bool
 }
 
 func newMesh(ctx context.Context, cancel context.CancelFunc, tok offerToken, stun, advertise string) (*mesh, error) {
-	m := &mesh{ctx: ctx, cancel: cancel, peers: map[*webrtc.PeerConnection]bool{}}
+	m := &mesh{ctx: ctx, cancel: cancel, peers: map[*webrtc.PeerConnection]bool{}, paired: tok.paired()}
 	se := webrtc.SettingEngine{}
 	// The ICE checks start with the answer, but the browser only joins them
 	// once the "accept" line is pasted. pion gives up after 30s by default;
-	// wait as long as for the browser in main.
-	se.SetICETimeouts(10*time.Second, 10*time.Minute, 2*time.Second)
+	// wait as long as for the browser in main. Through the relay, the tab
+	// has the answer at once, and a peer that fails is gone sooner.
+	failed := 10 * time.Minute
+	if m.paired {
+		failed = 30 * time.Second
+	}
+	se.SetICETimeouts(10*time.Second, failed, 2*time.Second)
 	se.DetachDataChannels()
 	// Writes wait until SCTP has sent what is queued. Without it a fast
 	// sender (kubectl logs -f, kubectl cp) queues without limit in memory.
@@ -259,11 +407,13 @@ func (m *mesh) add(pc *webrtc.PeerConnection, onConnected func()) {
 			// gives up on it after minutes. Without any connected tab for
 			// a while, the browser is gone.
 			m.peers[pc] = false
-			go m.orphaned()
+			if !m.paired {
+				go m.orphaned()
+			}
 		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 			delete(m.peers, pc)
 			go pc.Close()
-			if len(m.peers) == 0 {
+			if len(m.peers) == 0 && !m.paired {
 				log.Print("webrtc: no tab is left")
 				m.cancel()
 			}
