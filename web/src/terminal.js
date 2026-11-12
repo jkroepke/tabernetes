@@ -511,6 +511,8 @@ async function bootHere(term, opts, logs, crash) {
   globalThis.tabernetesStatus(cached ? "compiled WebAssembly from the browser cache" : "downloaded and compiled WebAssembly");
   // The "free" command reads the size of the linear memory from here.
   globalThis.tabernetesMemory = instance.exports.mem;
+  // "uname -r" reads the release (TABERNETES_VERSION of the build).
+  globalThis.tabernetesVersion = typeof TABERNETES_VERSION === "string" ? TABERNETES_VERSION : "dev";
   let booted = false;
   runGo(go, instance).then(() => exited(), (e) => exited(e?.message ?? String(e)));
   function exited(why) {

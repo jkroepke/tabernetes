@@ -92,6 +92,8 @@ async function boot(stream) {
     // workers, so it would unpack the zstd frames one after the other.
     const instance = await instantiate(stream, go);
     globalThis.tabernetesMemory = instance.exports.mem;
+    // "uname -r" reads the release (TABERNETES_VERSION of the build).
+    globalThis.tabernetesVersion = typeof TABERNETES_VERSION === "string" ? TABERNETES_VERSION : "dev";
     started = true;
     // A hibernated control plane runs only in the binary it was taken from.
     const image = await hibernated;
