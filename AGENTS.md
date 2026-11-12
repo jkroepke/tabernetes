@@ -77,7 +77,7 @@ that name.
 - **Thin tabs** (`k8s/tabernetes/session.go`, `web/src/bridge.js`): with the
   SharedWorker, a tab runs no Go. The shell, kubectl and the kubelet of
   every tab are a session in the worker; the tab keeps xterm, the line
-  editing, the builtins in JS, WebRTC and the workers of its pods (a shared
+  editing, the built-ins in JS, WebRTC and the workers of its pods (a shared
   worker cannot start workers, so the worker asks the tab to `spawn` one and
   the tab relays its messages). Measured 2026-11-12 against v1.1.0
   (headless Chromium): reload with a running worker 1.4-1.6 s -> 0.2 s to

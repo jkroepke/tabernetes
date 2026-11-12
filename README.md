@@ -105,7 +105,7 @@ browser tab (single wasm binary)                     docker run tabernetes
   every tab run in the worker too, in a session of the tab
   (`k8s/tabernetes/session.go`, `web/src/bridge.js`). A tab only shows the
   terminal and does the line editing; the command lines, the keys of `vi`
-  and the output go over one MessagePort per tab, and so do the builtins
+  and the output go over one MessagePort per tab, and so do the built-ins
   of the terminal (`join`, `proxy`, `vnc`, ...), which the shell calls in the
   tab. So a tab that finds the worker running is at the prompt at once, and
   it does not hold a Go heap of its own. The files of `/root` are the same in
