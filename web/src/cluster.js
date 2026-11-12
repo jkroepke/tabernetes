@@ -19,7 +19,7 @@ const peers = new Map(); // node name -> Set of tab ids with a connected peer
 const statusLines = [];
 let binary = null; // the tab that hands over the binary, once
 let feed = null; // the controller of the stream its chunks go to, while they arrive
-let state = "new"; // new, booting, ready, failed, exited
+let state = "new"; // new, booting, ready, stopping, failed, exited
 let started = false; // the control plane runs, or it did
 let failure = "";
 let forgotten = false; // forget ran: no reload may find this cluster
@@ -171,11 +171,37 @@ function exited(why) {
   end("exited", why);
 }
 
+// poweroff stops the control plane for every tab: poweroff, shutdown and
+// reboot in a terminal. It is the end of this worker like a crash, but the
+// cluster is saved first, as a machine that shuts down writes its disks. The
+// next tab that loads the page boots it from the etcd snapshot, not from a
+// hibernated image: a reboot starts a fresh control plane. The tabs show a
+// broadcast like wall(1) first; the tab that rebooted reloads itself, the
+// others stay down until they are reloaded.
+let stopping = null;
+function poweroff(id, reboot) {
+  stopping ??= (async () => {
+    hibernation++; // a hibernation that runs now is void
+    state = "stopping";
+    rejectReady(new Error("the control plane is going down"));
+    const by = tabs.get(id)?.nodes[0] ?? "";
+    broadcast({ type: "shutdown", reboot, by });
+    // the last changes: Go hands the etcd snapshot over once a second, and
+    // the files of /root a moment after they changed
+    await Promise.race([
+      Promise.all([saved.flush(), fsys?.syncHome(), dropHibernated()]),
+      new Promise((r) => setTimeout(r, 5000)),
+    ]).catch(() => {});
+    end("exited", reboot ? "rebooted" : "powered off", { off: reboot ? "reboot" : "poweroff", by });
+  })();
+  return stopping;
+}
+
 // end is the end of this control plane: it did not start, or it exited. The
 // tabs say so. A worker cannot boot a second time, so it closes: the next tab
 // that loads the page gets a new worker, and with it a new cluster. Without
 // that, a reload would find the dead one for as long as another tab is open.
-function end(how, why) {
+function end(how, why, extra = {}) {
   if (state === "failed" || state === "exited") return;
   // A saved cluster that does not boot, or that crashes the control plane
   // while it boots, would do so after every reload: the next one starts new.
@@ -186,7 +212,7 @@ function end(how, why) {
   failure = why;
   // The tabs keep the last lines of the logs: "logs" cannot ask for them anymore.
   const last = logs.join("").split("\n").slice(-500).join("\n");
-  broadcast(how === "failed" ? { type: "failed", error: why, logs: last } : { type: "exited", why, crash: crash.join(""), logs: last });
+  broadcast(how === "failed" ? { type: "failed", error: why, logs: last } : { type: "exited", why, crash: crash.join(""), logs: last, ...extra });
   rejectReady(new Error(how === "failed" ? why : `the control plane exited${why ? `: ${why}` : ""}`));
   // after the answers to the tabs that wait in joinTab, and after the drop
   const close = () => setTimeout(() => self.close(), 1000);
@@ -311,6 +337,11 @@ const methods = {
     forgotten = true;
     hibernation++;
     return forget();
+  },
+  // poweroff: poweroff, shutdown and reboot in a tab. It answers once the
+  // cluster is saved, before the worker closes.
+  poweroff(id, reboot) {
+    return poweroff(id, !!reboot);
   },
   // logs: the last n lines of the control plane logs, for "logs" in a tab.
   logs(id, n) {

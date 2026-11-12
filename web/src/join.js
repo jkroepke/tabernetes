@@ -136,8 +136,25 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
     }
   };
   if (cluster) {
+    // poweroff and reboot: this cluster is gone, and the next boot makes new
+    // builtins. These stop dialing and close their connections.
+    cluster.on("closed", () => {
+      for (const s of paired.values()) clearTimeout(s.timer);
+      paired.clear();
+      for (const n of nodes) n.pc?.close();
+      nodes.length = 0;
+    });
     cluster.on("mesh", ({ name }) => meshConnect(name));
     cluster.rpc("meshNodes").then((names) => names.forEach(meshConnect), () => {});
+    // The control plane is gone (poweroff, reboot, a crash): close the
+    // connections, so that the docker nodes end like after the last tab.
+    const down = () => {
+      for (const { pc } of nodes) pc.close();
+      pending = null;
+      render();
+    };
+    cluster.on("exited", down);
+    cluster.on("failed", down);
   }
 
   // A connection that may still come up, or is up.
@@ -204,7 +221,7 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
     if (!nodes.some((n) => n.info.name === p.name)) nodes.push({ pc: null, info: { name: p.name } });
     render();
     const attempt = async () => {
-      if (paired.get(p.name) !== s) return;
+      if (paired.get(p.name) !== s || cluster?.ended) return;
       let ok = false;
       try { ok = await dial(p); } catch (e) { console.debug(`tabernetes: ${p.name}:`, e.message); }
       if (paired.get(p.name) !== s) return;

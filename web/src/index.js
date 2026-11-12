@@ -30,28 +30,44 @@ const nodes = document.createElement("span");
 const ports = document.createElement("span");
 status?.append(nodes, ports);
 // The control plane runs in a shared worker, so that every tab of the page
-// is a node of the same cluster and any of them may close.
-const cluster = el.dataset.cluster
-  ? await connectCluster(el.dataset.cluster).catch((e) => { console.warn("tabernetes:", e); return null; })
-  : null;
-startTerminal(el, {
-  cluster,
-  pods,
-  wasmURL: el.dataset.wasm,
-  workerURL: el.dataset.worker,
-  wasmSize: Number(el.dataset.size) || 0,
-  builtins: {
-    ...joinBuiltins({
-      image: el.dataset.image || TABERNETES_IMAGE,
-      stun: el.dataset.stun ?? undefined,
-      relay: el.dataset.relay || undefined,
-      status: status && nodes,
-      cluster,
+// is a node of the same cluster and any of them may close. proxy and vnc
+// register listeners of the page: they are made once, not per boot.
+const pageBuiltins = {
+  ...proxyBuiltins({ status: status && ports }),
+  ...vncBuiltins({ box: el.parentElement }),
+};
+// boot connects to the control plane and starts the terminal. reboot, and
+// Enter after a poweroff, boot again in this page (restart): the page may
+// sit behind a start button, which a reload would show again.
+async function boot() {
+  const cluster = el.dataset.cluster
+    ? await connectCluster(el.dataset.cluster).catch((e) => { console.warn("tabernetes:", e); return null; })
+    : null;
+  return startTerminal(el, {
+    cluster,
+    pods,
+    wasmURL: el.dataset.wasm,
+    workerURL: el.dataset.worker,
+    wasmSize: Number(el.dataset.size) || 0,
+    restart: cluster && (() => {
+      cluster.close();
+      globalThis.tabernetesForwards?.([]); // of the cluster that is gone
+      start();
     }),
-    ...proxyBuiltins({ status: status && ports }),
-    ...vncBuiltins({ box: el.parentElement }),
-  },
-}).then((t) => (globalThis.tabernetesTerminal = t)).catch((e) => {
+    builtins: {
+      ...joinBuiltins({
+        image: el.dataset.image || TABERNETES_IMAGE,
+        stun: el.dataset.stun ?? undefined,
+        relay: el.dataset.relay || undefined,
+        status: status && nodes,
+        cluster,
+      }),
+      ...pageBuiltins,
+    },
+  }).then((t) => (globalThis.tabernetesTerminal = t));
+}
+const start = () => boot().catch((e) => {
   el.textContent = "Tabernetes failed to start: " + e;
   console.error(e);
 });
+start();
