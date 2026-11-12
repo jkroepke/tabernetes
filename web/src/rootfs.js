@@ -180,3 +180,27 @@ LayerStorage.WHOLE = 4 << 20;
 LayerStorage.CACHE = 64 << 20;
 
 export const modes = { S_IFDIR, S_IFREG, S_IFLNK };
+
+// statRoot makes statfs of the root file system (df) tell the truth. v86
+// says that every 9p file system has 256 GiB and that the files of the
+// image are all that is used, also after the container wrote more. The size
+// is the ephemeral-storage limit of the container, or else the image file
+// system of the tab (layers.js), as on a real node, where the root of a
+// container is on the disk of /var/lib/containerd. Used is what the files
+// of the pod take now: the image and what the container wrote.
+// v86 keeps the written files in the memory of the worker of the pod and
+// does not stop at the size.
+const UNLINKED = 4; // the status of a deleted inode in v86 (STATUS_UNLINKED)
+
+export function statRoot(fs, size) {
+  fs.GetSpace = () => size;
+  fs.GetTotalSize = () => {
+    let used = 0;
+    for (const i of fs.inodes) {
+      if ((i.mode & S_IFMT) === S_IFREG && i.status !== UNLINKED) used += i.size;
+    }
+    // more than the size would make the free blocks negative
+    return Math.min(used, size);
+  };
+}
+

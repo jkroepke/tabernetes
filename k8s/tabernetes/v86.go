@@ -84,18 +84,23 @@ func (v *v86VM) start(ctx context.Context, log io.Writer, pull *imagePull) error
 	for _, s := range c.Args {
 		args = append(args, s)
 	}
-	var memory int64
+	var memory, storage int64
 	if q, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
 		memory = q.Value()
+	}
+	// df shows it as the size of the root file system (web/src/vmworker.js)
+	if q, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+		storage = q.Value()
 	}
 	opts := map[string]any{
 		"image": c.Image,
 		// the API server defaults it: Always for :latest, else IfNotPresent
-		"pullPolicy": string(c.ImagePullPolicy),
-		"hostname":   v.tp.name,
-		"ip":         v.tp.ip,
-		"gateway":    v.tp.n.gateway(),
-		"memory":     memory,
+		"pullPolicy":       string(c.ImagePullPolicy),
+		"hostname":         v.tp.name,
+		"ip":               v.tp.ip,
+		"gateway":          v.tp.n.gateway(),
+		"memory":           memory,
+		"ephemeralStorage": storage,
 		"container": map[string]any{
 			"command":    command,
 			"args":       args,

@@ -14,8 +14,8 @@
 // layers stay in the browser: a second pull finds the image "already present
 // on machine", in every tab and after a reload.
 import { V86 } from "v86";
-import { Tree, LayerStorage, modes } from "./rootfs.js";
-import { openStore } from "./layers.js";
+import { Tree, LayerStorage, modes, statRoot } from "./rootfs.js";
+import { openStore, imageFSCapacity } from "./layers.js";
 import { SHA256 } from "./sha256.js";
 import { initramfs } from "./initramfs.js";
 import { bootKernel } from "./kernelboot.js";
@@ -467,6 +467,7 @@ async function start(m) {
   }
   emulator.fs9p.storage = new LayerStorage(layers, mem);
   emulator.fs9p.load_from_json(fsJSON);
+  statRoot(emulator.fs9p, m.ephemeralStorage || (await imageFSCapacity()));
   emulator.run();
   // A restored VM has the clock and the random numbers of the saved one.
   const seed = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
