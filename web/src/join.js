@@ -1,5 +1,9 @@
 // "join" and "accept": connect a real kubelet to the in-browser control plane
 // using WebRTC data channels. Signaling is copy & paste, no server involved.
+// "join --keep" pairs the node instead: it stays in the cluster, and the tabs
+// reach it again after a reload through a relay (relay.js). "unjoin" ends
+// the pairing.
+import { DEFAULT_RELAY, exchange } from "./relay.js";
 
 const B = (s) => `\x1b[1m${s}\x1b[0m`;
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
@@ -42,10 +46,12 @@ const STATES = {
 
 // joinBuiltins returns the join and accept commands. status is an element
 // that shows every node and the state of its WebRTC connection.
-export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", status, cluster }) {
+export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", relay = DEFAULT_RELAY, status, cluster }) {
   const nodes = [];
   let pending = null;
   let seq = 0;
+  // The paired nodes this tab dials (join --keep): name -> {p, delay, timer}.
+  const paired = new Map();
 
   const render = () => {
     if (!status) return;
@@ -55,7 +61,8 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
       return;
     }
     status.replaceChildren(...nodes.map(({ info, pc }) => {
-      const [text, color] = STATES[pc.connectionState] || [pc.connectionState, "#8b949e"];
+      const [text, color] = !pc ? ["waiting for the node", "#d29922"]
+        : STATES[pc.connectionState] || [pc.connectionState, "#8b949e"];
       const el = document.createElement("span");
       el.className = "tabernetes-node";
       const dot = document.createElement("span");
@@ -103,7 +110,8 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
   // meshConnect connects this tab to a docker node that joined through
   // another tab: the offer goes there through the shared worker.
   const meshConnect = async (name) => {
-    if (nodes.some((n) => n.info.name === name)) return;
+    if (nodes.some((n) => n.info.name === name && alive(n.pc))) return;
+    drop(name);
     const pc = new RTCPeerConnection({ iceServers: stun ? [{ urls: stun }] : [] });
     const entry = { pc, info: { name } };
     nodes.push(entry);
@@ -132,6 +140,101 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
     cluster.rpc("meshNodes").then((names) => names.forEach(meshConnect), () => {});
   }
 
+  // A connection that may still come up, or is up.
+  const alive = (pc) => pc && !["failed", "closed"].includes(pc.connectionState);
+  // drop removes the entries of a node whose connections ended.
+  const drop = (name) => {
+    for (let i = nodes.length - 1; i >= 0; i--) if (nodes[i].info.name === name && !alive(nodes[i].pc) && nodes[i] !== pending) nodes.splice(i, 1);
+  };
+
+  // dial connects this tab to the paired node p through the relay. It
+  // resolves true once the node is connected, or when it was already.
+  const dial = async (p) => {
+    // A disconnected peer may come back, but a restarted node does not:
+    // dial it anew. The old peer would fail only after half a minute.
+    const cur = nodes.find((n) => n.info.name === p.name && alive(n.pc));
+    if (cur && cur.pc.connectionState !== "disconnected") return true;
+    cur?.pc.close();
+    drop(p.name);
+    const pc = new RTCPeerConnection({ iceServers: stun ? [{ urls: stun }] : [] });
+    const entry = { pc, info: { name: p.name } };
+    nodes.push(entry);
+    pc.createDataChannel("ctl");
+    pc.ondatachannel = (e) => cluster ? cluster.bridge(e.channel) : globalThis.tabernetes.attachChannel(e.channel);
+    const open = channels(pc);
+    open.pc = pc;
+    watch(pc, p.name);
+    render();
+    try {
+      await pc.setLocalDescription(await pc.createOffer());
+      await gatheringComplete(pc, 3000);
+      const sdp = await exchange(p, pc.localDescription.sdp);
+      await pc.setRemoteDescription({ type: "answer", sdp });
+      if (cluster) cluster.dataChannels.set(p.name, open);
+      else {
+        const err = globalThis.tabernetes.restoreNode(p.name, open);
+        if (err) throw err;
+      }
+      await new Promise((resolve, reject) => {
+        const check = () => {
+          if (pc.connectionState === "connected") resolve();
+          else if (!alive(pc)) reject(new Error(`the connection to ${p.name} failed`));
+          else return;
+          pc.removeEventListener("connectionstatechange", check);
+        };
+        pc.addEventListener("connectionstatechange", check);
+        check();
+      });
+      return true;
+    } catch (e) {
+      pc.close();
+      render();
+      throw e;
+    }
+  };
+
+  // keep dials the paired node p until this tab is connected to it, and
+  // again whenever the connection ends. A node that does not answer is
+  // asked less often, at most once a minute.
+  // eager: join --keep waits for the node to start, try often.
+  const keep = (p, eager = false) => {
+    if (paired.has(p.name)) return;
+    const s = { p, delay: 5000, timer: 0, eager };
+    paired.set(p.name, s);
+    if (!nodes.some((n) => n.info.name === p.name)) nodes.push({ pc: null, info: { name: p.name } });
+    render();
+    const attempt = async () => {
+      if (paired.get(p.name) !== s) return;
+      let ok = false;
+      try { ok = await dial(p); } catch (e) { console.debug(`tabernetes: ${p.name}:`, e.message); }
+      if (paired.get(p.name) !== s) return;
+      if (ok) s.eager = false;
+      s.delay = ok ? 5000 : Math.min(s.delay * 2, 60000);
+      s.timer = setTimeout(attempt, ok ? 5000 : s.eager ? 2000 : s.delay);
+    };
+    attempt();
+  };
+  const unkeep = (name) => {
+    const s = paired.get(name);
+    if (!s) return;
+    clearTimeout(s.timer);
+    paired.delete(name);
+    for (const n of nodes) if (n.info.name === name) n.pc?.close();
+    for (let i = nodes.length - 1; i >= 0; i--) if (nodes[i].info.name === name) nodes.splice(i, 1);
+    render();
+  };
+  // The paired nodes of the cluster: this tab dials them from the start.
+  (async () => {
+    let list;
+    if (cluster) list = await cluster.rpc("pairedNodes");
+    else {
+      while (!globalThis.tabernetes?.ready) await new Promise((r) => setTimeout(r, 500));
+      await globalThis.tabernetes.ready;
+      list = globalThis.tabernetes.pairedNodes();
+    }
+    list.forEach(keep);
+  })().catch((e) => console.debug("tabernetes: paired nodes:", e));
+
   // finish hands the answer of the node to the pending connection.
   const finish = async (answer, term) => {
     let ans;
@@ -147,8 +250,67 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
     return true;
   };
 
+  // joinPaired is join --keep: the token has no offer but the relay, the
+  // topic and the key of the node. The container starts the node at once
+  // and waits for offers; this tab sends one until the node answers.
+  const joinPaired = async (via, { term, active }) => {
+    let url;
+    try { url = new URL(via); } catch { url = null; }
+    if (url?.protocol !== "https:" && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(url?.hostname ?? "")) {
+      term.writeln(`The relay must be an https:// URL of an ntfy server.`);
+      return;
+    }
+    const noOpen = () => Promise.reject(new Error("no tab is connected to the node"));
+    let info;
+    if (cluster) info = await cluster.rpc("prepareJoin", url.href.replace(/\/+$/, ""));
+    else info = await globalThis.tabernetes.prepareJoin(noOpen, url.href.replace(/\/+$/, ""));
+    const p = info.pairing;
+    const port = 50000 + ((Number(info.name.replace(/^\D+/, "")) || ++seq) % 10000);
+    const token = await encodeToken({
+      v: 1, n: info.name, ip: info.ip, t: info.token, ca: info.ca, p: port, ru: p.relay, rt: p.topic, k: p.key,
+    });
+    globalThis.tabernetesLastJoin = { token, port, name: info.name, paired: true };
+    const run = (ports) => `docker run -d --restart unless-stopped ${ports} --name tabernetes-${info.name}`;
+    term.writeln(`Start the node on a machine with docker. It stays in the cluster: when this page`);
+    term.writeln(`reloads, the tabs find it again through ${p.relay} (end to end encrypted).`);
+    term.writeln("");
+    term.writeln(B(`${run(`-p ${port}:${port}/udp`)} \\`));
+    term.writeln(B(`  ${NODE_FLAGS} \\`));
+    term.writeln(B(`  ${image} \\`));
+    term.writeln(B(`  ${token}`));
+    term.writeln("");
+    term.writeln(`On the machine of this browser, publish the port on ${B(`127.0.0.1:${port}:${port}/udp`)} only.`);
+    term.writeln(`In your network, add ${B("--advertise <LAN IP of that machine>")} before the token.`);
+    term.writeln(`${B(`unjoin ${info.name}`)} removes the node again.`);
+    term.writeln("");
+    if (navigator.clipboard?.writeText) {
+      const cmd = `${run(`-p ${port}:${port}/udp`)} ${NODE_FLAGS} ${image} ${token}`;
+      await navigator.clipboard.writeText(cmd).then(() => term.writeln(DIM("(the docker command was copied to your clipboard)")), () => {});
+    }
+    keep(p, true);
+    term.writeln(`Waiting for ${info.name}... Ctrl-C stops waiting, the tab keeps trying.`);
+    while (active()) {
+      if (nodes.some((n) => n.info.name === info.name && n.pc?.connectionState === "connected")) {
+        term.writeln(`${info.name} is connected. ${B("kubectl get nodes")} shows it once its kubelet has registered.`);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  };
+
   return {
     async join(args, { term, ask, active }) {
+      let keepIt = false, via = relay;
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === "--keep") keepIt = true;
+        else if (args[i] === "--relay" && args[i + 1]) { keepIt = true; via = args[++i]; }
+        else if (args[i].startsWith("--relay=")) { keepIt = true; via = args[i].slice(8); }
+        else {
+          term.writeln(`usage: join [--keep] [--relay <ntfy URL>]`);
+          return;
+        }
+      }
+      if (keepIt) return joinPaired(via, { term, active });
       if (pending) {
         // The node never answered (docker run failed, accept line lost): start over.
         term.writeln(DIM(`dropping the pending join for ${pending.info.name}`));
@@ -208,6 +370,20 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
         if (pending !== me) return; // another join replaced this one
         if (answer.trim() && await finish(answer, term)) return;
       }
+    },
+
+    async unjoin(args, { term }) {
+      const name = args[0];
+      if (!name) { term.writeln(`usage: unjoin <node>`); return; }
+      try {
+        if (cluster) await cluster.rpc("unjoin", name);
+        else await globalThis.tabernetes.unjoin(name);
+      } catch (e) {
+        term.writeln(e.message);
+        return;
+      }
+      unkeep(name);
+      term.writeln(`${name} is gone from the cluster. Its container still waits for the browser: ${B(`docker rm -f tabernetes-${name}`)}`);
     },
 
     async accept(args, { term }) {

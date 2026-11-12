@@ -43,7 +43,15 @@ type offerToken struct {
 	SDP    string `json:"sdp"`
 	Port   int    `json:"p"`
 	Server string `json:"s,omitempty"`
+	// A paired node (join --keep) has no offer: the tabs send theirs
+	// through the relay (relay.go), to the topic, sealed with the key.
+	Relay string `json:"ru,omitempty"`
+	Topic string `json:"rt,omitempty"`
+	Key   string `json:"k,omitempty"`
 }
+
+// paired: the node stays when its tabs are gone and waits for new offers.
+func (t offerToken) paired() bool { return t.SDP == "" && t.Key != "" }
 
 type answerToken struct {
 	V   int    `json:"v"`
@@ -120,6 +128,10 @@ func main() {
 		log.Fatal(err)
 	}
 	defer m.close()
+	if tok.paired() {
+		runPaired(ctx, m, tok, !*noKubelet)
+		return
+	}
 	pc, err := m.newPeer()
 	if err != nil {
 		log.Fatal(err)
@@ -146,8 +158,14 @@ func main() {
 		return
 	}
 	log.Printf("connected to the control plane in the browser, joining as %s (%s)", tok.Name, tok.IP)
+	startNode(ctx, m, tok, !*noKubelet)
+	<-ctx.Done()
+}
 
-	if !*noKubelet {
+// startNode forwards the kube-apiserver addresses to the browser and starts
+// containerd and the kubelet.
+func startNode(ctx context.Context, m *mesh, tok offerToken, kubelet bool) {
+	if kubelet {
 		for _, ip := range []string{apiserverIP, tok.IP} {
 			if err := addLoopbackIP(ip); err != nil {
 				log.Fatalf("adding %s to lo: %v", ip, err)
@@ -162,13 +180,35 @@ func main() {
 		}
 		go m.serve(ctx, l)
 	}
-
-	if !*noKubelet {
+	if kubelet {
 		if err := runNode(ctx, tok); err != nil {
 			log.Fatal(err)
 		}
 	}
-	<-ctx.Done()
+}
+
+// runPaired runs a paired node: it starts at once and lives on without a
+// tab. The kubelet retries until a tab connects; the container restarts
+// with the same token (docker run --restart) and keeps its certificate.
+func runPaired(ctx context.Context, m *mesh, tok offerToken, kubelet bool) {
+	r, err := newRelay(tok.Relay, tok.Topic, tok.Key)
+	if err != nil {
+		log.Fatal(err)
+	}
+	startNode(ctx, m, tok, kubelet)
+	log.Printf("%s (%s) waits for the browser, offers come through %s", tok.Name, tok.IP, tok.Relay)
+	r.serve(ctx, func(offer string) (string, error) {
+		pc, err := m.newPeer()
+		if err != nil {
+			return "", err
+		}
+		m.add(pc, nil)
+		sdp, err := answerOffer(ctx, pc, offer)
+		if err != nil {
+			pc.Close()
+		}
+		return sdp, err
+	})
 }
 
 // mesh is the set of WebRTC peer connections to the browser: one to every
@@ -186,15 +226,23 @@ type mesh struct {
 	mu    sync.Mutex
 	peers map[*webrtc.PeerConnection]bool // connected
 	next  int
+
+	// paired: the agent does not end without tabs (join --keep).
+	paired bool
 }
 
 func newMesh(ctx context.Context, cancel context.CancelFunc, tok offerToken, stun, advertise string) (*mesh, error) {
-	m := &mesh{ctx: ctx, cancel: cancel, peers: map[*webrtc.PeerConnection]bool{}}
+	m := &mesh{ctx: ctx, cancel: cancel, peers: map[*webrtc.PeerConnection]bool{}, paired: tok.paired()}
 	se := webrtc.SettingEngine{}
 	// The ICE checks start with the answer, but the browser only joins them
 	// once the "accept" line is pasted. pion gives up after 30s by default;
-	// wait as long as for the browser in main.
-	se.SetICETimeouts(10*time.Second, 10*time.Minute, 2*time.Second)
+	// wait as long as for the browser in main. Through the relay, the tab
+	// has the answer at once, and a peer that fails is gone sooner.
+	failed := 10 * time.Minute
+	if m.paired {
+		failed = 30 * time.Second
+	}
+	se.SetICETimeouts(10*time.Second, failed, 2*time.Second)
 	se.DetachDataChannels()
 	// Writes wait until SCTP has sent what is queued. Without it a fast
 	// sender (kubectl logs -f, kubectl cp) queues without limit in memory.
@@ -259,11 +307,13 @@ func (m *mesh) add(pc *webrtc.PeerConnection, onConnected func()) {
 			// gives up on it after minutes. Without any connected tab for
 			// a while, the browser is gone.
 			m.peers[pc] = false
-			go m.orphaned()
+			if !m.paired {
+				go m.orphaned()
+			}
 		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 			delete(m.peers, pc)
 			go pc.Close()
-			if len(m.peers) == 0 {
+			if len(m.peers) == 0 && !m.paired {
 				log.Print("webrtc: no tab is left")
 				m.cancel()
 			}

@@ -126,6 +126,10 @@ func boot() (*cluster, error) {
 		return nil, fmt.Errorf("kube-apiserver did not get ready: %w", err)
 	}
 	if st != nil {
+		// The paired docker nodes stay (join --keep): the tabs dial them again.
+		if err := loadPairings(context.Background()); err != nil {
+			return nil, fmt.Errorf("reading the paired nodes: %w", err)
+		}
 		status("removing the nodes of your last visit")
 		if err := dropOldNodes(context.Background()); err != nil {
 			return nil, fmt.Errorf("removing the old nodes: %w", err)
@@ -372,15 +376,41 @@ func main() {
 	// tabernetes.dial(port, onData, onClose) for the VNC viewer, see dial.go.
 	api.Set("dial", js.FuncOf(func(this js.Value, a []js.Value) any { return dialJS(a) }))
 
-	// prepareJoin(open: (label: string) => Promise<RTCDataChannel>): Promise<{name, ip, token, ca, caHash}>
+	// prepareJoin(open: (label: string) => Promise<RTCDataChannel>, relay?: string): Promise<{name, ip, token, ca, caHash, pairing?}>
+	// With a relay URL, the node is paired (join --keep, paired.go).
 	api.Set("prepareJoin", js.FuncOf(func(this js.Value, a []js.Value) any {
 		open := a[0]
+		relay := ""
+		if len(a) > 1 && a[1].Type() == js.TypeString {
+			relay = a[1].String()
+		}
 		return promise(func() (any, error) {
 			if current == nil {
 				return nil, fmt.Errorf("cluster is not ready yet")
 			}
-			return current.prepareJoin(open)
+			return current.prepareJoin(open, relay)
 		})
+	}))
+	// pairedNodes(): [{name, ip, relay, topic, key}] of the paired docker nodes.
+	api.Set("pairedNodes", js.FuncOf(func(this js.Value, a []js.Value) any {
+		list := []any{}
+		for _, p := range pairings() {
+			list = append(list, p.js())
+		}
+		return js.ValueOf(list)
+	}))
+	// restoreNode(name, open) connects the kube-apiserver to the kubelet of a
+	// paired node again, through open (like the one of prepareJoin).
+	api.Set("restoreNode", js.FuncOf(func(this js.Value, a []js.Value) any {
+		if err := restoreNode(a[0].String(), a[1]); err != nil {
+			return js.Global().Get("Error").New(err.Error())
+		}
+		return nil
+	}))
+	// unjoin(name): Promise removes a paired node, its pairing and its pods.
+	api.Set("unjoin", js.FuncOf(func(this js.Value, a []js.Value) any {
+		name := a[0].String()
+		return promise(func() (any, error) { return nil, unjoin(context.Background(), name) })
 	}))
 	// attachChannel(dc: RTCDataChannel) for channels opened by a node agent.
 	api.Set("attachChannel", js.FuncOf(func(this js.Value, a []js.Value) any {

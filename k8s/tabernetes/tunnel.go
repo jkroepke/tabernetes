@@ -250,8 +250,23 @@ func attach(conn io.ReadWriteCloser, label string) {
 type joinedNode struct {
 	name string
 	ip   string
-	open js.Value // JS function(label) => Promise<RTCDataChannel or MessagePort>
 	ln   net.Listener
+
+	mu   sync.Mutex
+	open js.Value // JS function(label) => Promise<RTCDataChannel or MessagePort>
+}
+
+func (jn *joinedNode) setOpen(open js.Value) {
+	jn.mu.Lock()
+	jn.open = open
+	jn.mu.Unlock()
+}
+
+func (jn *joinedNode) openChannel(label string) js.Value {
+	jn.mu.Lock()
+	open := jn.open
+	jn.mu.Unlock()
+	return open.Invoke(label)
 }
 
 var (
@@ -262,8 +277,9 @@ var (
 
 // prepareJoin creates a bootstrap token and allocates an IP for a new node.
 // The returned listener on <ip>:10250 forwards apiserver->kubelet connections
-// through a data channel created by the JS side.
-func (c *cluster) prepareJoin(open js.Value) (map[string]any, error) {
+// through a data channel created by the JS side. A relay URL pairs the node
+// (join --keep, paired.go): the answer has the topic and the key for it.
+func (c *cluster) prepareJoin(open js.Value, relay string) (map[string]any, error) {
 	nodesMu.Lock()
 	n := nextNode
 	nextNode++
@@ -289,6 +305,16 @@ stringData:
   usage-bootstrap-signing: "true"
   auth-extra-groups: system:bootstrappers:tabernetes:default-node-token
 `, id, id, secret, time.Now().Add(2*time.Hour).UTC().Format(time.RFC3339))
+	var pair *pairing
+	if relay != "" {
+		// The topic is the address of the node on the relay, the key
+		// encrypts what goes through it: the relay sees neither the offers
+		// nor the addresses in them.
+		pair = &pairing{Name: name, IP: ip, Relay: relay, Topic: "tabernetes-" + randToken(24), Key: randKey()}
+		if err := savePairing(context.Background(), *pair); err != nil {
+			return nil, fmt.Errorf("saving the pairing: %w", err)
+		}
+	}
 	if code := runKubectl(context.Background(), []string{"apply", "-f", "-"}, strings.NewReader(manifest), os.Stderr, os.Stderr); code != 0 {
 		return nil, fmt.Errorf("creating bootstrap token failed (exit %d)", code)
 	}
@@ -303,13 +329,17 @@ stringData:
 	nodesMu.Unlock()
 	go jn.serve()
 
-	return map[string]any{
+	info := map[string]any{
 		"name":   name,
 		"ip":     ip,
 		"token":  id + "." + secret,
 		"ca":     string(c.ca.caPEM),
 		"caHash": c.ca.caHash(),
-	}, nil
+	}
+	if pair != nil {
+		info["pairing"] = pair.js()
+	}
+	return info, nil
 }
 
 func (jn *joinedNode) serve() {
@@ -321,7 +351,7 @@ func (jn *joinedNode) serve() {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			dc, err := awaitPromise(ctx, jn.open.Invoke("kubelet:10250"))
+			dc, err := awaitPromise(ctx, jn.openChannel("kubelet:10250"))
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "tabernetes: opening kubelet channel:", err)
 				tcp.Close()
@@ -336,6 +366,9 @@ func awaitPromise(ctx context.Context, p js.Value) (js.Value, error) {
 	type result struct {
 		v   js.Value
 		err error
+	}
+	if p.Type() != js.TypeObject || p.Get("then").Type() != js.TypeFunction {
+		return js.Undefined(), errors.New("not a promise")
 	}
 	ch := make(chan result, 1)
 	var then, catch js.Func

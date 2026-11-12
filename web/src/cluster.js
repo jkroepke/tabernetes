@@ -106,6 +106,13 @@ async function boot(stream) {
     running.then(() => exited(""), (e) => exited(e?.message ?? String(e)));
     await globalThis.tabernetes.ready;
     if (state !== "booting") return; // it exited meanwhile
+    // The kube-apiserver reaches the kubelets of the paired nodes through
+    // the tabs that dial them. After a resume, the functions that did so
+    // belonged to the worker that hibernated: they are new ones now.
+    for (const { name } of globalThis.tabernetes.pairedNodes()) {
+      const err = globalThis.tabernetes.restoreNode(name, (label) => openNode(name, label));
+      if (err) console.warn(`tabernetes: ${name}:`, err);
+    }
     state = "ready";
     resolveReady();
   } catch (e) {
@@ -254,10 +261,11 @@ const methods = {
   },
   // prepareJoin is "join" (docker) in a tab: the WebRTC connections live in
   // the tabs, one per tab.
-  async prepareJoin(id) {
+  // relay: join --keep, the node is paired (k8s/tabernetes/paired.go).
+  async prepareJoin(id, relay) {
     await ready;
     let name = "";
-    const info = await globalThis.tabernetes.prepareJoin((label) => openNode(name, label, id));
+    const info = await globalThis.tabernetes.prepareJoin((label) => openNode(name, label, id), relay);
     name = info.name;
     tabs.get(id)?.joined.push(name);
     return info;
@@ -272,6 +280,17 @@ const methods = {
   // meshDown: the connection of the tab to the node failed.
   meshDown(id, name) {
     peers.get(name)?.delete(id);
+  },
+  // pairedNodes: the paired docker nodes, every tab dials them (join.js).
+  async pairedNodes() {
+    await ready;
+    return globalThis.tabernetes.pairedNodes();
+  },
+  // unjoin: remove a paired node.
+  async unjoin(id, name) {
+    await ready;
+    await globalThis.tabernetes.unjoin(name);
+    peers.delete(name);
   },
   // meshNodes: the docker nodes a new tab connects to.
   meshNodes() {

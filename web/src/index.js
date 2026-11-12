@@ -44,6 +44,7 @@ startTerminal(el, {
     ...joinBuiltins({
       image: el.dataset.image || TABERNETES_IMAGE,
       stun: el.dataset.stun ?? undefined,
+      relay: el.dataset.relay || undefined,
       status: status && nodes,
       cluster,
     }),
