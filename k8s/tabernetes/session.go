@@ -38,7 +38,8 @@ type session struct {
 var (
 	sessionsMu sync.Mutex
 	sessions   = map[string]*session{}
-	nextTab    = 1
+	// droppingTabs are the names whose nodes dropNode is deleting (tabs.go).
+	droppingTabs = map[string]bool{}
 )
 
 type sessionKey struct{}
@@ -58,7 +59,11 @@ func termFrom(ctx context.Context) *terminal {
 	return newTerminal()
 }
 
-// openTab adds a tab: it gets the next name and address and a shell.
+// openTab adds a tab: it gets the lowest free name and address and a shell.
+// A hibernated control plane (web/src/hibernate.js) lives on over many
+// visits and would run out of numbers with a counter. A number is free once
+// the node of its last tab is deleted: a reload must not get the name of the
+// node that is just being removed.
 // Its node registers in the background: the shell does not need it, and on
 // a new cluster the node waits seconds for its pod CIDR.
 func openTab(host js.Value) (*session, error) {
@@ -66,12 +71,17 @@ func openTab(host js.Value) (*session, error) {
 		return nil, errors.New("the cluster is not ready yet")
 	}
 	sessionsMu.Lock()
-	n := nextTab
+	n := 1
+	for ; n <= 250; n++ {
+		name := fmt.Sprintf("tab-%d", n)
+		if sessions[name] == nil && !droppingTabs[name] {
+			break
+		}
+	}
 	if n > 250 {
 		sessionsMu.Unlock()
 		return nil, errors.New("too many tabs")
 	}
-	nextTab++
 	s := &session{
 		name: fmt.Sprintf("tab-%d", n),
 		ip:   fmt.Sprintf("10.0.1.%d", n),
@@ -147,6 +157,13 @@ func openSessions() int {
 	sessionsMu.Lock()
 	defer sessionsMu.Unlock()
 	return len(sessions)
+}
+
+// droppingNodes is the number of nodes that dropNode is still deleting.
+func droppingNodes() int {
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+	return len(droppingTabs)
 }
 
 // api is the session for JavaScript (web/src/terminal.js, bridge.js).

@@ -364,6 +364,8 @@ func main() {
 	}))
 	// sessions(): the number of open sessions
 	api.Set("sessions", js.FuncOf(func(js.Value, []js.Value) any { return openSessions() }))
+	// dropping(): the number of nodes of closed tabs that are still being deleted
+	api.Set("dropping", js.FuncOf(func(js.Value, []js.Value) any { return droppingNodes() }))
 
 	// proxy(port, method, path, headers, body): Promise<{status, statusText, headers, body}>, see proxy.go
 	api.Set("proxy", js.FuncOf(func(this js.Value, a []js.Value) any { return proxyJS(a) }))

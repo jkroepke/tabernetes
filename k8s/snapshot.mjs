@@ -18,6 +18,7 @@
 // The JavaScript values Go holds must be found again by name in the page,
 // so the build fails if Go holds anything else (a js.FuncOf, an object it
 // created) after init.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import vm from "node:vm";
 import { pathToFileURL } from "node:url";
@@ -100,13 +101,15 @@ function readName(body) {
 const gsec = secs.find((s) => s.id === 6);
 const types = globals(gsec.body);
 
-// The same binary with every global exported as g<i>, to read them.
-const probe = Buffer.concat([wasm.subarray(0, 8), ...secs.map((s) => {
-  if (s.id !== 7) return section(s.id, s.body);
+// Every global is exported as g<i>: this script reads them here, and the
+// page reads and sets them to hibernate the control plane (web/src/hibernate.js).
+const exports = (() => {
+  const s = secs.find((s) => s.id === 7);
   const [n, p] = readLEB(s.body, 0);
   const extra = types.map((_, i) => Buffer.concat([name(`g${i}`), Buffer.from([3]), uLEB(i)]));
-  return section(7, Buffer.concat([uLEB(n + types.length), s.body.subarray(p), ...extra]));
-})]);
+  return Buffer.concat([uLEB(n + types.length), s.body.subarray(p), ...extra]);
+})();
+const probe = Buffer.concat([wasm.subarray(0, 8), ...secs.map((s) => section(s.id, s.id === 7 ? exports : s.body))]);
 
 // A page has no process object: wasm_exec.js puts a stub there and fs.js
 // adds to it. Node's own process is read-only in parts, so hide it.
@@ -170,6 +173,9 @@ const meta = {
   nextTimeout: go._nextCallbackTimeoutID,
   env: ENV,
   constants,
+  // A hibernated control plane (web/src/hibernate.js) resumes only in the
+  // binary that it ran in.
+  build: crypto.createHash("sha256").update(wasm).digest("hex").slice(0, 16),
 };
 
 // ---- write the new binary ----
@@ -202,6 +208,7 @@ for (const s of secs) {
     const max = flags & 1 ? body.subarray(q) : Buffer.alloc(0);
     body = Buffer.concat([uLEB(1), Buffer.from([flags]), uLEB(mem.length / PAGE), max]);
   } else if (s.id === 6) body = global;
+  else if (s.id === 7) body = exports;
   else if (s.id === 11) body = data;
   else if (s.id === 12) body = uLEB(segments.length);
   out.push(section(s.id, body));

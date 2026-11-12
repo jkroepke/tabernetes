@@ -320,6 +320,22 @@ packages (`k8s/snapshot.mjs`, at build time). That init takes about 0.9 s in
 the browser. The page starts the program from the snapshot instead, in the
 tab and in the shared worker, so `main` runs after a few milliseconds.
 
+The shared worker takes the same kind of snapshot of the running control
+plane when the last tab closes (`web/src/hibernate.js`): the linear memory,
+the wasm globals, the in-memory file system and the JavaScript values that Go
+holds, the memory gzipped to about 40 MB in IndexedDB. Go is paused between
+two JavaScript tasks, so a copy taken in a task of its own is consistent;
+it pauses the control plane for about 0.25 s. The next visit compiles the
+binary as always, but resumes the image instead of booting kube-apiserver:
+the prompt comes after ~3.4 s instead of ~9 s. Callbacks of `js.FuncOf` are
+made again by their Go id, objects that Go built are rebuilt from their
+parts, and objects of the closed tabs (MessagePorts, data channels) become
+stand-ins that are closed at once, so the goroutines that used them end. The
+image is good for one start: the next visit deletes it as it reads it, and
+a tab that joins the running worker deletes it too. Only Chrome 148+ keeps
+the worker alive after the last tab (`extendedLifetime`), long enough to
+write the image; other browsers boot as before.
+
 The blog fingerprints the files with Hugo, so the name of the binary
 changes with its content. The page keeps the binary in the Cache Storage of
 the browser and the next visit downloads nothing. GitHub Pages itself sends

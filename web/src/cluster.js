@@ -7,7 +7,8 @@
 // (k8s/tabernetes/session.go, bridge.js): a tab runs no Go itself.
 import "./wasm_exec.js";
 import { installFS } from "./fs.js";
-import { clusterState, forget, loadHome, saveHome } from "./state.js";
+import { capture, pack, resume, trackFuncs, unpack } from "./hibernate.js";
+import { clusterState, dropHibernated, forget, loadHome, saveHibernated, saveHome, takeHibernated } from "./state.js";
 import { instantiate, runGo } from "./wasm.js";
 import { serveTab } from "./bridge.js";
 
@@ -22,6 +23,7 @@ let state = "new"; // new, booting, ready, failed, exited
 let started = false; // the control plane runs, or it did
 let failure = "";
 let forgotten = false; // forget ran: no reload may find this cluster
+let go = null; // the Go of wasm_exec.js that runs the control plane
 let resolveReady, rejectReady;
 const ready = new Promise((res, rej) => { resolveReady = res; rejectReady = rej; });
 ready.catch(() => {});
@@ -47,6 +49,7 @@ let crashing = false;
 // The files of /root from the last visit (state.js): the shells of all tabs
 // share them.
 const home = loadHome().catch(() => []);
+let fsys = null; // the in-memory file system of Go (fs.js)
 const output = (fd, s) => {
   if (crashing || /^(panic:|fatal error:)/m.test(s)) {
     crashing = true;
@@ -63,20 +66,42 @@ const output = (fd, s) => {
 // The cluster survives a reload: the control plane saves it (state.js).
 const saved = clusterState();
 globalThis.tabernetesState = saved;
+// The control plane of the last visit, hibernated when its last tab closed
+// (hibernate.js). It unpacks while the tab sends the binary.
+const hibernated = takeHibernated().then(async (image) => {
+  if (image) image.data = await unpack(image.data);
+  return image;
+}).catch((e) => {
+  console.warn("tabernetes: the hibernated control plane:", e);
+  return null;
+});
+let resumed = false; // this control plane was hibernated, it did not boot
+// hibernation counts the hibernations that started: a tab that joins, or
+// forget, makes a running one void. imaged: this worker saved an image.
+let hibernation = 0, imaged = false;
 
 // boot compiles the binary while the tab sends it, then starts the control plane.
 async function boot(stream) {
   state = "booting";
   try {
-    installFS(output, { records: await home, save: saveHome });
-    const go = new globalThis.Go();
+    fsys = installFS(output, { records: await home, save: saveHome });
+    go = new globalThis.Go();
     go.env = { HOME: "/root", USER: "root", PATH: "/usr/bin" };
+    trackFuncs(go);
     // The tab sends the binary unpacked: a shared worker cannot start
     // workers, so it would unpack the zstd frames one after the other.
     const instance = await instantiate(stream, go);
     globalThis.tabernetesMemory = instance.exports.mem;
     started = true;
-    runGo(go, instance).then(() => exited(""), (e) => exited(e?.message ?? String(e)));
+    // A hibernated control plane runs only in the binary it was taken from.
+    const image = await hibernated;
+    let running;
+    if (image?.build && image.build === go.snapshot?.build) {
+      globalThis.tabernetesStatus(`resuming the control plane of your last visit (hibernated ${ago(image.at)})`);
+      resumed = true;
+      running = resume(go, instance, image, fsys);
+    } else running = runGo(go, instance);
+    running.then(() => exited(""), (e) => exited(e?.message ?? String(e)));
     await globalThis.tabernetes.ready;
     if (state !== "booting") return; // it exited meanwhile
     state = "ready";
@@ -84,6 +109,53 @@ async function boot(stream) {
   } catch (e) {
     end("failed", e.message);
   }
+}
+
+const ago = (t) => {
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  return s < 120 ? `${s} s ago` : s < 7200 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`;
+};
+
+// hibernate saves the running control plane once its last tab is gone, so
+// that the next visit resumes it instead of booting it (hibernate.js). The
+// worker lives about 30 s after the last tab (extendedLifetime, Chrome 148+);
+// browsers that end it at once get no image and boot as before.
+//
+// The etcd snapshot (state.go) stops at the same moment: the image is the
+// newer cluster, and a cluster that goes on without tabs only changes what
+// the next visit drops anyway (nodes, leases, events).
+async function hibernate() {
+  const gen = ++hibernation;
+  // dropNode runs in Go in the background: wait until the sessions of the
+  // closed tabs are closed and their nodes deleted, so that the image holds
+  // no half-deleted node.
+  const api = globalThis.tabernetes;
+  for (let i = 0; i < 100 && (api.sessions() || api.dropping()); i++) await new Promise((r) => setTimeout(r, 100));
+  await new Promise((r) => setTimeout(r, 0)); // a task of its own: Go is paused
+  if (tabs.size || forgotten || state !== "ready" || gen !== hibernation) return;
+  try {
+    const t0 = performance.now();
+    const image = capture(go, fsys);
+    saved.pause(true);
+    image.build = go.snapshot?.build;
+    image.data = await pack(image.data);
+    if (tabs.size || forgotten || gen !== hibernation) return;
+    imaged = true;
+    await saveHibernated(image);
+    if (gen !== hibernation) await dropHibernated();
+    else console.info(`tabernetes: hibernated in ${Math.round(performance.now() - t0)} ms (Go paused for ${Math.round(image.ms)} ms), ${(image.data.size / 2 ** 20).toFixed(1)} MiB; tab objects left behind:`, image.dead);
+  } catch (e) {
+    console.warn("tabernetes: hibernating:", e);
+  }
+}
+
+// unhibernate voids the image: a tab joins the control plane again and may
+// change the cluster.
+function unhibernate() {
+  hibernation++;
+  saved.pause(false);
+  if (imaged) dropHibernated();
+  imaged = false;
 }
 
 function exited(why) {
@@ -98,7 +170,9 @@ function end(how, why) {
   if (state === "failed" || state === "exited") return;
   // A saved cluster that does not boot, or that crashes the control plane
   // while it boots, would do so after every reload: the next one starts new.
-  const dropped = started && state === "booting" ? saved.drop() : Promise.resolve();
+  // A hibernated one that fails is not the fault of the saved cluster: the
+  // image is gone already (takeHibernated), the next visit boots from it.
+  const dropped = started && state === "booting" && !resumed ? saved.drop() : Promise.resolve();
   state = how;
   failure = why;
   // The tabs keep the last lines of the logs: "logs" cannot ask for them anymore.
@@ -209,6 +283,7 @@ const methods = {
   // on until the last tab closes, but not beyond: the next visit starts new.
   forget() {
     forgotten = true;
+    hibernation++;
     return forget();
   },
   // logs: the last n lines of the control plane logs, for "logs" in a tab.
@@ -227,6 +302,7 @@ self.onconnect = (e) => {
         port.nodes = [];
         port.joined = [];
         tabs.set(id, port);
+        unhibernate();
         // The tab holds this lock while it is open.
         navigator.locks.request(data.lock, () => {
           tabs.delete(id);
@@ -234,6 +310,7 @@ self.onconnect = (e) => {
           // Its node, and the docker nodes that no other tab is connected to.
           for (const name of port.nodes) globalThis.tabernetes?.dropNode(name);
           leave(id, port.joined);
+          if (!tabs.size && state === "ready") hibernate();
           // It was to hand over the binary and did not get to the end of it:
           // the other tabs would wait for this control plane forever.
           const gone = "the tab that downloaded the control plane was closed";
