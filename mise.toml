@@ -49,7 +49,7 @@ touch .build/kubernetes/.patched
 [tasks.wasm]
 description = "Build dist/tabernetes.wasm.zst"
 depends = ["patch"]
-sources = [".build/kubernetes/.patched", "k8s/build.sh"]
+sources = [".build/kubernetes/.patched", "k8s/build.sh", "k8s/snapshot.mjs", "web/src/fs.js"]
 outputs = ["dist/tabernetes.wasm.zst", ".build/wasm_exec.js"]
 run = '''
 mkdir -p dist

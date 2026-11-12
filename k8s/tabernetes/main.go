@@ -20,6 +20,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/client-go/rest"
 	logsapi "k8s.io/component-base/logs/api/v1"
 
@@ -316,6 +317,17 @@ func promise(fn func() (any, error)) js.Value {
 }
 
 func main() {
+	// The build (k8s/snapshot.mjs) saves the heap at this point, after the
+	// init of all packages, and the page starts from that. The sleep hands
+	// control back to JavaScript, with nothing else left to run. In the page
+	// the timer of the sleep is long gone, so main goes on at once.
+	if js.Global().Get("tabernetesSnapshot").Truthy() {
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Every start from the snapshot has the random seeds of the build. The
+	// names that Kubernetes generates (pods of a ReplicaSet, ...) come from
+	// util/rand, seeded with the clock during init: seed it again.
+	utilrand.Seed(time.Now().UnixNano())
 	// The allocation profiler takes a stack trace now and then. When that
 	// happens in runtime.beforeIdle, the js/wasm runtime cannot unwind the
 	// stack and dies with "invalid runtime symbol table". Nobody profiles

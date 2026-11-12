@@ -27,6 +27,8 @@ caches.delete("tabernetes-images").catch(() => {});
 const PLATFORM = { os: "linux", architecture: "386" };
 const INDEX_TYPES = ["application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"];
 const MANIFEST_TYPES = ["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"];
+// Layers that download at once, the default of containerd.
+const PULL_PARALLEL = 3;
 
 // MiB, of the VM of a pod: its memory limit, or 256 MiB without one. The
 // files of the image are not in it, only what the container runs and writes
@@ -223,21 +225,34 @@ async function unpackImage(p, ref, imageID, m, onFetching) {
   if (config.architecture && config.architecture !== PLATFORM.architecture) {
     throw new PullError(`failed to pull and unpack image "${ref.name}": no match for platform in manifest: not found (the tab node runs linux/386 images, this one is ${config.os}/${config.architecture})`);
   }
-  const layers = [];
-  for (const [i, l] of m.layers.entries()) {
-    let idx = indexes[i];
-    if (!idx) {
-      const { fetch, verify } = p.layer(l.digest);
+  // Up to PULL_PARALLEL layers download and unpack at once, as containerd
+  // does (max_concurrent_downloads = 3). It saves the round trips and the
+  // time the mirror needs to fetch a blob from Docker Hub. The order of the
+  // layers matters only for the root file system, not for the download.
+  const add = async (l) => {
+    const { fetch, verify } = p.layer(l.digest);
+    try {
+      return await store.add(l.digest, fetch, verify, l.mediaType);
+    } catch (e) {
+      if (e instanceof PullError) throw e;
+      const why = e?.name === "QuotaExceededError" ? "no space left on device" : e?.message || String(e);
+      throw new PullError(`failed to extract layer ${l.digest}: write /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs: ${why}`);
+    }
+  };
+  const missing = m.layers.map((l, i) => i).filter((i) => !indexes[i]);
+  let next = 0, failed = false;
+  await Promise.all(Array.from({ length: Math.min(PULL_PARALLEL, missing.length) }, async () => {
+    while (!failed && next < missing.length) {
+      const i = missing[next++];
       try {
-        idx = await store.add(l.digest, fetch, verify, l.mediaType);
+        indexes[i] = await add(m.layers[i]);
       } catch (e) {
-        if (e instanceof PullError) throw e;
-        const why = e?.name === "QuotaExceededError" ? "no space left on device" : e?.message || String(e);
-        throw new PullError(`failed to extract layer ${l.digest}: write /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs: ${why}`);
+        failed = true; // start no more layers, the pull fails anyway
+        throw e;
       }
     }
-    layers.push({ id: l.digest, entries: idx.entries });
-  }
+  }));
+  const layers = m.layers.map((l, i) => ({ id: l.digest, entries: indexes[i].entries }));
   return { present, size, imageID, config: config.config || {}, layers };
 }
 
