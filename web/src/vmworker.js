@@ -416,9 +416,14 @@ async function start(m) {
   tree.layer = img.layers.length;
   const now = Math.floor(Date.now() / 1000);
   const mem = new Map();
+  const enc = new TextEncoder();
   const extra = {
-    ".tabernetes/config.json": { mode: modes.S_IFREG | 0o644, data: new TextEncoder().encode(JSON.stringify(conf)) },
+    ".tabernetes/config.json": { mode: modes.S_IFREG | 0o644, data: enc.encode(JSON.stringify(conf)) },
+    // what the kubelet mounts into every container. init wrote them over
+    // 9p, which took 0.3 million instructions of every start.
+    "etc/hosts": { mode: modes.S_IFREG | 0o644, data: enc.encode(`# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n${m.ip ? `${m.ip}\t${m.hostname || ""}\n` : ""}`) },
   };
+  if (m.gateway) extra["etc/resolv.conf"] = { mode: modes.S_IFREG | 0o644, data: enc.encode(`nameserver ${m.gateway}\n`) };
   for (const [path, e] of Object.entries(extra)) {
     const key = `mem:${mem.size}`;
     mem.set(key, e.data);

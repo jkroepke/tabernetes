@@ -24,6 +24,12 @@ const GDT = 0x1000;
 // kernel must reach it before it maps high memory.
 const INITRD_MAX = 0x37000000;
 
+// Where a BIOS puts its tables. Linux looks for a PCI interrupt routing
+// table between 0xf0000 and 0xfffff: in steps of 16 bytes for "$PIR", then
+// byte by byte for "$IRT". Without a table that search is 0.3 million
+// instructions of every boot (2 % of it).
+const PIR = 0xf0000;
+
 // The PCI interrupts as SeaBIOS routes them: PIRQ A-D of the PIIX3 to IRQ
 // 10, 10, 11, 11.
 const PIRQ = [10, 10, 11, 11];
@@ -94,6 +100,24 @@ export function bootKernel(cpu, { kernel, initrd, cmdline }) {
   cpu.update_state_flags();
 
   routePCI(cpu.io);
+  mem.set(pirTable(), PIR);
+}
+
+// pirTable is a PCI interrupt routing table ($PIR) without entries, for the
+// PIIX3 at 00:01.0. Linux finds it at the first address it looks at, and
+// takes the IRQ of each device from its interrupt line (routePCI).
+function pirTable() {
+  const t = new Uint8Array(32);
+  const v = new DataView(t.buffer);
+  t.set([0x24, 0x50, 0x49, 0x52]); // "$PIR"
+  v.setUint16(4, 0x0100, true); // version 1.0
+  v.setUint16(6, t.length, true); // size: the header, no slots
+  t[8] = 0; // bus of the router
+  t[9] = 1 << 3; // device 1, function 0
+  v.setUint16(12, 0x8086, true); // the router: PIIX3
+  v.setUint16(14, 0x7000, true);
+  t[31] = -t.reduce((a, b) => a + b, 0) & 0xff; // checksum: all bytes add up to 0
+  return t;
 }
 
 // loadELF copies the segments of vmlinux to their physical addresses and
@@ -116,8 +140,9 @@ function loadELF(mem, kernel) {
 
 // routePCI does what SeaBIOS did for the PCI interrupts: it routes PIRQ A-D
 // of the PIIX3, writes the IRQ to the interrupt line of every device, and
-// makes these IRQs level triggered. Without a BIOS, Linux finds no routing
-// table and the virtio devices get no IRQ ("can't find IRQ for PCI INT A").
+// makes these IRQs level triggered. Without a BIOS, the routing table has no
+// entries, and without the interrupt lines the virtio devices get no IRQ
+// ("can't find IRQ for PCI INT A").
 // v86 maps pin and slot to a PIRQ like SeaBIOS: (pin - 1 + slot - 1) & 3.
 function routePCI(io) {
   const select = (dev, reg) => io.port_write32(0xcf8, (0x80000000 | (dev << 11) | (reg & 0xfc)) >>> 0);

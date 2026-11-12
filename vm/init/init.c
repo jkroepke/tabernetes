@@ -13,11 +13,12 @@
 // the root.
 //
 // It does what containerd and runc do for a container: mount /proc, /sys and
-// /dev, write /etc/hosts and /etc/resolv.conf, set the hostname, then start
-// the entrypoint with the environment, working directory and user of the
-// container. The console (ttyS0) is stdout and stderr of the container; the
-// second serial port (ttyS1) tells the page "started", "exit <code>" and, if
-// the entrypoint did not start, "error <message>" before that.
+// /dev, set the hostname, then start the entrypoint with the environment,
+// working directory and user of the container. The page puts /etc/hosts and
+// /etc/resolv.conf into the file system, as the kubelet does. The console
+// (ttyS0) is stdout and stderr of the container; the second serial port
+// (ttyS1) tells the page "started", "exit <code>" and, if the entrypoint did
+// not start, "error <message>" before that.
 //
 // kubectl exec and attach come in over the network: the kubelet connects to
 // port 60250 and sends one line of JSON (k8s/tabernetes/v86exec.go). After
@@ -1170,6 +1171,43 @@ static void loop(int *reported) {
 
 // ---- stage 0 ----
 
+// What a container gets in /dev, /proc and /sys. Stage 0 mounts them before
+// the page saves the VM and moves them into the root of the pod after "go":
+// a restored VM does not mount them again.
+static const struct {
+  const char *fs, *dir, *data;
+} mounts[] = {
+    {"proc", "/proc", NULL},
+    {"sysfs", "/sys", NULL},
+    {"devtmpfs", "/dev", NULL},
+    {"devpts", "/dev/pts", "newinstance,ptmxmode=0666"},
+    {"tmpfs", "/dev/shm", "mode=1777"},
+};
+
+static int mount_dev_proc_sys(void) {
+  for (size_t i = 0; i < sizeof(mounts) / sizeof(mounts[0]); i++) {
+    mkdir(mounts[i].dir, 0755);
+    if (mount(mounts[i].fs, mounts[i].dir, mounts[i].fs, 0, mounts[i].data) < 0 && errno != EBUSY)
+      return fail("mount %s: %s", mounts[i].dir, errtext(errno));
+  }
+  // programs open /dev/ptmx, the pairs are in the instance of /dev/pts
+  unlink("/dev/ptmx");
+  (void)!symlink("pts/ptmx", "/dev/ptmx");
+  // What a container runtime puts into /dev: the log files of nginx are
+  // links to /dev/stdout and /dev/stderr. A container that does not run as
+  // root opens the console through them, too.
+  (void)!symlink("/proc/self/fd", "/dev/fd");
+  (void)!symlink("/proc/self/fd/0", "/dev/stdin");
+  (void)!symlink("/proc/self/fd/1", "/dev/stdout");
+  (void)!symlink("/proc/self/fd/2", "/dev/stderr");
+  chmod("/dev/console", 0666);
+  return 0;
+}
+
+// The config of the pod, read by stage 0 from the root of the pod.
+static config_t staged_config;
+static int staged; // stage 0 set up /dev, /proc, /sys and the config
+
 // from <linux/random.h>, which a musl tool chain may not have
 #define RNDADDENTROPY 0x40085203
 #define RNDRESEEDCRNG 0x5207
@@ -1224,15 +1262,14 @@ static int if_addr(int s, const char *name, unsigned long req, in_addr_t a) {
   return 0;
 }
 
-// setup_network does what ip= on the kernel command line did: lo and eth0
-// up, the address of the pod on eth0 (/24), the default route to the
-// gateway.
+// setup_network does what ip= on the kernel command line did: the address
+// of the pod on eth0 (/24) and the default route to the gateway. lo and eth0
+// are up since stage 0.
 static int setup_network(const char *ip, const char *gateway) {
   int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
   if (s < 0) return fail("socket: %s", errtext(errno));
   int rc = -1;
   struct in_addr a, gw;
-  if (if_up(s, "lo") < 0) goto out;
   if (!ip || !*ip) {
     rc = 0;
     goto out;
@@ -1241,7 +1278,7 @@ static int setup_network(const char *ip, const char *gateway) {
     fail("invalid IP %s", ip);
     goto out;
   }
-  if (if_addr(s, "eth0", SIOCSIFADDR, a.s_addr) < 0 || if_addr(s, "eth0", SIOCSIFNETMASK, htonl(0xffffff00)) < 0 || if_up(s, "eth0") < 0) goto out;
+  if (if_addr(s, "eth0", SIOCSIFADDR, a.s_addr) < 0 || if_addr(s, "eth0", SIOCSIFNETMASK, htonl(0xffffff00)) < 0) goto out;
   if (!gateway || !*gateway) {
     rc = 0;
     goto out;
@@ -1266,8 +1303,7 @@ out:
 }
 
 static int stage0(void) {
-  mkdir("/dev", 0755);
-  if (mount("devtmpfs", "/dev", "devtmpfs", 0, NULL) < 0 && errno != EBUSY) return fail("mount /dev: %s", errtext(errno));
+  if (mount_dev_proc_sys() < 0) return -1;
   int tty = open("/dev/ttyS1", O_RDWR | O_CLOEXEC);
   if (tty < 0) return fail("open /dev/ttyS1: %s", errtext(errno));
   struct termios t;
@@ -1276,6 +1312,14 @@ static int stage0(void) {
     tcsetattr(tty, TCSANOW, &t);
   }
   control = tty;
+  // eth0 fills its receive queue (1024 buffers) when it comes up: 0.8
+  // million instructions, a third of the start of a pod after "go". Done
+  // here, it is in the saved VM. The address comes with the pod.
+  int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (s < 0) return fail("socket: %s", errtext(errno));
+  int up = if_up(s, "lo") < 0 || if_up(s, "eth0") < 0 ? -1 : 0;
+  close(s);
+  if (up < 0) return -1;
   report("ready");
   // The page saves the VM here, while init waits for the line.
   char line[1024];
@@ -1298,11 +1342,19 @@ static int stage0(void) {
   mkdir(NEW_ROOT, 0755);
   // cache=loose: only the guest changes the files, it may keep them
   if (mount("host9p", NEW_ROOT, "9p", 0, "trans=virtio,version=9p2000.L,cache=loose,msize=262144") < 0) return fail("mount 9p: %s", errtext(errno));
-  config_t c = {0};
-  if (load_config(NEW_ROOT "/.tabernetes/config.json", &c) < 0) return -1;
-  if (setup_network(c.ip, c.gateway) < 0) return -1;
+  if (load_config(NEW_ROOT "/.tabernetes/config.json", &staged_config) < 0) return -1;
+  if (setup_network(staged_config.ip, staged_config.gateway) < 0) return -1;
+  // /dev (with /dev/pts and /dev/shm), /proc and /sys move into the root of
+  // the pod
+  static const char *const moves[] = {"/dev", "/proc", "/sys"};
+  for (size_t i = 0; i < sizeof(moves) / sizeof(moves[0]); i++) {
+    char dir[64];
+    snprintf(dir, sizeof(dir), NEW_ROOT "%s", moves[i]);
+    mkdir(dir, 0755);
+    if (mount(moves[i], dir, NULL, MS_MOVE, NULL) < 0) return fail("move %s: %s", moves[i], errtext(errno));
+  }
+  staged = 1;
   // what switch_root does; the initramfs keeps only this program
-  umount2("/dev", MNT_DETACH);
   if (chdir(NEW_ROOT) < 0) return fail("chdir: %s", errtext(errno));
   if (mount(".", "/", NULL, MS_MOVE, NULL) < 0) return fail("move the root: %s", errtext(errno));
   if (chroot(".") < 0) return fail("chroot: %s", errtext(errno));
@@ -1318,56 +1370,21 @@ static int setup_container(config_t *c) {
     if (!c->args.n) return fail("no command specified");
     return 0;
   }
-  static const struct {
-    const char *fs, *dir, *data;
-  } mounts[] = {
-      {"proc", "/proc", NULL},
-      {"sysfs", "/sys", NULL},
-      {"devtmpfs", "/dev", NULL},
-      {"devpts", "/dev/pts", "newinstance,ptmxmode=0666"},
-      {"tmpfs", "/dev/shm", "mode=1777"},
-  };
-  for (size_t i = 0; i < sizeof(mounts) / sizeof(mounts[0]); i++) {
-    mkdir(mounts[i].dir, 0755);
-    if (mount(mounts[i].fs, mounts[i].dir, mounts[i].fs, 0, mounts[i].data) < 0 && errno != EBUSY)
-      return fail("mount %s: %s", mounts[i].dir, errtext(errno));
-  }
-  // programs open /dev/ptmx, the pairs are in the instance of /dev/pts
-  unlink("/dev/ptmx");
-  (void)!symlink("pts/ptmx", "/dev/ptmx");
-  // What a container runtime puts into /dev: the log files of nginx are
-  // links to /dev/stdout and /dev/stderr. A container that does not run as
-  // root opens the console through them, too.
-  (void)!symlink("/proc/self/fd", "/dev/fd");
-  (void)!symlink("/proc/self/fd/0", "/dev/stdin");
-  (void)!symlink("/proc/self/fd/1", "/dev/stdout");
-  (void)!symlink("/proc/self/fd/2", "/dev/stderr");
-  chmod("/dev/console", 0666);
-  // /dev was mounted after stage 0 opened ttyS1
+  if (!staged && mount_dev_proc_sys() < 0) return -1;
   if (control < 0) control = open("/dev/ttyS1", O_WRONLY | O_CLOEXEC);
   console = open("/dev/console", O_WRONLY | O_CLOEXEC);
   if (console < 0) return fail("open /dev/console: %s", errtext(errno));
   dup2(console, 1);
   dup2(console, 2);
 
-  if (load_config("/.tabernetes/config.json", c) < 0) return -1;
+  if (staged) *c = staged_config;
+  else if (load_config("/.tabernetes/config.json", c) < 0) return -1;
   if (!c->args.n) return fail("no command specified");
 
-  // what the kubelet mounts into every container
+  // what the kubelet does for every container; /etc/hosts and
+  // /etc/resolv.conf come from the page (web/src/vmworker.js)
   if (c->hostname && *c->hostname) (void)!sethostname(c->hostname, strlen(c->hostname));
-  mkdir("/etc", 0755);
-  FILE *f = fopen("/etc/hosts", "we");
-  if (f) {
-    fprintf(f, "# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
-    if (c->ip && *c->ip) fprintf(f, "%s\t%s\n", c->ip, c->hostname ? c->hostname : "");
-    fclose(f);
-  }
   if (c->gateway && *c->gateway) {
-    f = fopen("/etc/resolv.conf", "we");
-    if (f) {
-      fprintf(f, "nameserver %s\n", c->gateway);
-      fclose(f);
-    }
     // The network of the page learns the MAC of eth0 from the first packet:
     // send one, so that port-forward finds the pod.
     int u = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
