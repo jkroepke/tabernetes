@@ -6,7 +6,7 @@
 // (rootfs.js). The files stay outside the memory of the VM.
 //
 // The VM boots while the image is pulled. init waits in an initramfs for the
-// pod (vm/init/stage0.go): the first VM of each memory size saves its state
+// pod (vm/init/init.c): the first VM of each memory size saves its state
 // there, and later ones restore it instead of booting (vmstate.js).
 //
 // Docker Hub sends no CORS headers, so the page cannot pull from it. The
