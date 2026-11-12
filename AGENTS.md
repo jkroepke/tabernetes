@@ -72,8 +72,21 @@ that name.
   Without SharedWorker or Web Locks the tab runs the control plane itself.
   Chrome on Android has SharedWorker again since Chrome 148. The worker is
   created with `extendedLifetime` (Chrome 148+), so it outlives the last tab
-  by about 30 s and a reload joins the running cluster (2-3 s to the prompt
-  instead of ~12 s). `forget` closes it with the last tab.
+  by about 30 s and a reload joins the running cluster. `forget` closes it
+  with the last tab.
+- **Thin tabs** (`k8s/tabernetes/session.go`, `web/src/bridge.js`): with the
+  SharedWorker, a tab runs no Go. The shell, kubectl and the kubelet of
+  every tab are a session in the worker; the tab keeps xterm, the line
+  editing, the builtins in JS, WebRTC and the workers of its pods (a shared
+  worker cannot start workers, so the worker asks the tab to `spawn` one and
+  the tab relays its messages). Measured 2026-11-12 against v1.1.0
+  (headless Chromium): reload with a running worker 1.4-1.6 s -> 0.2 s to
+  the prompt, a further tab 1.5-1.9 s -> 0.2-0.3 s, and each further tab
+  ~730 MiB -> ~110 MiB of renderer RSS. Things that are process wide in Go
+  stay so: `os.Chdir` for kubectl, `localhost` of port-forward (shared by
+  all tabs), and the terminal hooks of moby/term and `kubectl edit`, which
+  is why only one `kubectl -t`/`edit` runs at a time (`ownTTY`). Without a
+  SharedWorker the tab runs the control plane and one session itself.
 - **The kubelet of a tab is like a Virtual Kubelet**: a node for the control
   plane, but no container runtime. Limit of 8 pods per tab (kept on purpose).
 - **Real images in a tab run in v86** (32-bit x86 JIT to Wasm, npm `v86`),

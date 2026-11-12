@@ -20,31 +20,61 @@ func init() {
 	term.TerminalStreams = func() (io.ReadCloser, io.Writer, io.Writer) {
 		in := ttyIn.Load()
 		if in == nil {
-			in = &termReader{done: closedChan}
+			in = &termReader{t: newTerminal(), done: closedChan}
 		}
-		return in, ttyOut{}, ttyOut{}
+		return in, ttyOut{in.t}, ttyOut{in.t}
 	}
 	term.TerminalSize = func() (uint16, uint16) {
-		cols, rows := tty.size()
+		t := newTerminal()
+		if in := ttyIn.Load(); in != nil {
+			t = in.t
+		}
+		cols, rows := t.size()
 		return uint16(cols), uint16(rows)
 	}
 	term.TerminalRaw = func() func() {
-		if ttyIn.Load() == nil {
+		in := ttyIn.Load()
+		if in == nil {
 			// the command line was canceled before kubectl got here
 			return func() {}
 		}
-		return tty.enterLine()
+		return in.t.enterLine()
 	}
 }
 
 var closedChan = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
 
-// ttyIn is the stdin of the kubectl that owns the terminal, if any.
-var ttyIn atomic.Pointer[termReader]
+// The hooks above and the editor of kubectl edit (vi.go) are process wide:
+// they cannot tell which tab runs the kubectl that calls them. So only one
+// such kubectl runs at a time; another tab waits for it.
+var (
+	ttyOwner = make(chan struct{}, 1)
+	// ttyIn is the stdin of the kubectl -t that owns the terminal, if any.
+	ttyIn atomic.Pointer[termReader]
+	// editTerm is the terminal of the kubectl edit that runs, if any.
+	editTerm atomic.Pointer[terminal]
+)
+
+// ownTTY waits until no other kubectl uses the terminal hooks. The returned
+// func lets the next one have them.
+func ownTTY(ctx context.Context, w io.Writer) (func(), error) {
+	select {
+	case ttyOwner <- struct{}{}:
+	default:
+		io.WriteString(w, "waiting for kubectl in another tab to end...\n")
+		select {
+		case ttyOwner <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return func() { <-ttyOwner }, nil
+}
 
 // termReader is stdin on the terminal in raw mode: the keys as the browser
 // sends them, until the kubectl command ends.
 type termReader struct {
+	t    *terminal
 	done <-chan struct{}
 	buf  []byte
 }
@@ -55,7 +85,7 @@ func (r *termReader) Close() error { return nil }
 func (r *termReader) Read(b []byte) (int, error) {
 	for len(r.buf) == 0 {
 		select {
-		case s := <-tty.keys:
+		case s := <-r.t.keys:
 			if s != resizeKey {
 				r.buf = []byte(s)
 			}
@@ -69,10 +99,10 @@ func (r *termReader) Read(b []byte) (int, error) {
 }
 
 // ttyOut is stdout on the terminal.
-type ttyOut struct{}
+type ttyOut struct{ t *terminal }
 
-func (ttyOut) Fd() uintptr                 { return term.TerminalFd }
-func (ttyOut) Write(b []byte) (int, error) { return tty.Write(b) }
+func (ttyOut) Fd() uintptr                   { return term.TerminalFd }
+func (o ttyOut) Write(b []byte) (int, error) { return o.t.Write(b) }
 
 // wantsTTY tells whether kubectl is asked for a tty (-t), before "--".
 func wantsTTY(args []string) bool {
@@ -91,8 +121,14 @@ func wantsTTY(args []string) bool {
 
 // kubectlTTY runs kubectl with the terminal as stdin.
 func kubectlTTY(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	t := termFrom(ctx)
+	release, err := ownTTY(ctx, hc.Stderr)
+	if err != nil {
+		return interp.ExitStatus(130)
+	}
+	defer release()
 	done := make(chan struct{})
-	in := &termReader{done: done}
+	in := &termReader{t: t, done: done}
 	ttyIn.Store(in)
 	defer func() {
 		ttyIn.CompareAndSwap(in, nil)
@@ -101,7 +137,7 @@ func kubectlTTY(ctx context.Context, hc interp.HandlerContext, args []string) er
 	code := make(chan int, 1)
 	// stderr goes straight to the terminal: kubectl attach says "If you
 	// don't see a command prompt, try pressing enter." in raw mode.
-	go func() { code <- runKubectl(ctx, args, in, hc.Stdout, ctxWriter{ctx, ttyOut{}}) }()
+	go func() { code <- runKubectl(ctx, args, in, hc.Stdout, ctxWriter{ctx, ttyOut{t}}) }()
 	select {
 	case c := <-code:
 		return exitCode(c)

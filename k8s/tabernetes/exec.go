@@ -70,6 +70,7 @@ func interactiveExec(args []string) ([]string, bool) {
 // execLines runs kubectl exec -i with the line editing of the terminal as
 // stdin.
 func execLines(ctx context.Context, args []string) int {
+	tty := termFrom(ctx)
 	execCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stdin, toPod := io.Pipe()

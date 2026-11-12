@@ -342,70 +342,28 @@ func main() {
 		status = func(s string) { cb.Invoke(s) }
 	}
 
-	// tabernetesRole "tab": the control plane runs in a SharedWorker, this
-	// tab joins it (tabs.go). Otherwise this instance boots the control plane,
-	// in a tab of its own or in the worker.
-	if r := js.Global().Get("tabernetesRole"); r.Type() == js.TypeString {
-		role = r.String()
-	}
-	var c *cluster
+	// This instance boots the control plane, in the SharedWorker
+	// (web/src/cluster.js) or in a tab without one. Every tab opens a session
+	// on it (openTab, session.go): its shell, kubectl and its node.
 	ready := promise(func() (any, error) {
-		var err error
-		if role == "tab" {
-			c, err = follow(js.Global().Get("tabernetesCluster"))
-		} else {
-			c, err = boot()
-			// a tab that runs the control plane itself is a node too; the
-			// SharedWorker has no document and is none
-			if err == nil && js.Global().Get("document").Truthy() {
-				go registerTab()
-			}
-		}
+		_, err := boot()
 		return nil, err
 	})
 	api.Set("ready", ready)
 
-	// shell(src: string, write: (s: string) => void, builtins: {[name]: (args, {write, stdin}) => Promise}): Promise<number>
-	sh := newShell()
-	api.Set("shell", js.FuncOf(func(this js.Value, a []js.Value) any {
-		src, out, builtins := a[0].String(), a[1], js.Undefined()
-		if len(a) > 2 {
-			builtins = a[2]
-		}
-		return promise(func() (any, error) { return sh.run(src, out, builtins), nil })
-	}))
-	// incomplete(src: string): boolean, true while src needs more lines
-	api.Set("incomplete", js.FuncOf(func(this js.Value, a []js.Value) any { return incomplete(a[0].String()) }))
-	// commands(): {tools: string[], builtins: string[]} for the help text
-	api.Set("commands", js.FuncOf(func(js.Value, []js.Value) any { return commands() }))
-	// rawMode(): boolean, true while a full screen program (vi) wants every key
-	api.Set("rawMode", js.FuncOf(func(js.Value, []js.Value) any { return tty.raw.Load() }))
-	// input(data: string) passes keys to a raw mode program
-	api.Set("input", js.FuncOf(func(this js.Value, a []js.Value) any { tty.input(a[0].String()); return nil }))
-	// resize(cols: number, rows: number) tells programs the terminal size
-	api.Set("resize", js.FuncOf(func(this js.Value, a []js.Value) any { tty.resize(a[0].Int(), a[1].Int()); return nil }))
-	// complete(line: string, builtins: string[]): Promise<{word, items, noSpace}>, tab completion
-	api.Set("complete", js.FuncOf(func(this js.Value, a []js.Value) any {
-		line := a[0].String()
-		var builtins []string
-		if len(a) > 1 && a[1].Type() == js.TypeObject {
-			for i := range a[1].Length() {
-				builtins = append(builtins, a[1].Index(i).String())
-			}
-		}
+	// openTab(host): Promise<session>, see session.go
+	api.Set("openTab", js.FuncOf(func(this js.Value, a []js.Value) any {
+		host := a[0]
 		return promise(func() (any, error) {
-			c := sh.complete(line, builtins)
-			items := make([]any, len(c.items))
-			for i, it := range c.items {
-				items[i] = it
+			s, err := openTab(host)
+			if err != nil {
+				return nil, err
 			}
-			return map[string]any{"word": c.word, "items": items, "noSpace": c.noSpace}, nil
+			return s.api(), nil
 		})
 	}))
-	// cwd(): string, the working directory of the shell
-	api.Set("cwd", js.FuncOf(func(js.Value, []js.Value) any { return sh.dir() }))
-	// cancel() stops the running command line (Ctrl-C)
-	api.Set("cancel", js.FuncOf(func(js.Value, []js.Value) any { sh.stop(); return nil }))
+	// sessions(): the number of open sessions
+	api.Set("sessions", js.FuncOf(func(js.Value, []js.Value) any { return openSessions() }))
 
 	// proxy(port, method, path, headers, body): Promise<{status, statusText, headers, body}>, see proxy.go
 	api.Set("proxy", js.FuncOf(func(this js.Value, a []js.Value) any { return proxyJS(a) }))
@@ -416,13 +374,10 @@ func main() {
 	api.Set("prepareJoin", js.FuncOf(func(this js.Value, a []js.Value) any {
 		open := a[0]
 		return promise(func() (any, error) {
-			if c == nil {
+			if current == nil {
 				return nil, fmt.Errorf("cluster is not ready yet")
 			}
-			if role == "tab" {
-				return nil, fmt.Errorf("the control plane in the shared worker prepares joins")
-			}
-			return c.prepareJoin(open)
+			return current.prepareJoin(open)
 		})
 	}))
 	// attachChannel(dc: RTCDataChannel) for channels opened by a node agent.
@@ -430,24 +385,14 @@ func main() {
 		attachChannel(a[0])
 		return nil
 	}))
-	// attachPort(port: MessagePort, label: string) for connections that the
-	// other side of a tab and the shared worker opened (tabs.go).
+	// attachPort(port: MessagePort, label: string) for the data channels that
+	// a docker node opens: a tab bridges them to the shared worker (tabs.js).
 	api.Set("attachPort", js.FuncOf(func(this js.Value, a []js.Value) any {
 		attach(newPortConn(a[0]), a[1].String())
 		return nil
 	}))
-	// prepareTab(open: (label: string) => Promise<MessagePort>): Promise<{name, ip, token, files}>
-	// adds a tab to the control plane in the shared worker.
-	api.Set("prepareTab", js.FuncOf(func(this js.Value, a []js.Value) any {
-		open := a[0]
-		return promise(func() (any, error) {
-			if c == nil || role == "tab" {
-				return nil, fmt.Errorf("no control plane here")
-			}
-			return c.prepareTab(open)
-		})
-	}))
-	// dropNode(name: string) removes a node of a closed tab (tabs.go).
+	// dropNode(name: string) removes a node of a closed tab, with its
+	// session, or a node from join whose connections ended (tabs.go).
 	api.Set("dropNode", js.FuncOf(func(this js.Value, a []js.Value) any {
 		name := a[0].String()
 		go dropNode(name)

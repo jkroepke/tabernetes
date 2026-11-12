@@ -2,12 +2,14 @@
 // (k8s/tabernetes/tabs.go). It lives as long as one of the tabs is open, so
 // any tab may close, and a short time longer (extendedLifetime, tabs.js), so
 // that a reload finds it. The first tab hands over the binary it downloads, every
-// tab joins as a node (tab-1, tab-2, ...). Each connection between a tab and
-// the control plane is a MessagePort of its own.
+// tab joins as a node (tab-1, tab-2, ...). The shell, kubectl and the
+// kubelet of every tab run here too, in a session of the tab
+// (k8s/tabernetes/session.go, bridge.js): a tab runs no Go itself.
 import "./wasm_exec.js";
 import { installFS } from "./fs.js";
-import { clusterState, forget } from "./state.js";
+import { clusterState, forget, loadHome, saveHome } from "./state.js";
 import { instantiate, runGo } from "./wasm.js";
+import { serveTab } from "./bridge.js";
 
 const tabs = new Map(); // tab id -> MessagePort
 // The docker nodes from join: every tab connects to each of them over WebRTC
@@ -30,12 +32,22 @@ globalThis.tabernetesStatus = (text) => {
   statusLines.push(text);
   broadcast({ type: "status", text });
 };
+// The ports of kubectl port-forward (forwards.go): localhost is the one of
+// this worker, so every tab links them.
+let forwards = [];
+globalThis.tabernetesForwards = (list) => {
+  forwards = list;
+  broadcast({ type: "forwards", list });
+};
 // The logs of the control plane: the console of this worker
 // (chrome://inspect/#workers), and "logs" in the terminal of a tab.
 const logs = [];
 const crash = [];
 let crashing = false;
-installFS((fd, s) => {
+// The files of /root from the last visit (state.js): the shells of all tabs
+// share them.
+const home = loadHome().catch(() => []);
+const output = (fd, s) => {
   if (crashing || /^(panic:|fatal error:)/m.test(s)) {
     crashing = true;
     console.error(s);
@@ -46,7 +58,7 @@ installFS((fd, s) => {
   if (s.includes("is not as new as written version")) return;
   logs.push(s);
   if (logs.length > 5000) logs.splice(0, logs.length - 5000);
-});
+};
 
 // The cluster survives a reload: the control plane saves it (state.js).
 const saved = clusterState();
@@ -56,6 +68,7 @@ globalThis.tabernetesState = saved;
 async function boot(stream) {
   state = "booting";
   try {
+    installFS(output, { records: await home, save: saveHome });
     const go = new globalThis.Go();
     go.env = { HOME: "/root", USER: "root", PATH: "/usr/bin" };
     // The tab sends the binary unpacked: a shared worker cannot start
@@ -151,14 +164,17 @@ function leave(id, joined) {
 }
 
 const methods = {
-  // joinTab adds the tab as a node and removes it once the tab is closed.
-  async joinTab(id) {
+  // joinTab opens the session of the tab, with its node, on the port of the
+  // "session" message. cfg: what the tab runs (bridge.js). The tab is
+  // removed once it is closed.
+  async joinTab(id, cfg) {
     await ready;
-    const info = await globalThis.tabernetes.prepareTab((label) => open(id, label));
     const tab = tabs.get(id);
-    if (tab) tab.nodes.push(info.name);
-    else globalThis.tabernetes.dropNode(info.name); // closed meanwhile
-    return info;
+    if (!tab?.session) throw new Error("the tab has no session port");
+    const session = await serveTab(tab.session, cfg);
+    if (tabs.get(id)) tab.nodes.push(session.name);
+    else globalThis.tabernetes.dropNode(session.name); // closed meanwhile
+    return { name: session.name, ip: session.ip, forwards };
   },
   // prepareJoin is "join" (docker) in a tab: the WebRTC connections live in
   // the tabs, one per tab.
@@ -248,8 +264,13 @@ self.onconnect = (e) => {
         else ctl.enqueue(new Uint8Array(data.data));
         break;
       }
+      case "session":
+        // the port of the session of the tab (bridge.js), before joinTab
+        port.session = data.port;
+        break;
       case "connect":
-        // A connection from the tab: "api" to the kube-apiserver.
+        // A data channel of a docker node, bridged by the tab: "api" to the
+        // kube-apiserver.
         if (state === "ready") globalThis.tabernetes.attachPort(data.port, data.label);
         else data.port.postMessage(null);
         break;

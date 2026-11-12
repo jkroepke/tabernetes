@@ -54,7 +54,7 @@ func newWorkload(tp *tabPod, c *corev1.Container) (workload, error) {
 	if model, ok := webllmModel(c.Image); ok {
 		return newWebLLM(tp, model)
 	}
-	if hasVM() {
+	if tp.n.hasVM() {
 		return newV86(tp, c)
 	}
 	return nil, fmt.Errorf("the tab node runs no containers, only images that run in the browser: "+webllmRepo+"<model> (not %q)", c.Image)
@@ -106,7 +106,7 @@ func (n *tabNode) newPod(pod *corev1.Pod) *tabPod {
 		started:       metav1.Now(),
 	}
 	if pod.Spec.HostNetwork {
-		tp.ip = tabNodeIP
+		tp.ip = n.ip
 	}
 	if len(pod.Spec.Containers) > 0 {
 		tp.container = pod.Spec.Containers[0]
@@ -152,11 +152,11 @@ func (tp *tabPod) envValue(e corev1.EnvVar) (value string, ok bool) {
 		case "metadata.uid":
 			return string(tp.uid), true
 		case "spec.nodeName":
-			return tabNodeName, true
+			return tp.n.name, true
 		case "status.podIP", "status.podIPs":
 			return tp.ip, true
 		case "status.hostIP", "status.hostIPs":
-			return tabNodeIP, true
+			return tp.n.ip, true
 		}
 	}
 	return "", false
@@ -457,7 +457,7 @@ func (tp *tabPod) update() {
 
 		s := &pod.Status
 		s.Phase, s.Reason, s.Message = phase, reason, message
-		s.HostIP, s.HostIPs = tabNodeIP, []corev1.HostIP{{IP: tabNodeIP}}
+		s.HostIP, s.HostIPs = tp.n.ip, []corev1.HostIP{{IP: tp.n.ip}}
 		s.PodIP, s.PodIPs = tp.ip, []corev1.PodIP{{IP: tp.ip}}
 		s.StartTime = &tp.started
 		if phase != corev1.PodFailed || reason == "" {

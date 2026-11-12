@@ -36,18 +36,18 @@ type v86VM struct {
 	isReady bool
 }
 
-// hasVM tells whether the page can run container images (web/src/vm.js).
-func hasVM() bool {
-	return js.Global().Get("tabernetesVM").Type() == js.TypeObject
+// hasVM tells whether the tab can run container images (web/src/vm.js).
+func (n *tabNode) hasVM() bool {
+	return n.host.Get("vm").Type() == js.TypeObject
 }
 
 // vmRuntime is the container runtime of the node, as kubectl get nodes -o
-// wide shows it, or "" if the page runs no container images.
-func vmRuntime() string {
-	if !hasVM() {
+// wide shows it, or "" if the tab runs no container images.
+func (n *tabNode) vmRuntime() string {
+	if !n.hasVM() {
 		return ""
 	}
-	return "v86://" + js.Global().Get("tabernetesVM").Get("version").String()
+	return "v86://" + n.host.Get("vm").Get("version").String()
 }
 
 func newV86(tp *tabPod, _ *corev1.Container) (workload, error) {
@@ -66,9 +66,9 @@ func (n *tabNode) gateway() string {
 }
 
 func (v *v86VM) start(ctx context.Context, log io.Writer, pull *imagePull) error {
-	vm := js.Global().Get("tabernetesVM")
+	vm := v.tp.n.host.Get("vm")
 	if vm.Type() != js.TypeObject {
-		return errors.New("this page cannot run container images")
+		return errors.New("this tab cannot run container images")
 	}
 	c := v.tp.container
 	env := []any{}

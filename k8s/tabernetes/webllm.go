@@ -71,9 +71,9 @@ func (m *webLLM) runtime() string { return "webgpu" }
 var fetchedMB = regexp.MustCompile(`^Fetching param cache\[\d+/\d+\]: (\d+)MB fetched`)
 
 func (m *webLLM) start(ctx context.Context, log io.Writer, pull *imagePull) error {
-	gpu := js.Global().Get("tabernetesGPU")
+	gpu := m.tp.n.host.Get("gpu")
 	if gpu.Type() != js.TypeObject {
-		return errors.New("this page has no GPU support")
+		return errors.New("this tab has no GPU support")
 	}
 	// The weights are the image: downloading them is the pull, and the
 	// container starts with the shaders. The log begins there.

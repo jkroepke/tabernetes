@@ -42,9 +42,6 @@ type savedState struct {
 // stateAPI is globalThis.tabernetesState: load(): Promise<Uint8Array|null>
 // and save(data: Uint8Array): Promise. Undefined where nothing is kept.
 func stateAPI() js.Value {
-	if role == "tab" {
-		return js.Undefined()
-	}
 	if v := js.Global().Get("tabernetesState"); v.Type() == js.TypeObject {
 		return v
 	}

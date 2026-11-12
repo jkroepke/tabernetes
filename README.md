@@ -79,9 +79,10 @@ browser tab (single wasm binary)                     docker run tabernetes
   service worker under `/tabernetes-proxy/` (`web/proxy-sw.js`) hands
   every request of that tab to the terminal tab, which sends it to the
   in-process network. The tab works as long as the terminal tab is open.
-  Every terminal tab has its own `localhost`, so the worker remembers which
-  tab answers for a port, and it unregisters when the last terminal tab that
-  used it is gone. While
+  With the control plane in a SharedWorker, all terminal tabs share one
+  `localhost` (the one of the worker); without it, every tab has its own.
+  The service worker remembers which tab answers for a port, and it
+  unregisters when the last terminal tab that used it is gone. While
   `kubectl port-forward` runs, the status line under the terminal links each
   of its local ports the same way (`k8s/tabernetes/forwards.go`).
 - `vnc <port>` shows a VNC server on `localhost` of the Wasm (a
@@ -95,17 +96,30 @@ browser tab (single wasm binary)                     docker run tabernetes
   (`web/src/cluster.js`, `k8s/tabernetes/tabs.go`) that all tabs of the page
   share, and it lives as long as one of them is open: open a second tab, and
   it joins as `tab-2`; close the first one, and the cluster keeps running. The
-  first tab hands its download to the worker chunk by chunk (Safari cannot
-  transfer a stream), and the worker compiles a second instance of the binary
-  for the control plane. When the control plane fails or exits, the worker
-  ends, so a reload boots a new one even while other tabs are open. `logs`
-  reads the log of the worker, and its last lines once it has ended. Each tab
-  runs the binary for its shell, kubectl and kubelet, and every connection
-  between a tab and the worker is a
-  MessagePort of its own. A tab holds a Web Lock while it is open; the worker
-  waits for that lock, so it learns when a tab closes, deletes its node and
-  renews the node leases in between (timers of a hidden tab may fire only once
-  a minute). WebRTC does not exist in workers, so the tabs hold the
+  first tab downloads and unpacks the binary and hands it to the worker chunk
+  by chunk (Safari cannot transfer a stream; a shared worker cannot start the
+  workers that unpack it), and the worker compiles it. When the control plane
+  fails or exits, the worker ends, so a reload boots a new one even while
+  other tabs are open. `logs` reads the log of the worker, and its last lines
+  once it has ended. The tabs run no Go: the shell, kubectl and the kubelet of
+  every tab run in the worker too, in a session of the tab
+  (`k8s/tabernetes/session.go`, `web/src/bridge.js`). A tab only shows the
+  terminal and does the line editing; the command lines, the keys of `vi`
+  and the output go over one MessagePort per tab, and so do the builtins
+  of the terminal (`join`, `proxy`, `vnc`, ...), which the shell calls in the
+  tab. So a tab that finds the worker running is at the prompt at once, and
+  it does not hold a Go heap of its own. The files of `/root` are the same in
+  all tabs; the working directory, the jobs and the history are per tab. A
+  shared worker cannot start workers, so the VMs and the language models of
+  the pods of a tab run in workers of that tab: the worker asks the tab to
+  start one and talks to it through the tab. Only one `kubectl exec -t`,
+  `attach -t` or `edit` runs at a time; another tab waits for it (the
+  terminal hooks of kubectl are process wide). A tab holds a Web Lock while
+  it is open; the worker waits for that lock, so it learns when a tab closes,
+  ends its session (with its jobs, a `kubectl port-forward &` too) and deletes
+  its node. The worker renews the node leases (timers of a hidden tab may
+  fire only once a minute, those of the worker do not slow down). WebRTC does
+  not exist in workers, so the tabs hold the
   connections to a node from `join`: every tab connects to every such node,
   and the data channels go on to the worker over MessagePorts. Only the first
   connection needs copy and paste. Every further tab sends its offer through
@@ -113,8 +127,8 @@ browser tab (single wasm binary)                     docker run tabernetes
   and the node agent answers on a new peer connection on the same UDP port.
   The node lives as long as one of these tabs is open; once none is left, the
   worker deletes the node, and the agent exits 30 seconds later. Without
-  SharedWorker or Web Locks (Chrome on Android), the tab runs the control
-  plane itself, as before.
+  SharedWorker or Web Locks, the tab runs the control plane and its session
+  itself.
 - `llm [model]` deploys a language model to the GPU of a tab: it applies the
   Deployment `llm` and returns, as `kubectl create deployment` would. The
   scheduler prefers the tab that ran `llm`; when that tab closes, the pod
