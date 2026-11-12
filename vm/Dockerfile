@@ -1,9 +1,10 @@
 # The VM of a pod that runs a container image on a tab node
-# (k8s/tabernetes/v86.go): the kernel, PID 1 and the BIOS that v86 boots.
+# (k8s/tabernetes/v86.go): the kernel and PID 1 that v86 boots. There is no
+# BIOS: the page starts the kernel itself (web/src/kernelboot.js).
 #
 #   docker build --output type=local,dest=out vm
 #
-# writes bzImage, init and seabios.bin to out/ (mise run vm).
+# writes vmlinux and init to out/ (mise run vm).
 ARG PYTHON_IMAGE=mirror.gcr.io/library/python:3.15-alpine
 ARG KERNEL_IMAGE=mirror.gcr.io/library/ubuntu:26.04
 
@@ -26,9 +27,12 @@ RUN set -eux; \
     for o in X86_32 M686 SERIAL_8250_CONSOLE VIRTIO_PCI VIRTIO_NET NET_9P_VIRTIO 9P_FS DEVTMPFS BLK_DEV_INITRD COMPAT_32BIT_TIME HIGHMEM4G KERNEL_LZ4 NO_HZ_IDLE; do \
       grep -q "^CONFIG_$o=y" .config || { echo "kernel.config: CONFIG_$o did not make it into .config" >&2; exit 1; }; \
     done; \
-    make -s -j"$(nproc)" bzImage; \
+    make -s -j"$(nproc)" vmlinux; \
     mkdir /out; \
-    cp arch/x86/boot/bzImage /out/
+    # The kernel unpacked: a bzImage unpacks itself on the emulated CPU,
+    # which took longer than the BIOS. Without symbols it has 5.6 MB, 2 MB
+    # with gzip, which GitHub Pages uses (the bzImage had 2.2 MB).
+    llvm-objcopy --strip-all vmlinux /out/vmlinux
 
 # PID 1 of the VM, a static binary for linux/386 with musl. zig cc comes
 # with musl for i386 and cross-compiles on any build platform (an i386
@@ -41,13 +45,6 @@ COPY init/init.c /src/init.c
 RUN mkdir /out \
   && python -m ziglang cc -target x86-linux-musl -static -Os -s -Wall -Wextra -Werror -o /out/init /src/init.c
 
-# The BIOS that comes with v86, from the commit of the npm release in
-# web/package.json (0.5.473+g315b2b0).
-FROM scratch AS bios
-ADD --checksum=sha256:73e3f359102e3a9982c35fce98eb7cd08f18303ac7f1ba6ebfbe6cdc1c244d98 \
-    https://raw.githubusercontent.com/copy/v86/315b2b0/bios/seabios.bin /seabios.bin
-
 FROM scratch
-COPY --from=kernel /out/bzImage /bzImage
+COPY --from=kernel /out/vmlinux /vmlinux
 COPY --from=init /out/init /init
-COPY --from=bios /seabios.bin /seabios.bin
