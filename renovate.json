@@ -18,6 +18,19 @@
         "k8s/go.mod"
       ],
       "enabled": false
+    },
+    {
+      "description": "The pod kernel is linux-source-6.8.0, which only Ubuntu 24.04 ships. A new Ubuntu release means a new kernel and a new test of vm/kernel.config, so it is not updated here.",
+      "matchFileNames": [
+        "vm/Dockerfile"
+      ],
+      "matchPackageNames": [
+        "mirror.gcr.io/library/ubuntu"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
     }
   ]
 }
