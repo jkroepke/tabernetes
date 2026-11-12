@@ -293,6 +293,10 @@ async function bootVM(m, memory) {
     disable_keyboard: true,
     disable_mouse: true,
     disable_speaker: true,
+    // The pod has no screen. v86 saves all VGA memory in the state: the
+    // smallest size (256 KiB) instead of the default 8 MiB halves every
+    // saved state (15.8 -> 7.6 MiB with 256 MiB of RAM).
+    vga_memory_size: 256 << 10,
     // the network adapter must learn the MAC of a restored VM
     preserve_mac_from_state_image: true,
     net_device: { type: "virtio", relay_url: "fetch", vm_ip: m.ip, router_ip: m.gateway },

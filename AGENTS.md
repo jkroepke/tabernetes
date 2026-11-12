@@ -137,6 +137,15 @@ that name.
   did not change. Side effects: the state is 15.8 instead of 17.1 MiB, and
   the guest gets 16 MiB more RAM (SeaBIOS reserved the top 16 MiB). GitHub
   Pages gzips `vmlinux` (5.6 MB, 2 MB gzip).
+  v86 saves all VGA memory in a state: pods use the smallest size (256 KiB
+  instead of 8 MiB), which halves every state (15.8 -> 7.6 MiB).
+- **Kernel config trimmed** (2026-11-12): other CPU vendors, PCI quirks and
+  PCI serial cards, PTP, ethtool netlink, wireless, the crypto API, legacy
+  virtio and a 4 KiB log buffer are off. `vmlinux` 5.6 -> 4.7 MB (gzip
+  1.97 -> 1.81 MB), -10 % emulated instructions to "ready", +876 KiB free
+  memory per pod; the boot time gain is below the noise (~50 ms). Most boot
+  time is the JIT on cold kernel code, not idle waits. Keep PCI
+  configuration type 1 (direct boot needs it).
 - **Node join over WebRTC** with copy and paste signaling and STUN, one UDP mux per
   node. The node runs without `--privileged`: the agent re-execs into
   user/mount/net/cgroup namespaces, pasta (built from passt.top at the fixed

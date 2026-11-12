@@ -40,6 +40,8 @@ function options(extra) {
     disable_keyboard: true,
     disable_mouse: true,
     disable_speaker: true,
+    // like web/src/vmworker.js: a small VGA memory keeps the state small
+    vga_memory_size: 256 << 10,
     preserve_mac_from_state_image: true,
     net_device: { type: "virtio", relay_url: "fetch", vm_ip: IP, router_ip: GATEWAY },
     ...extra,
