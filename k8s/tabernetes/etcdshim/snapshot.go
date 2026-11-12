@@ -65,59 +65,92 @@ func (s *store) saveLoop(save func([]byte), every time.Duration, ready <-chan st
 	// The first snapshot goes out right away: what is there now was never
 	// saved, or was restored from a snapshot of another time.
 	saved := int64(-1)
+	var cache map[*mvccpb.KeyValue][]byte
 	for {
 		s.mu.Lock()
-		var b []byte
+		var st *snapState
 		if s.durable != saved {
 			saved = s.durable
-			b = s.snapshotLocked()
+			st = s.snapState()
 		}
 		s.mu.Unlock()
-		if b != nil {
+		if st != nil {
+			var b []byte
+			b, cache = st.encode(cache)
 			save(b)
 		}
 		time.Sleep(every)
 	}
 }
 
-// Snapshot returns the current state of the store.
-func (s *store) snapshot() []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.snapshotLocked()
+// snapState is what a snapshot holds, taken from the store under its lock.
+// The values are not copied: a record never changes once it is in the store,
+// a write adds a new one.
+type snapState struct {
+	rev, nextLease int64
+	leases         [][2]int64 // ID, TTL
+	kvs            []*mvccpb.KeyValue
 }
 
-func (s *store) snapshotLocked() []byte {
-	b := append([]byte(nil), magic...)
-	b = binary.AppendUvarint(b, uint64(s.rev))
-	b = binary.AppendUvarint(b, uint64(s.nextLease))
-	ids := make([]int64, 0, len(s.leases))
-	for id := range s.leases {
-		ids = append(ids, id)
+// snapState must be called with mu held. It is cheap: the expensive part,
+// encode, runs without the lock, so the apiserver can write meanwhile.
+func (s *store) snapState() *snapState {
+	st := &snapState{rev: s.rev, nextLease: s.nextLease, kvs: make([]*mvccpb.KeyValue, 0, len(s.sorted))}
+	for id, l := range s.leases {
+		st.leases = append(st.leases, [2]int64{id, l.ttl})
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	b = binary.AppendUvarint(b, uint64(len(ids)))
-	for _, id := range ids {
-		b = binary.AppendUvarint(b, uint64(id))
-		b = binary.AppendUvarint(b, uint64(s.leases[id].ttl))
-	}
-	var kvs [][]byte
+	sort.Slice(st.leases, func(i, j int) bool { return st.leases[i][0] < st.leases[j][0] })
 	for _, k := range s.sorted {
-		kv := s.current(k)
-		if kv == nil {
-			continue
+		if kv := s.current(k); kv != nil {
+			st.kvs = append(st.kvs, kv)
 		}
-		m, err := proto.Marshal(kv)
-		if err != nil {
-			continue
-		}
-		kvs = append(kvs, m)
 	}
-	b = binary.AppendUvarint(b, uint64(len(kvs)))
-	for _, m := range kvs {
+	return st
+}
+
+// encode returns the snapshot and the marshalled records in it. The next
+// encode gets these back as old: most records did not change since the last
+// snapshot, and marshalling all of them again each second cost the most.
+// old may be nil.
+func (st *snapState) encode(old map[*mvccpb.KeyValue][]byte) ([]byte, map[*mvccpb.KeyValue][]byte) {
+	ms := make([][]byte, 0, len(st.kvs))
+	cache := make(map[*mvccpb.KeyValue][]byte, len(st.kvs))
+	size := len(magic) + 3*binary.MaxVarintLen64 + len(st.leases)*2*binary.MaxVarintLen64
+	for _, kv := range st.kvs {
+		m, ok := old[kv]
+		if !ok {
+			var err error
+			if m, err = proto.Marshal(kv); err != nil {
+				continue
+			}
+		}
+		cache[kv] = m
+		ms = append(ms, m)
+		size += binary.MaxVarintLen64 + len(m)
+	}
+	b := make([]byte, 0, size)
+	b = append(b, magic...)
+	b = binary.AppendUvarint(b, uint64(st.rev))
+	b = binary.AppendUvarint(b, uint64(st.nextLease))
+	b = binary.AppendUvarint(b, uint64(len(st.leases)))
+	for _, l := range st.leases {
+		b = binary.AppendUvarint(b, uint64(l[0]))
+		b = binary.AppendUvarint(b, uint64(l[1]))
+	}
+	b = binary.AppendUvarint(b, uint64(len(ms)))
+	for _, m := range ms {
 		b = binary.AppendUvarint(b, uint64(len(m)))
 		b = append(b, m...)
 	}
+	return b, cache
+}
+
+// snapshot returns the current state of the store.
+func (s *store) snapshot() []byte {
+	s.mu.Lock()
+	st := s.snapState()
+	s.mu.Unlock()
+	b, _ := st.encode(nil)
 	return b
 }
 

@@ -1,6 +1,7 @@
 package etcdshim
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"testing"
@@ -55,6 +56,44 @@ func TestWatch(t *testing.T) {
 	t.Logf("txn ok=%v err=%v", tx.Succeeded, err)
 }
 
+// A txn is all or nothing: one that fails writes nothing, also when it
+// fails after a put.
+func TestTxnAtomic(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go Serve(l)
+	c, err := clientv3.New(clientv3.Config{Endpoints: []string{l.Addr().String()}, DialTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = c.Txn(ctx).Then(clientv3.OpPut("/x", "1"), clientv3.OpPut("/y", "2", clientv3.WithLease(999))).Commit()
+	if err == nil {
+		t.Fatal("a put with an unknown lease worked")
+	}
+	r1, err := c.Put(ctx, "/z", "3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, err := c.Get(ctx, "/", clientv3.WithPrefix()); err != nil || len(r.Kvs) != 1 {
+		t.Fatalf("keys after the failed txn: %v, %v", r.Kvs, err)
+	}
+	// The compares of a nested txn see the store before the txn, as in etcd.
+	tx, err := c.Txn(ctx).If(clientv3.Compare(clientv3.Version("/z"), "=", 1)).Then(
+		clientv3.OpPut("/z", "4"),
+		clientv3.OpTxn([]clientv3.Cmp{clientv3.Compare(clientv3.Version("/z"), "=", 1)}, []clientv3.Op{clientv3.OpPut("/n", "ok")}, nil),
+	).Commit()
+	if err != nil || !tx.Succeeded || tx.Header.Revision != r1.Header.Revision+1 {
+		t.Fatalf("nested txn: %+v, %v", tx, err)
+	}
+	if r, _ := c.Get(ctx, "/n"); len(r.Kvs) != 1 {
+		t.Fatal("the nested txn took the wrong branch")
+	}
+}
+
 func TestSnapshot(t *testing.T) {
 	s := newStore()
 	s.mu.Lock()
@@ -89,6 +128,16 @@ func TestSnapshot(t *testing.T) {
 	}
 	if got := r.rangeKeys([]byte("/"), []byte("0")); len(got) != 2 {
 		t.Fatalf("keys %v", got)
+	}
+	// A snapshot from the records of the last one is the same as a new one.
+	s.mu.Lock()
+	_, cache := s.snapState().encode(nil)
+	s.rev++
+	s.put(s.rev, []byte("/a"), []byte("5"), 0)
+	cached, _ := s.snapState().encode(cache)
+	s.mu.Unlock()
+	if !bytes.Equal(cached, s.snapshot()) {
+		t.Fatal("the snapshot from the cache differs")
 	}
 	if err := r.restore([]byte("tbs1\x05")); err == nil {
 		t.Fatal("a cut snapshot restored")
