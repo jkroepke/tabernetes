@@ -95,6 +95,9 @@ out="$(cd dist && pwd)"
 # uses the node image of that release, everything else uses latest.
 image="$NODE_IMAGE:latest"
 if [ -n "${TABERNETES_VERSION:-}" ]; then image="$NODE_IMAGE:${TABERNETES_VERSION#v}"; fi
+# uname -r shows the release; the binary is the same for every release (CI
+# caches it), so the bundle hands the version to it (k8s/tabernetes/uname.go).
+version="${TABERNETES_VERSION:-dev}"
 cp .build/wasm_exec.js web/src/wasm_exec.js
 # Go reads the wall clock from Date.now(), in whole milliseconds, so two
 # events in the same millisecond get the same name. performance.now() is
@@ -112,6 +115,7 @@ cd web
 npm ci --no-audit --no-fund
 npx esbuild src/index.js --bundle --minify --format=esm --target=es2022 \
   --define:TABERNETES_IMAGE="\"$image\"" \
+  --define:TABERNETES_VERSION="\"$version\"" \
   --define:V86_VERSION="\"$(node -p 'require("./node_modules/v86/package.json").version')\"" \
   --outfile="$out/tabernetes.js"
 # The zstd decoder runs in a worker, so that the page does not freeze.
@@ -120,7 +124,8 @@ npx esbuild src/unzstd.js --bundle --minify --format=iife --target=es2022 --outf
 npx esbuild src/gpuworker.js --bundle --minify --format=iife --target=es2022 --outfile="$out/gpuworker.js"
 # The control plane runs in a shared worker, so that all tabs of the page join
 # one cluster (k8s/tabernetes/tabs.go).
-npx esbuild src/cluster.js --bundle --minify --format=iife --target=es2022 --outfile="$out/cluster.js"
+npx esbuild src/cluster.js --bundle --minify --format=iife --target=es2022 \
+  --define:TABERNETES_VERSION="\"$version\"" --outfile="$out/cluster.js"
 # Container images on the tab node run in v86, an x86 emulator, one worker per
 # pod. v86 imports node modules only when it runs in Node.js.
 npx esbuild src/vmworker.js --bundle --minify --format=iife --target=es2022 \

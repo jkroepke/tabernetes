@@ -37,7 +37,7 @@ func init() {
 		"base64": base64Cmd, "cat": cat, "cut": cut, "env": env, "free": free, "grep": grep,
 		"head": head, "ls": ls, "mkdir": mkdir, "rm": rm, "seq": seq, "sleep": sleepCmd,
 		"sort": sortCmd, "tail": tail, "tee": tee, "touch": touch, "tr": tr,
-		"uniq": uniq, "vi": viCmd, "vim": viCmd, "wc": wc, "wget": wget, "xargs": xargs,
+		"uname": uname, "uniq": uniq, "vi": viCmd, "vim": viCmd, "wc": wc, "wget": wget, "xargs": xargs,
 	}
 }
 

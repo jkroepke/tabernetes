@@ -6,8 +6,10 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"syscall/js"
 	"testing"
 
+	"k8s.io/component-base/version"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
 )
@@ -155,6 +157,36 @@ func TestWgetURL(t *testing.T) {
 	for _, raw := range []string{"ftp://example.com", "https://"} {
 		if u, err := wgetURL(raw); err == nil {
 			t.Errorf("wgetURL(%q) = %v, want an error", raw, u)
+		}
+	}
+}
+
+func TestUname(t *testing.T) {
+	kube := "Kubernetes " + version.Get().GitVersion
+	for _, tc := range []struct{ script, want string }{
+		{"uname", "Tabernetes\n"},
+		{"uname -r", "dev\n"},
+		{"uname -nm", "tabernetes wasm32\n"},
+		{"uname -v", kube + "\n"},
+		{"uname -a", "Tabernetes tabernetes dev " + kube + " wasm32 Browser\n"},
+		{"uname --kernel-release --operating-system", "dev Browser\n"},
+		{"uname -p -i", "unknown unknown\n"},
+	} {
+		t.Run(tc.script, func(t *testing.T) {
+			got, code := sh(t, tc.script)
+			if code != 0 || got != tc.want {
+				t.Errorf("got %q (exit %d), want %q", got, code, tc.want)
+			}
+		})
+	}
+	js.Global().Set("tabernetesVersion", "v1.4.0")
+	defer js.Global().Delete("tabernetesVersion")
+	if got, _ := sh(t, "uname -r"); got != "1.4.0\n" {
+		t.Errorf("uname -r with a release: got %q", got)
+	}
+	for _, script := range []string{"uname -x", "uname foo"} {
+		if out, code := sh(t, script); code == 0 {
+			t.Errorf("%s: exit 0, output %q", script, out)
 		}
 	}
 }
