@@ -323,6 +323,12 @@ const methods = {
     await globalThis.tabernetes.unjoin(name);
     peers.delete(name);
   },
+  // nodeLeft: a docker node said goodbye (join.js): it and its pods go.
+  // A paired node stays (dropNode in tabs.go).
+  nodeLeft(id, name) {
+    peers.delete(name);
+    globalThis.tabernetes?.dropNode(name);
+  },
   // meshNodes: the docker nodes a new tab connects to.
   meshNodes() {
     return [...peers].filter(([, ids]) => ids.size).map(([name]) => name);

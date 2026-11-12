@@ -74,6 +74,25 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
   };
   render();
 
+  // incoming takes the data channels a node opens: they go on to the
+  // control plane, but "bye" says the node stops (Ctrl-C, docker stop of a
+  // node without --keep): it leaves the cluster with its pods at once, not
+  // only when the last tab closes.
+  const incoming = (pc, name) => (e) => {
+    if (e.channel.label !== "bye") {
+      cluster ? cluster.bridge(e.channel) : globalThis.tabernetes.attachChannel(e.channel);
+      return;
+    }
+    e.channel.close();
+    const n = name();
+    if (!n) return;
+    if (cluster) cluster.rpc("nodeLeft", n).catch(() => {});
+    else globalThis.tabernetes.dropNode(n);
+    pc.close();
+    drop(n);
+    render();
+  };
+
   // channels returns open(label) for the data channels a tab opens to a node.
   const channels = (pc) => (label) => new Promise((resolve, reject) => {
     const dc = pc.createDataChannel(label);
@@ -116,7 +135,7 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
     const entry = { pc, info: { name } };
     nodes.push(entry);
     pc.createDataChannel("ctl");
-    pc.ondatachannel = (e) => cluster.bridge(e.channel);
+    pc.ondatachannel = incoming(pc, () => name);
     const open = channels(pc);
     open.pc = pc;
     cluster.dataChannels.set(name, open);
@@ -177,7 +196,7 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
     const entry = { pc, info: { name: p.name } };
     nodes.push(entry);
     pc.createDataChannel("ctl");
-    pc.ondatachannel = (e) => cluster ? cluster.bridge(e.channel) : globalThis.tabernetes.attachChannel(e.channel);
+    pc.ondatachannel = incoming(pc, () => p.name);
     const open = channels(pc);
     open.pc = pc;
     watch(pc, p.name);
@@ -401,7 +420,8 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
       const pc = new RTCPeerConnection({ iceServers: stun ? [{ urls: stun }] : [] });
       pc.createDataChannel("ctl");
       // With the control plane in the shared worker, the data channels go on there.
-      pc.ondatachannel = (e) => cluster ? cluster.bridge(e.channel) : globalThis.tabernetes.attachChannel(e.channel);
+      let joining = "";
+      pc.ondatachannel = incoming(pc, () => joining);
       const open = channels(pc);
       open.pc = pc;
       let info;
@@ -409,6 +429,7 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
         info = await cluster.rpc("prepareJoin");
         cluster.dataChannels.set(info.name, open);
       } else info = await globalThis.tabernetes.prepareJoin(open);
+      joining = info.name;
       await pc.setLocalDescription(await pc.createOffer());
       await gatheringComplete(pc, 3000);
       if (!active()) { pc.close(); return; } // Ctrl-C while preparing

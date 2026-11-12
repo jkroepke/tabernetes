@@ -173,6 +173,36 @@ func main() {
 	log.Printf("connected to the control plane in the browser, joining as %s (%s)", tok.Name, tok.IP)
 	startNode(ctx, m, tok, !*noKubelet)
 	<-ctx.Done()
+	// Ctrl-C or docker stop: the node leaves the cluster now, not when the
+	// last tab closes. A paired node (join --keep) stays: docker stop and
+	// a restart of the host are no goodbye.
+	m.bye()
+}
+
+// bye tells the tabs that the node stops: a data channel "bye" to each.
+// The tab removes the node and its pods (join.js).
+func (m *mesh) bye() {
+	var wg sync.WaitGroup
+	for _, pc := range m.connected() {
+		dc, err := pc.CreateDataChannel("bye", nil)
+		if err != nil {
+			continue
+		}
+		wg.Add(1)
+		opened := make(chan struct{})
+		dc.OnOpen(func() { close(opened) })
+		go func() {
+			defer wg.Done()
+			select {
+			case <-opened:
+				// let the tab see it open before the connection closes
+				time.Sleep(200 * time.Millisecond)
+			case <-time.After(2 * time.Second):
+			}
+		}()
+	}
+	wg.Wait()
+	log.Print("left the cluster")
 }
 
 // startNode forwards the kube-apiserver addresses to the browser and starts

@@ -231,6 +231,12 @@ browser tab (single wasm binary)                     docker run tabernetes
   also advertises `127.0.0.1` for the `-p 127.0.0.1:<port>:<port>/udp`
   mapping. That way it works on Docker Desktop, where the browser cannot
   reach container IPs.
+- A node of `join` leaves the cluster with its pods when its agent stops
+  (Ctrl-C, `docker stop`): before it ends, it opens a data channel `bye`
+  to every tab, and the tab drops the node. Without it, the node stayed
+  `NotReady` until the last tab closed. A node of `join --keep` sends no
+  goodbye, because a `docker stop` or a reboot of the host is no reason to
+  leave.
 - `join --keep` pairs the node instead (`k8s/tabernetes/paired.go`,
   `web/src/relay.js`, `node/agent/relay.go`). The node stays in the cluster
   when its tabs close and when the page reloads, and nothing is pasted back.
