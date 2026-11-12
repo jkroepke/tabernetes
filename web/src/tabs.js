@@ -7,8 +7,10 @@ export async function connectCluster(url, tries = 0) {
   if (typeof SharedWorker !== "function" || !navigator.locks?.request) return null;
   const id = crypto.randomUUID();
   const lock = `tabernetes-tab-${id}`;
-  // Held until the tab closes. The worker waits for it to learn that.
-  await new Promise((held) => navigator.locks.request(lock, () => { held(); return new Promise(() => {}); }));
+  // Held until the tab closes, or until it leaves this control plane
+  // (close). The worker waits for it to learn that.
+  let release;
+  await new Promise((held) => navigator.locks.request(lock, () => { held(); return new Promise((r) => { release = r; }); }));
 
   // extendedLifetime (Chrome 148+, others ignore it): the control plane runs
   // on for a short time (about 30 s in Chrome) after the last tab closed. A
@@ -18,11 +20,12 @@ export async function connectCluster(url, tries = 0) {
   const worker = new SharedWorker(url, { name: "tabernetes", extendedLifetime: true });
   const port = worker.port;
   const calls = new Map();
-  const listeners = { status: [], failed: [], exited: [], mesh: [] };
+  const listeners = { status: [], failed: [], exited: [], mesh: [], shutdown: [] };
   const dataChannels = new Map(); // docker node name -> open(label) of join.js
   let seq = 0;
   let hello;
   let ended = null; // the message of the control plane that failed or exited
+  let session = null; // of this tab, once opened
   const gone = () => new Error(ended.type === "failed" ? ended.error : `the control plane exited${ended.why ? `: ${ended.why}` : ""}`);
   const greeted = new Promise((resolve, reject) => {
     hello = resolve;
@@ -37,12 +40,14 @@ export async function connectCluster(url, tries = 0) {
         // the ports of kubectl port-forward (proxy.js)
         globalThis.tabernetesForwards?.(data.list);
         break;
-      case "status": case "failed": case "exited": case "mesh":
+      case "status": case "failed": case "exited": case "mesh": case "shutdown":
         if (data.type === "failed" || data.type === "exited") {
-          // The worker closes in a moment: nothing answers a call anymore.
+          // The worker closes in a moment: nothing answers a call anymore,
+          // and the pods of this tab have no kubelet left.
           ended = data;
           for (const call of calls.values()) call.reject(gone());
           calls.clear();
+          session?.stop();
         }
         listeners[data.type].forEach((fn) => fn(data));
         break;
@@ -65,10 +70,11 @@ export async function connectCluster(url, tries = 0) {
   port.start();
   port.postMessage({ type: "hello", id, lock });
   const h = await greeted;
-  // A control plane that failed or exited: its worker closes in a moment
-  // (cluster.js), and the next one boots a new cluster.
-  if ((h.state === "failed" || h.state === "exited") && tries < 3) {
+  // A control plane that failed, exited or goes down (poweroff): its worker
+  // closes in a moment (cluster.js), and the next one boots a new cluster.
+  if (["failed", "exited", "stopping"].includes(h.state) && tries < 3) {
     port.close();
+    release();
     await new Promise((r) => setTimeout(r, 1500));
     return connectCluster(url, tries + 1);
   }
@@ -106,9 +112,16 @@ export async function connectCluster(url, tries = 0) {
     async openSession(cfg, status) {
       const ch = new MessageChannel();
       port.postMessage({ type: "session", port: ch.port2 }, [ch.port2]);
-      const session = tabSession(ch.port1, { status });
+      session = tabSession(ch.port1, { status });
       const info = await this.rpc("joinTab", cfg);
       return { session, ...info };
+    },
+    // close leaves a control plane that is gone (poweroff, reboot), before
+    // the tab connects to the next one.
+    close() {
+      session?.stop();
+      port.close();
+      release();
     },
     // ended: the last lines of the logs of a control plane that is gone.
     get ended() { return ended; },

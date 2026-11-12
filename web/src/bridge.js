@@ -119,6 +119,7 @@ export function tabSession(port, { status }) {
   const calls = new Map();
   let builtins = {}; // of the command line that runs
   let write = () => {};
+  const workers = new Set(); // of the pods of this tab, started for the worker
   const call = (m, a, extra = {}, transfer = []) => new Promise((resolve, reject) => {
     calls.set(++seq, { resolve, reject });
     port.postMessage({ t: "call", seq, m, a, ...extra }, transfer);
@@ -150,7 +151,7 @@ export function tabSession(port, { status }) {
         if (d.m === "gpuAdapter") answer(d.seq, gpuAdapter());
         else answer(d.seq, Promise.reject(new Error(`unknown call ${d.m}`)));
         break;
-      case "spawn": relay(d.url, d.p); break;
+      case "spawn": relay(d.url, d.p, workers); break;
     }
   };
   const method = (m) => (...a) => call(m, a);
@@ -170,6 +171,12 @@ export function tabSession(port, { status }) {
     complete: method("complete"),
     cwd: method("cwd"),
     cancel: method("cancel"),
+    // stop ends the workers of the pods of this tab: the control plane is
+    // gone (poweroff, reboot, a crash), and with it their kubelet.
+    stop() {
+      for (const w of workers) w.terminate();
+      workers.clear();
+    },
     proxy: (...a) => call("proxy", a),
     // dial(port, onData, onClose): Promise<{send, close}>, like dial.go
     async dial(p, onData, onClose) {
@@ -198,12 +205,14 @@ function gpuAdapter() {
 }
 
 // relay starts a worker for the shared worker and passes the messages on.
-function relay(url, p) {
+// workers holds it while it runs.
+function relay(url, p, workers) {
   const w = new Worker(url);
+  workers.add(w);
   w.onmessage = ({ data }) => p.postMessage({ m: data }, buffers(data));
   w.onerror = (e) => { e.preventDefault(); p.postMessage({ error: e.message || "the worker failed" }); };
   p.onmessage = ({ data }) => {
-    if (data.end) { w.terminate(); p.close(); } else w.postMessage(data.m, data.x || []);
+    if (data.end) { w.terminate(); workers.delete(w); p.close(); } else w.postMessage(data.m, data.x || []);
   };
 }
 

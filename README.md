@@ -51,7 +51,11 @@ browser tab (single wasm binary)                     docker run tabernetes
   `/root` of the terminal (not `~/.kube`) go to IndexedDB, too, one record per
   file, a moment after each change. `forget` deletes the cluster, the files,
   the images and the models of `llm`. The layers of a pod that still runs
-  stay until the pod is gone, the next visit deletes them.
+  stay until the pod is gone, the next visit deletes them. `poweroff` (or
+  `shutdown`) saves the cluster and the files and stops the control plane for
+  every tab; `reboot` does the same, then the tab boots a fresh control plane
+  from the saved cluster (not from a hibernated one), and the other tabs join
+  it once they are reloaded.
 - The terminal runs a real POSIX shell: [mvdan.cc/sh](https://github.com/mvdan/sh),
   a shell interpreter in Go, compiled into the same binary. Pipes, variables,
   loops, `$(...)`, redirects and here-documents work. There are no processes,
