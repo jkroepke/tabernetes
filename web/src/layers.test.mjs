@@ -12,11 +12,14 @@ async function collect(t, sizes) {
     else delete globalThis.FileSystemFileHandle;
   });
   const removed = [];
+  // One clock reading for all layers: layer i is i ms older than layer 0,
+  // also when the runner is slow.
+  const now = Date.now();
   const dir = {
     async getDirectoryHandle() { return this; },
     async *entries() {
       for (const [i, size] of sizes.entries()) {
-        yield [`sha256-layer${i}.tar`, { kind: "file", getFile: async () => ({ size, lastModified: Date.now() - 180000 - i }) }];
+        yield [`sha256-layer${i}.tar`, { kind: "file", getFile: async () => ({ size, lastModified: now - 180000 - i }) }];
       }
     },
     async removeEntry(name) { removed.push(name); },
