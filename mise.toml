@@ -69,7 +69,7 @@ node -e '
 '''
 
 [tasks.vm]
-description = "Build the kernel, init and BIOS that v86 boots into dist/vm/"
+description = "Build the kernel and init that v86 boots into dist/vm/"
 run = '''
 # docker builds them (vm/Dockerfile) only when vm/ changed.
 out=dist/vm
