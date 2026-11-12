@@ -190,8 +190,10 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", sta
       term.writeln(B(`  ${image} \\`));
       term.writeln(B(`  ${token}`));
       term.writeln("");
-      term.writeln(`Docker on another machine in your network? Publish the port on all interfaces and`);
-      term.writeln(`add ${B("--advertise <LAN IP of that machine>")} before the token:`);
+      term.writeln(`Docker on another machine? Publish the port on all interfaces: ${B(`-p ${port}:${port}/udp`)}.`);
+      term.writeln(`- A server with a public IP needs nothing else, not even a firewall rule: the node`);
+      term.writeln(`  sends to the browser too, so the firewall of the server lets the browser in.`);
+      term.writeln(`- In your network, add ${B("--advertise <LAN IP of that machine>")} before the token:`);
       term.writeln(DIM(`  docker run ... -p ${port}:${port}/udp ... ${image} --advertise 192.168.x.y <token>`));
       term.writeln("");
       if (navigator.clipboard?.writeText) {

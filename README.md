@@ -430,5 +430,13 @@ still works, too. Real isolation from the host needs rootless Docker or Podman.
   `--advertise <LAN IP>` before the token. The browser hides its own addresses
   behind mDNS names, and the container cannot resolve them, so the browser has
   to reach the container.
-- Across different networks, WebRTC needs a port forward or TURN. There is no
-  TURN server.
+- A server with a public IP (a cloud VM) works without `--advertise` and
+  without a firewall rule: publish the port on all interfaces
+  (`-p 50001:50001/udp`). STUN tells both sides their public address, and
+  both send UDP to each other during the ICE checks. The packet of the node
+  opens the stateful firewall of the server (tested with an Oracle Cloud VM,
+  whose public IP is a 1:1 NAT), so the packets of the browser get in. With
+  `-p 127.0.0.1:...`, Docker drops them.
+- When both sides sit behind NAT, WebRTC needs a port forward or TURN. A
+  browser behind a symmetric NAT (mobile networks, some company networks)
+  cannot reach a node without TURN. There is no TURN server.
