@@ -4,8 +4,8 @@
 #   docker build --output type=local,dest=out vm
 #
 # writes bzImage, init and seabios.bin to out/ (mise run vm).
-ARG PYTHON_IMAGE=mirror.gcr.io/library/python:3.14-alpine
-ARG KERNEL_IMAGE=mirror.gcr.io/library/ubuntu:24.04
+ARG PYTHON_IMAGE=mirror.gcr.io/library/python:3.15-alpine
+ARG KERNEL_IMAGE=mirror.gcr.io/library/ubuntu:26.04
 
 # Linux 6.8 from Ubuntu 24.04 (linux-source), for i386, cross-compiled with
 # clang on any build platform.
