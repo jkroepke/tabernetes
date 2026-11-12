@@ -119,6 +119,14 @@ that name.
   RSS per pod). Kernel options that cost boot time: legacy PTYs (310 ms),
   gzip (LZ4 unpacks in a third of the time, in-guest zstd is 200 ms slower
   than LZ4).
+  v86 saves all VGA memory in a state: pods use the smallest size (256 KiB
+  instead of 8 MiB), which halves every state (16.5 -> 8.8 MiB).
+- **Kernel config trimmed** (2026-11-12): other CPU vendors, PCI quirks and
+  PCI serial cards, PTP, ethtool netlink, wireless, the crypto API, legacy
+  virtio and a 4 KiB log buffer are off. bzImage -188 KiB, -10 % emulated
+  instructions to "ready", +876 KiB free memory per pod; the boot time
+  gain is below the noise (~50 ms). Most boot time is the JIT on cold kernel
+  code, not idle waits. Keep PCI configuration type 1 (direct boot needs it).
 - **Node join over WebRTC** with copy and paste signaling and STUN, one UDP mux per
   node. The node runs without `--privileged`: the agent re-execs into
   user/mount/net/cgroup namespaces, pasta (built from passt.top at the fixed
