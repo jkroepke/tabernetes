@@ -3,6 +3,21 @@
 // Locks: the tab then runs the control plane itself.
 import { tabSession } from "./bridge.js";
 
+// After poweroff or reboot the next control plane runs in a shared worker
+// of a new name (cluster.js sends it). Firefox may hand a new connection to
+// the worker that just closed itself, under the old name, and that one
+// never answers. The name is kept in localStorage, so that the other tabs
+// and the next visit find the same worker.
+const GENERATION = "tabernetes-cluster";
+const workerName = () => {
+  try {
+    const gen = localStorage.getItem(GENERATION);
+    return gen ? `tabernetes-${gen}` : "tabernetes";
+  } catch {
+    return "tabernetes";
+  }
+};
+
 export async function connectCluster(url, tries = 0) {
   if (typeof SharedWorker !== "function" || !navigator.locks?.request) return null;
   const id = crypto.randomUUID();
@@ -17,7 +32,7 @@ export async function connectCluster(url, tries = 0) {
   // reload of the only tab then joins the running cluster instead of
   // booting a new one: 3 s instead of 12.6 s to the prompt (v1.0.0).
   // The options must be the same for every tab of a page.
-  const worker = new SharedWorker(url, { name: "tabernetes", extendedLifetime: true });
+  const worker = new SharedWorker(url, { name: workerName(), extendedLifetime: true });
   const port = worker.port;
   const calls = new Map();
   const listeners = { status: [], failed: [], exited: [], mesh: [], shutdown: [] };
@@ -41,10 +56,16 @@ export async function connectCluster(url, tries = 0) {
         globalThis.tabernetesForwards?.(data.list);
         break;
       case "status": case "failed": case "exited": case "mesh": case "shutdown":
+        // poweroff or reboot: the pods end first, so that their layers
+        // can be deleted (cluster.js)
+        if (data.type === "shutdown") session?.stop();
         if (data.type === "failed" || data.type === "exited") {
           // The worker closes in a moment: nothing answers a call anymore,
           // and the pods of this tab have no kubelet left.
           ended = data;
+          if (data.next) {
+            try { localStorage.setItem(GENERATION, data.next); } catch { /* the old name: a retry gets the new worker */ }
+          }
           for (const call of calls.values()) call.reject(gone());
           calls.clear();
           session?.stop();

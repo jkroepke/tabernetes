@@ -95,13 +95,6 @@ export function clusterState() {
       paused = on;
       if (!on && next) this.save(next);
     },
-    // flush resolves once the last changes are saved: the control plane
-    // hands a snapshot over once a second, when something changed
-    // (etcdshim saveLoop), so it waits a bit longer than that first.
-    async flush() {
-      await new Promise((r) => setTimeout(r, 1500));
-      while (running) await running;
-    },
     async drop() {
       dropped = true;
       await running;

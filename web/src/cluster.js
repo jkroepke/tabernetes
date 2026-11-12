@@ -165,12 +165,11 @@ function exited(why) {
 }
 
 // poweroff stops the control plane for every tab: poweroff, shutdown and
-// reboot in a terminal. It is the end of this worker like a crash, but the
-// cluster is saved first, as a machine that shuts down writes its disks. The
-// next tab that loads the page boots it from the etcd snapshot, not from a
-// hibernated image: a reboot starts a fresh control plane. The tabs show a
-// broadcast like wall(1) first; the tab that rebooted reloads itself, the
-// others stay down until they are reloaded.
+// reboot in a terminal. It is the end of this worker like a crash, and it
+// deletes what forget deletes (the cluster, the files of /root, the images,
+// the saved VM states), so the next boot is a new cluster, like on the first
+// visit. The tabs show a broadcast like wall(1) first and end their pods;
+// the tab that rebooted boots again, the others stay down until Enter.
 let stopping = null;
 function poweroff(id, reboot) {
   stopping ??= (async () => {
@@ -179,13 +178,15 @@ function poweroff(id, reboot) {
     rejectReady(new Error("the control plane is going down"));
     const by = tabs.get(id)?.nodes[0] ?? "";
     broadcast({ type: "shutdown", reboot, by });
-    // the last changes: Go hands the etcd snapshot over once a second, and
-    // the files of /root a moment after they changed
-    await Promise.race([
-      Promise.all([saved.flush(), fsys?.syncHome(), dropHibernated()]),
-      new Promise((r) => setTimeout(r, 5000)),
-    ]).catch(() => {});
-    end("exited", reboot ? "rebooted" : "powered off", { off: reboot ? "reboot" : "poweroff", by });
+    // No more saves from here. The tabs end their pods on the broadcast;
+    // their Web Locks go a moment later, and with them the layers they
+    // read. A layer still in use gets a mark, the next page load deletes it.
+    forgotten = true;
+    await new Promise((r) => setTimeout(r, 500));
+    await Promise.race([forget(), new Promise((r) => setTimeout(r, 5000))]).catch(() => {});
+    // next: the name of the next shared worker (tabs.js)
+    const next = crypto.randomUUID().slice(0, 8);
+    end("exited", reboot ? "rebooted" : "powered off", { off: reboot ? "reboot" : "poweroff", by, next });
   })();
   return stopping;
 }
@@ -315,7 +316,7 @@ const methods = {
     return forget();
   },
   // poweroff: poweroff, shutdown and reboot in a tab. It answers once the
-  // cluster is saved, before the worker closes.
+  // cluster is deleted, before the worker closes.
   poweroff(id, reboot) {
     return poweroff(id, !!reboot);
   },

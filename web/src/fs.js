@@ -135,8 +135,7 @@ export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}
       else del.push(path);
     }
     changed.clear();
-    if (!put.length && !del.length) return Promise.resolve();
-    return persist.save(put, del).catch((e) => console.warn("tabernetes: saving files:", e));
+    if (put.length || del.length) persist.save(put, del).catch((e) => console.warn("tabernetes: saving files:", e));
   }
 
   const getFd = (fd) => {
@@ -315,9 +314,6 @@ export function createFS({ cwd = "/", onOutput = () => {}, persist = null } = {}
     }
     persist = keep;
   };
-  // syncHome saves the changed files of /root now, not a moment later:
-  // poweroff and reboot (cluster.js) close the worker right after it.
-  fs.syncHome = () => (persist && changed.size ? flush() : Promise.resolve());
   // dump and load carry the files and the open file descriptors over to
   // another instance, for the hibernation of the control plane
   // (hibernate.js). structuredClone keeps hard links one node.
