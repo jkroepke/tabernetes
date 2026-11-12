@@ -12,7 +12,8 @@
 // slow as with it.
 //
 // What the BIOS did and the kernel still needs is done here: the memory map
-// (E820) and the routing of the PCI interrupts.
+// (E820) and the routing of the PCI interrupts. It also names the 9p device
+// of the root file system (MOUNT_TAG).
 
 // Where the boot parameters go: below 640 KiB, where the kernel does not
 // load anything. The kernel copies them before it uses this memory.
@@ -33,6 +34,13 @@ const PIR = 0xf0000;
 // The PCI interrupts as SeaBIOS routes them: PIRQ A-D of the PIIX3 to IRQ
 // 10, 10, 11, 11.
 const PIRQ = [10, 10, 11, 11];
+
+// MOUNT_TAG is the tag of the 9p device that holds the root file system of
+// the pod. Linux shows it as the source of the mount, so df and
+// /proc/mounts print "overlay" for /, like in a container of containerd or
+// Docker, instead of the "host9p" of v86. init mounts the device by this
+// name (vm/init/init.c).
+export const MOUNT_TAG = "overlay";
 
 // bootKernel prepares a VM that v86 created but did not run yet. cpu is
 // emulator.v86.cpu, kernel the bytes of vmlinux, initrd those of the
@@ -101,6 +109,26 @@ export function bootKernel(cpu, { kernel, initrd, cmdline }) {
 
   routePCI(cpu.io);
   mem.set(pirTable(), PIR);
+  if (cpu.devices.virtio_9p) setMountTag(cpu.devices.virtio_9p, cpu.io, MOUNT_TAG);
+}
+
+// setMountTag renames the 9p device. The kernel reads the tag once, when it
+// finds the device; a saved VM keeps it. v86 has no option for the tag:
+// the bytes of the tag are read from its array, which can change in place,
+// but the length is a copy in a closure. So the length gets a port handler
+// of its own: the first field of the config of the device, at BAR 3.
+function setMountTag(dev, io, tag) {
+  const bytes = new TextEncoder().encode(tag);
+  if (bytes.length > 254) throw new Error("the 9p mount tag is too long");
+  dev.configspace_tagname.length = 0;
+  dev.configspace_tagname.push(...bytes);
+  dev.configspace_taglen = bytes.length;
+  const bar = dev.virtio.pci_space;
+  const port = (bar[0x1c] | (bar[0x1d] << 8)) & 0xfffc;
+  const len = bytes.length;
+  io.ports[port].read16 = () => len;
+  io.ports[port].read8 = () => len & 0xff;
+  io.ports[port + 1].read8 = () => len >> 8;
 }
 
 // pirTable is a PCI interrupt routing table ($PIR) without entries, for the

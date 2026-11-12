@@ -59,6 +59,10 @@
 static const char *test_config;
 static int exec_port = EXEC_PORT;
 #define NEW_ROOT "/newroot"
+// The tag of the 9p device with the root file system. The page names it
+// (MOUNT_TAG in web/src/kernelboot.js), so that / shows up as "overlay" in
+// df and /proc/mounts, like in a container of containerd or Docker.
+#define ROOT_TAG "overlay"
 #define DEFAULT_PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 // frames to the VM
@@ -1341,7 +1345,7 @@ static int stage0(void) {
 
   mkdir(NEW_ROOT, 0755);
   // cache=loose: only the guest changes the files, it may keep them
-  if (mount("host9p", NEW_ROOT, "9p", 0, "trans=virtio,version=9p2000.L,cache=loose,msize=262144") < 0) return fail("mount 9p: %s", errtext(errno));
+  if (mount(ROOT_TAG, NEW_ROOT, "9p", 0, "trans=virtio,version=9p2000.L,cache=loose,msize=262144") < 0) return fail("mount 9p: %s", errtext(errno));
   if (load_config(NEW_ROOT "/.tabernetes/config.json", &staged_config) < 0) return -1;
   if (setup_network(staged_config.ip, staged_config.gateway) < 0) return -1;
   // /dev (with /dev/pts and /dev/shm), /proc and /sys move into the root of

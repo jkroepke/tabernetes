@@ -24,6 +24,19 @@
 const IMAGE_FS = 4 * 2 ** 30;
 const HIGH = 0.85, LOW = 0.8, MIN_AGE = 2 * 60 * 1000;
 
+// imageFSCapacity returns the size of the image file system in bytes:
+// IMAGE_FS, or half of the quota of the origin if that is less. The root
+// file system of a pod shows it as its size (vmworker.js), like the disk of
+// /var/lib/containerd in a container on a real node.
+export async function imageFSCapacity() {
+  let capacity = IMAGE_FS;
+  try {
+    const { quota } = await navigator.storage.estimate();
+    if (quota) capacity = Math.min(capacity, quota / 2);
+  } catch { /* no estimate */ }
+  return capacity;
+}
+
 import { Decompress } from "fzstd";
 import { useLock, unpackLock, removeLayer } from "./state.js";
 
@@ -322,11 +335,7 @@ class OPFSStore {
       }
       let total = 0;
       for (const l of layers.values()) total += l.size;
-      let capacity = IMAGE_FS;
-      try {
-        const { quota } = await navigator.storage.estimate();
-        if (quota) capacity = Math.min(capacity, quota / 2);
-      } catch { /* no estimate */ }
+      const capacity = await imageFSCapacity();
       if (total <= capacity * HIGH) return 0;
       const goal = total - capacity * LOW;
       console.info(`tabernetes: image garbage collection: the image file system is at ${Math.round((total / capacity) * 100)} %, which is over the high threshold (${HIGH * 100} %). Trying to free ${goal} bytes down to the low threshold (${LOW * 100} %).`);

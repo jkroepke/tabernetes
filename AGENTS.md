@@ -280,6 +280,12 @@ that name.
   Always test with a glibc image (`nginx`), not only Alpine. A fresh nginx
   refuses connections for 1-3 s after Ready. The guest must send a packet
   first (ping the router) so the network adapter learns its MAC.
+- v86 names the 9p device `host9p` and answers statfs with 256 GiB and the
+  size of the image as used. `kernelboot.js` renames the device to
+  `overlay` before boot (init mounts it by that name, so a saved state of
+  an older init does not fit) and `statRoot` (`rootfs.js`) reports the
+  ephemeral-storage limit or the image file system as the size, and the
+  files of the pod as used. v86 does not enforce that size.
 
 ## Node gotchas
 
