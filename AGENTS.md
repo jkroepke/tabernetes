@@ -238,7 +238,7 @@ that name.
   to a file; piping through `tail` hangs because the server keeps the pipe
   open.
 - Kernel builds: `LLVM=1 ARCH=i386`. Sandboxes may block kernel.org and the
-  tarballs of GitHub, but a git fetch of `gregkh/linux` (what `ADD ...git` in
+  tarballs of GitHub, but a Git fetch of `gregkh/linux` (what `ADD ...git` in
   `vm/Dockerfile` does) usually works. Delete the tree afterwards; sandbox
   disks are small.
 - Boot test: `vm/test/boot.test.mjs` boots `dist/vm` in v86 in Node.js, saves
