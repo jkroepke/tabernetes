@@ -147,7 +147,7 @@ that name.
   left over from init lets the timer expire and Go never pauses. In-process
   reloads gain less, Chrome reuses the compiled code of the same bytes.
 - **Hibernation** (`web/src/hibernate.js`, `cluster.js`): when the last tab
-  closes, the worker copies memory, wasm globals (the build exports them as
+  closes, the worker copies memory, Wasm globals (the build exports them as
   `g<i>`), the fs and `go._values` in one JavaScript task, gzips the memory
   (~360 MiB -> ~40 MB, ~5 s, CompressionStream) and puts it into IndexedDB
   (`cluster` store, key `hibernated`). The next worker takes it (read and
