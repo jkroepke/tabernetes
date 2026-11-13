@@ -141,6 +141,10 @@ that name.
   side of a conditional jump that the interpreter saw run (cold code of a
   module 55 % -> 15-20 %): process CPU spring 134 -> 110 s, glibc 11.9 ->
   9.2 s, Go binary 3.9 -> 3.3 s; nginx compiles almost nothing anymore.
+  0.5.81-fork makes memory accesses in JIT code cheaper (one compare for
+  the TLB check; a miss leaves the module for the interpreter instead of
+  calling a slow path, so V8 keeps guest registers in host registers):
+  spring main thread 75.5 -> 59.3 s, process 106.7 -> 76.0 s.
 - **Saved VM states** (`web/src/vmstate.js`, stage 0 in
   `vm/init/init.c`): init waits in an initramfs for the pod; the first VM
   per memory size saves its state there, later pods restore it (~0.6 s less
