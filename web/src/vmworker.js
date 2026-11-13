@@ -284,6 +284,8 @@ const fetchBytes = async (url) => new Uint8Array(await (await fetch(url)).arrayB
 async function bootVM(m, memory) {
   const base = {
     wasm_path: m.wasmURL,
+    // the tab compiled v86.wasm already (postStart in vm.js)
+    ...(m.wasmModule ? { wasm_fn: (env) => WebAssembly.instantiate(m.wasmModule, env).then((i) => i.exports) } : {}),
     // No BIOS: the page starts the kernel itself (kernelboot.js).
     // an empty 9p file system; the tree of the pod comes in before "go"
     filesystem: {},
