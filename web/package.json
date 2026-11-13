@@ -13,7 +13,7 @@
     "@xterm/xterm": "6.0.0",
     "esbuild": "0.28.2",
     "fzstd": "0.1.1",
-    "v86": "github:jkroepke/v86#d07236b057b3437511a4bbe1034d44c4a1b109fb",
+    "v86": "github:jkroepke/v86#be73c0710e953688c00b1d2b090d43a7877b89ce",
     "zstddec": "0.3.4"
   }
 }

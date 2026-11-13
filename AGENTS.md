@@ -144,7 +144,10 @@ that name.
   0.5.81-fork makes memory accesses in JIT code cheaper (one compare for
   the TLB check; a miss leaves the module for the interpreter instead of
   calling a slow path, so V8 keeps guest registers in host registers):
-  spring main thread 75.5 -> 59.3 s, process 106.7 -> 76.0 s.
+  spring main thread 75.5 -> 59.3 s, process 106.7 -> 76.0 s. 0.5.84-fork
+  lets an idle guest sleep until its next timer instead of calling
+  main_loop again at once (~115 times per 10 ms tick in a Chromium worker):
+  an idle nginx pod 89 -> 20 ms CPU per second.
 - **Saved VM states** (`web/src/vmstate.js`, stage 0 in
   `vm/init/init.c`): init waits in an initramfs for the pod; the first VM
   per memory size saves its state there, later pods restore it (~0.6 s less
