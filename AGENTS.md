@@ -126,6 +126,11 @@ that name.
   HTTP 1500 -> 1040 ms, a static Go binary (start + 20 scrapes) 2810 ->
   1780 ms, glibc text tools 10.1 -> 7.3 s, a JIT-bound shell/gzip/sha256
   job 6.8 -> 6.4 s; sha256sum and AES in OpenSSL 1.7-3x (SHA and AES-NI).
+  Since 0.5.75-fork the JIT compiles one page per module: V8 recompiles
+  hot modules with TurboFan on background threads, which was ~60 % of the
+  CPU of a Spring Boot pod, and its cost grows faster than the module.
+  Process CPU (all threads) spring 263 -> 160 s, Go binary 12.5 -> 8.8 s,
+  nginx 3.75 -> 2.83 s; peak RSS of spring 1108 -> 770 MiB.
 - **Saved VM states** (`web/src/vmstate.js`, stage 0 in
   `vm/init/init.c`): init waits in an initramfs for the pod; the first VM
   per memory size saves its state there, later pods restore it (~0.6 s less
