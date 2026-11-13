@@ -279,6 +279,14 @@ let onControl = () => {};
 
 const fetchBytes = async (url) => new Uint8Array(await (await fetch(url)).arrayBuffer());
 
+// tsc=reliable: v86 has no second clock to check the TSC against, and
+// without the check the kernel never stops its tick in an idle pod
+// (vm/kernel.config). highres=off: timers keep the resolution of the tick
+// (10 ms). With high resolution timers the short sleeps of the Go runtime
+// are real: a Go program ran 10 % more instructions (measured with
+// access-log-exporter, start and 50 scrapes).
+const KERNEL_CMDLINE = "console=ttyS0 quiet loglevel=3 tsc=reliable highres=off";
+
 // bootVM starts the VM of the pod, without its file system: from a saved
 // state, or by booting the kernel. It resolves once init waits for the pod.
 async function bootVM(m, memory) {
@@ -295,6 +303,9 @@ async function bootVM(m, memory) {
     disable_keyboard: true,
     disable_mouse: true,
     disable_speaker: true,
+    // The local APIC: its timer lets an idle kernel sleep for seconds. The
+    // kernel has no ACPI; it finds the APIC by CPUID (vm/kernel.config).
+    acpi: true,
     // The pod has no screen. v86 saves all VGA memory in the state: the
     // smallest size (256 KiB) instead of the default 8 MiB halves every
     // saved state (15.8 -> 7.6 MiB with 256 MiB of RAM).
@@ -326,7 +337,7 @@ async function bootVM(m, memory) {
   // No state: the kernel starts in this VM, which has run nothing yet.
   emulator = e;
   await ok;
-  bootKernel(e.v86.cpu, { kernel, initrd: initramfs(init), cmdline: "console=ttyS0 quiet loglevel=3" });
+  bootKernel(e.v86.cpu, { kernel, initrd: initramfs(init), cmdline: KERNEL_CMDLINE });
   const ready = new Promise((resolve, reject) => {
     let error = "";
     onControl = (l) => {
