@@ -130,7 +130,14 @@ that name.
   hot modules with TurboFan on background threads, which was ~60 % of the
   CPU of a Spring Boot pod, and its cost grows faster than the module.
   Process CPU (all threads) spring 263 -> 160 s, Go binary 12.5 -> 8.8 s,
-  nginx 3.75 -> 2.83 s; peak RSS of spring 1108 -> 770 MiB.
+  nginx 3.75 -> 2.83 s; peak RSS of spring 1108 -> 770 MiB. 0.5.79-fork
+  raises the JIT threshold 200k -> 750k: process CPU nginx 2.83 -> 1.09 s,
+  Go binary 8.8 -> 3.1 s. The tab compiles v86.wasm once (`postStart` in
+  `vm.js`) and posts the Module with the start message of every pod; a
+  shared worker cannot post a Module, so `relay` in `bridge.js` adds it on
+  the tab side. A worker that compiles the file itself starts on baseline
+  code and V8 optimises the interpreter again (go to `started` 180 -> 70 ms,
+  ~0.4 s CPU per pod, headless Chromium).
 - **Saved VM states** (`web/src/vmstate.js`, stage 0 in
   `vm/init/init.c`): init waits in an initramfs for the pod; the first VM
   per memory size saves its state there, later pods restore it (~0.6 s less
