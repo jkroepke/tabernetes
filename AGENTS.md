@@ -229,10 +229,10 @@ that name.
   forever. Firefox and Safari end the worker with the last tab: no image.
 - **poweroff, shutdown, reboot** (`terminal.js`, `cluster.js`): stop the
   control plane of every tab. The worker broadcasts a wall(1)-like message,
-  waits ~1.5 s for the last etcd snapshot (Go saves once a second) and the
-  files of `/root`, drops a hibernated image and closes like after a crash.
-  The cluster is kept, like the disk of a machine; `forget` is the command
-  that deletes it. reboot then boots a fresh control plane in the same tab,
+  the tabs end their pods, and the worker runs `forget` (cluster, `/root`,
+  images, VM states) and closes like after a crash. Joe wants a wiped
+  cluster, like on the first visit, not a kept one (2026-11-12). reboot
+  then boots a new cluster in the same tab,
   in place (`restart` in `index.js`), not by a reload: the blog page sits
   behind a start button. The other tabs stay down until Enter. The tabs end
   the workers of their pods and close their WebRTC connections, so Docker

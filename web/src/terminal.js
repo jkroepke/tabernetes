@@ -148,8 +148,8 @@ export async function startTerminal(el, opts) {
         "  logs [n]                 the last n lines of the control plane logs",
         "  history [n] | -c         the commands of this tab (Ctrl-R searches them)",
         "  forget [-y]              delete the cluster, the files in ~ and the images this browser keeps",
-        "  poweroff, shutdown       stop the control plane of all tabs (the cluster is kept)",
-        "  reboot, shutdown -r      the same, then this tab boots a fresh control plane",
+        "  poweroff, shutdown       stop the control plane of all tabs and forget the cluster",
+        "  reboot, shutdown -r      the same, then this tab boots a new cluster",
         "  clear                    clear the screen",
         ...terminal.filter((n) => !["join", "accept", "unjoin", "proxy", "vnc", "logs", "history", "forget", "poweroff", "shutdown", "reboot", "clear"].includes(n)).map((n) => `  ${n}`),
         "",
@@ -189,10 +189,10 @@ export async function startTerminal(el, opts) {
       if (kept) write("The images of the running pods stay until the pods are gone: the next visit deletes them.\n");
     },
     // poweroff, shutdown and reboot stop the control plane: for every tab
-    // with a shared worker (cluster.js), else the one of this tab. The
-    // cluster and the files in ~ are saved first, like the disks of a
-    // machine. reboot then boots a new control plane in this tab, from the
-    // saved cluster; the other tabs stay down until they are reloaded.
+    // with a shared worker (cluster.js), else the one of this tab. They
+    // delete what forget deletes, so the next boot is a new cluster, like
+    // on the first visit. reboot boots it in this tab; the other tabs stay
+    // down until Enter.
     poweroff(args, ctx) { return power(false, ctx); },
     reboot(args, ctx) { return power(true, ctx); },
     shutdown(args, ctx) {
@@ -217,7 +217,7 @@ export async function startTerminal(el, opts) {
   };
   async function power(reboot) {
     if (cluster) {
-      // It answers once the cluster is saved; the worker closes, and the
+      // It answers once the cluster is deleted; the worker closes, and the
       // tabs say so (joinCluster).
       await cluster.rpc("poweroff", reboot).catch(() => {});
       if (reboot) restart();
@@ -225,7 +225,7 @@ export async function startTerminal(el, opts) {
     }
     // The control plane runs in this tab: a reload ends it.
     broadcast(term, globalThis.tabernetesNode, reboot);
-    await Promise.all([globalThis.tabernetesState?.flush(), globalThis.fs?.syncHome?.()]).catch(() => {});
+    await forget().catch(() => {});
     if (!reboot) {
       try { sessionStorage.setItem(POWEROFF, "1"); } catch { /* no storage: it boots again */ }
     }
@@ -524,8 +524,8 @@ async function joinCluster(term, cluster, opts, crash) {
       ended = true;
       if (off === "reboot" && by === globalThis.tabernetesNode) return; // it reloads
       term.writeln(DIM(off === "reboot"
-        ? `${by || "Another tab"} boots a new control plane. Press Enter to join it.`
-        : "The control plane is powered off. Press Enter to start it again."));
+        ? `${by || "Another tab"} boots a new cluster. Press Enter to join it.`
+        : "The control plane is powered off and the cluster is gone. Press Enter to boot a new one."));
       return;
     }
     term.writeln(`\r\n\x1b[31mthe control plane exited${why ? `: ${why}` : ""}\x1b[0m`);
