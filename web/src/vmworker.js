@@ -310,7 +310,6 @@ async function bootVM(m, memory) {
   const state = build && (await loadState(build, memory));
   if (state) {
     await ok;
-    fastUnpack(e.v86.cpu);
     try {
       await e.restore_state(state);
       return { emulator: e, init };
@@ -348,28 +347,6 @@ async function bootVM(m, memory) {
 }
 
 const opfs = () => navigator.storage?.getDirectory?.().then(() => true, () => false) ?? Promise.resolve(false);
-
-// fastUnpack replaces how v86 restores the memory of a state: it zeroes all
-// of the memory first, which takes 160 ms for 256 MiB and makes the browser
-// commit every page. The memory of a new VM is zero already: without a
-// BIOS, v86 puts nothing there. The first MiB is checked anyway, as it was
-// when v86 loaded SeaBIOS there (29 pages, v86 0.5.473). Checking every
-// page would take 80 ms.
-const LOW_PAGES = (1 << 20) >> 12;
-function fastUnpack(cpu) {
-  cpu.unpack_memory = function (bitmap, packed) {
-    const pages = this.memory_size[0] >> 12;
-    let d = 0;
-    for (let p = 0; p < pages; p++) {
-      if (bitmap.get(p)) {
-        this.mem8.set(packed.subarray(d << 12, (d + 1) << 12), p << 12);
-        d++;
-      } else if (p < LOW_PAGES && !this.is_memory_zeroed(p << 12, 4096)) {
-        this.zero_memory(p << 12, 4096);
-      }
-    }
-  };
-}
 
 let line = "";
 function control(b) {

@@ -89,7 +89,8 @@ that name.
   SharedWorker the tab runs the control plane and one session itself.
 - **The kubelet of a tab is like a Virtual Kubelet**: a node for the control
   plane, but no container runtime. Limit of 8 pods per tab (kept on purpose).
-- **Real images in a tab run in v86** (32-bit x86 JIT to Wasm, npm `v86`),
+- **Real images in a tab run in v86** (32-bit x86 JIT to Wasm, Joe's fork
+  [jkroepke/v86](https://github.com/jkroepke/v86), see below),
   one worker per pod, `linux/386` image variants. Chosen over TinyEMU (no JIT,
   last release 2019). Kernel: upstream stable Linux (7.3, a tag of
   `gregkh/linux` pinned by its commit in `vm/Dockerfile`, Renovate bumps both)
@@ -108,17 +109,35 @@ that name.
   `k8s/tabernetes/v86exec.go`. `vm/test` runs init on the host
   (`TABERNETES_INIT_TEST`, no mounts, Linux only) and checks exec, attach,
   stdin acks, ttys and exit codes.
+- **v86 is Joe's fork** (since 2026-11-13): jkroepke/v86 is a "hack fork"
+  tuned for pods (its `AGENTS.md` lists the changes and how to measure them
+  with `tools/pod-bench`). `web/package.json` pins a commit of its branch
+  `dist` (`github:jkroepke/v86#<commit>`), which holds only the built npm
+  package files (`tools/dist.sh` in the fork makes it), so the build needs
+  no Rust or Java. Its version is unique per commit: saved VM states are
+  keyed by it, and a state of another v86 build (other CPUID) must not be
+  restored. It needs Wasm SIMD (all current browsers). The 9p server calls
+  `readInto` of `LayerStorage`: in the worker of a pod, a read-only OPFS
+  sync access handle (`layers.js`) reads the file data straight into guest
+  memory, and v86 answers the read in the same call; browsers without the
+  `read-only` mode keep the Blob reads. Measured against v86 0.5.473
+  (2026-11-13, Node.js, `tools/pod-bench` of the fork, main-thread CPU,
+  medians of 10 alternating rounds on a busy machine): nginx from `go` to
+  HTTP 1500 -> 1040 ms, a static Go binary (start + 20 scrapes) 2810 ->
+  1780 ms, glibc text tools 10.1 -> 7.3 s, a JIT-bound shell/gzip/sha256
+  job 6.8 -> 6.4 s; sha256sum and AES in OpenSSL 1.7-3x (SHA and AES-NI).
 - **Saved VM states** (`web/src/vmstate.js`, stage 0 in
   `vm/init/init.c`): init waits in an initramfs for the pod; the first VM
   per memory size saves its state there, later pods restore it (~0.6 s less
   per start). After a restore,
   init must set the clock and reseed the RNG (else all pods share the random
   numbers), and v86 needs `preserve_mac_from_state_image` (else the network
-  adapter has the wrong MAC and port-forward hangs). `fastUnpack` replaces
-  v86's `unpack_memory`, which zeroed all guest RAM (160 ms and 240 MiB more
-  RSS per pod). Kernel options that cost boot time: legacy PTYs (310 ms),
-  gzip (LZ4 unpacks in a third of the time, in-guest zstd is 200 ms slower
-  than LZ4); now the kernel ships unpacked (next point).
+  adapter has the wrong MAC and port-forward hangs). v86 0.5.473 zeroed all
+  guest RAM on restore (160 ms and 240 MiB more RSS per pod); the fork skips
+  that for fresh memory, so the `fastUnpack` override is gone. Kernel
+  options that cost boot time: legacy PTYs (310 ms), gzip (LZ4 unpacks in
+  a third of the time, in-guest zstd is 200 ms slower than LZ4); now the
+  kernel ships unpacked (next point).
 - **Direct kernel boot, no SeaBIOS** (`web/src/kernelboot.js`, since
   2026-11-12): the worker loads the segments of `vmlinux` (ELF, stripped),
   the initramfs and the zero page (E820, cmdline, initrd) into the VM and
@@ -382,9 +401,6 @@ that name.
   and `PREEMPT_VOLUNTARY` do not exist for x86 anymore (lazy preemption).
   `PRINTK=n` would save ~6 % of the first boot, but pods would lose kernel
   messages (OOM kills, segfaults) in their log.
-- **A JIT threshold for v86**: `JIT_THRESHOLD` is a constant in v86's Rust
-  code (`set_jit_config` sets only the page limit and loop safety); it needs
-  a fork of v86.
 - **Splitting the control plane into more workers** (apiserver / controllers /
   kubelet roles of one binary): measured on 2026-11-11, no gain beyond noise,
   +150 MiB per tab. Parked.
