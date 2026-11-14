@@ -63,6 +63,7 @@ export async function serveTab(port, cfg) {
         session.shell(d.src, (s) => port.postMessage({ t: "out", s }), builtins).then((v) => ret(d.seq, v), (e) => fail(d.seq, e));
         break;
       }
+      case "prepare": host.vm?.prepare?.(d.x); break;
       case "biw": builtinCalls.get(d.id)?.write(d.s); break;
       case "bir": {
         const c = builtinCalls.get(d.id);
@@ -164,6 +165,7 @@ export function tabSession(port, { status }) {
         port.postMessage({ t: "shell", seq, src, names: Object.keys(fns) });
       });
     },
+    prepare(x) { port.postMessage({ t: "prepare", x }); },
     incomplete: method("incomplete"),
     commands: method("commands"),
     key: method("key"),

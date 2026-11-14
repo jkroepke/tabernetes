@@ -309,10 +309,9 @@ const fetchBytes = async (url) => new Uint8Array(await (await fetch(url)).arrayB
 // access-log-exporter, start and 50 scrapes).
 const KERNEL_CMDLINE = "console=ttyS0 quiet loglevel=3 tsc=reliable highres=off";
 
-// bootVM starts the VM of the pod, without its file system: from a saved
-// state, or by booting the kernel. It resolves once init waits for the pod.
-async function bootVM(m, memory) {
-  const base = {
+// vmOptions are the options of v86 for the VM of a pod.
+function vmOptions(m, memory) {
+  return {
     wasm_path: m.wasmURL,
     // the tab compiled v86.wasm already (postStart in vm.js)
     ...(m.wasmModule ? { wasm_fn: (env) => WebAssembly.instantiate(m.wasmModule, env).then((i) => i.exports) } : {}),
@@ -336,6 +335,12 @@ async function bootVM(m, memory) {
     preserve_mac_from_state_image: true,
     net_device: { type: "virtio", relay_url: "fetch", vm_ip: m.ip, router_ip: m.gateway },
   };
+}
+
+// bootVM starts the VM of the pod, without its file system: from a saved
+// state, or by booting the kernel. It resolves once init waits for the pod.
+async function bootVM(m, memory) {
+  const base = vmOptions(m, memory);
   // Most pods restore a state: v86 compiles its wasm while the state loads.
   const loaded = (v) => new Promise((r) => v.add_listener("emulator-loaded", r));
   let e = new V86(base);
@@ -359,7 +364,7 @@ async function bootVM(m, memory) {
       await e.restore_state(state);
       // the JIT modules of the kernel that the tab compiled (jit.js)
       importJIT(e, m.jit, build);
-      return { emulator: e };
+      return { emulator: e, restored: { state, build } };
     } catch (err) {
       console.warn("tabernetes: the saved state of the VM does not restore, booting:", err);
       dropState(build, memory).catch(() => {});
@@ -411,6 +416,46 @@ function control(b) {
 
 const memoryOf = (m) => Math.min(MAX_MEMORY, Math.max(MIN_MEMORY, m.memory ? Math.ceil(m.memory / 2 ** 20) : DEFAULT_MEMORY)) * 2 ** 20;
 
+// exercise runs the "warm" command of init (vm/init/init.c) in a second VM
+// from the same state, which is thrown away. A VM that restores a state has
+// run nothing when its pod starts, and V8 optimises the hot functions of
+// v86.wasm (the interpreter) only after they ran for a while. The code of
+// v86.wasm is shared by all workers of the tab (vm.js), so the first pod of
+// a tab ran on baseline code. A pod that comes meanwhile ends the exercise.
+let exercising = null;
+async function exercise(m, memory, { state, build }) {
+  let e, timer;
+  try {
+    e = new V86(vmOptions(m, memory));
+    exercising = e;
+    await new Promise((r) => e.add_listener("emulator-loaded", r));
+    if (exercising !== e) return;
+    await e.restore_state(state);
+    if (exercising !== e) return;
+    importJIT(e, m.jit, build);
+    let l = "";
+    const warmed = new Promise((resolve) => {
+      e.add_listener("serial1-output-byte", (b) => {
+        if (b === 10) { if (l.trim() === "warmed" || l.startsWith("exit ")) resolve(); l = ""; } else l += String.fromCharCode(b);
+      });
+      timer = setTimeout(resolve, 10000);
+    });
+    e.run();
+    e.serial_send_bytes(1, new TextEncoder().encode("warm\n"));
+    await warmed;
+  } catch (err) {
+    console.warn("tabernetes: warm:", err);
+  } finally {
+    clearTimeout(timer);
+    if (exercising === e) { exercising = null; e?.destroy(); }
+  }
+}
+function stopExercise() {
+  const e = exercising;
+  exercising = null;
+  try { e?.destroy(); } catch {}
+}
+
 // A spare worker (vm.js) gets "warm" before there is a pod for it: it
 // restores (or boots) the VM with the default memory, which then waits for
 // the address and the root file system of the next pod, and opens the image
@@ -419,7 +464,7 @@ let warm = null; // {memory, vm}
 function warmUp(m) {
   const memory = memoryOf(m);
   warm = { memory, vm: bootVM(m, memory) };
-  warm.vm.catch(() => {});
+  warm.vm.then((v) => { if (m.exercise && v.restored && warm) exercise(m, memory, v.restored); }, () => {});
   openStore().then((s) => { store ??= s; }, () => {});
 }
 
@@ -434,6 +479,7 @@ function address(e, m) {
 
 async function start(m) {
   const t0 = Date.now();
+  stopExercise();
   const memory = memoryOf(m);
   // The VM of a spare worker, or one that boots while the image is pulled.
   let vm;

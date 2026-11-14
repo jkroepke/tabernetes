@@ -100,6 +100,7 @@ export async function startTerminal(el, opts) {
   // optimised now, not in the first pod. Not earlier: while the control
   // plane boots, the work made the prompt of a reload ~0.35 s later.
   if (opts.pods?.vm?.jitURL) prefetchJIT(opts.pods.vm.jitURL);
+  if (opts.pods?.vm && !globalThis.TABERNETES_NO_PREPARE) setTimeout(() => (joined.prepare ?? session.prepare)?.(globalThis.TABERNETES_EXERCISE !== false), globalThis.TABERNETES_PREPARE_DELAY ?? 300);
   keepStorage();
   // tabernetes.shell for tests and the DevTools console, as before.
   globalThis.tabernetes ??= {};
@@ -630,7 +631,7 @@ async function bootHere(term, opts, logs, crash) {
     gpu: p.gpu ? gpuAPI(p.gpu) : undefined,
   };
   const session = await globalThis.tabernetes.openTab(host);
-  return { session, name: session.name, ip: session.ip };
+  return { session, name: session.name, ip: session.ip, prepare: (x) => host.vm?.prepare(x) };
 }
 
 // broadcast prints what systemd sends to every terminal with wall(1) on

@@ -82,11 +82,11 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
   // next pod takes it. That saves the start of the worker and the restore
   // of the VM state.
   let spare = null;
-  const warmUp = () => {
+  const warmUp = (exercise = false) => {
     const w = newWorker();
     w.onmessage = ({ data: m }) => { if (m.type === "build") build = m.build; };
     w.onerror = (e) => { e.preventDefault(); if (spare === w) spare = null; };
-    const m = { type: "warm", version, build, wasmURL: abs(wasmURL), kernelURL: abs(kernelURL), initURL: abs(initURL), jitURL: jitURL && abs(jitURL) };
+    const m = { type: "warm", exercise, version, build, wasmURL: abs(wasmURL), kernelURL: abs(kernelURL), initURL: abs(initURL), jitURL: jitURL && abs(jitURL) };
     if (spawn) w.postMessage(m);
     else postStart(w, m);
     spare = w;
@@ -98,6 +98,8 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
     timer = setTimeout(() => { timer = 0; if (!spare) warmUp(); }, 2000);
   };
   return {
+    // prepare makes the first spare worker, at the prompt.
+    prepare(exercise = true) { if (!spare && !timer) warmUp(exercise); },
     version, // of v86, for the container runtime of the node
     registry,
 
