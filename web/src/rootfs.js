@@ -172,6 +172,24 @@ export class LayerStorage {
     return data.subarray(offset, offset + count);
   }
 
+  // readInto copies the data of a file straight into dest (a view of the
+  // memory of the guest) when that can be done synchronously: v86 then
+  // answers the read of the guest in the same call, and the data is copied
+  // once. It returns the number of bytes, or -1 if v86 has to use read.
+  readInto(key, offset, dest, size) {
+    const m = this.mem.get(key) || this.lru.get(key);
+    if (m) {
+      const part = m.subarray(offset, offset + dest.length);
+      dest.set(part);
+      return part.length;
+    }
+    const colon = key.lastIndexOf(":");
+    const layer = this.layers.get(key.slice(0, colon));
+    if (!layer.readInto) return -1;
+    const n = Math.max(0, Math.min(dest.length, size - offset));
+    return layer.readInto(Number(key.slice(colon + 1)) + offset, n === dest.length ? dest : dest.subarray(0, n));
+  }
+
   // v86 calls these for files it keeps itself; the layers stay as they are.
   async cache() {}
   uncache() {}

@@ -354,8 +354,29 @@ class OPFSStore {
 
   // layer is the reader of the tar of an unpacked layer.
   async layer(digest) {
-    const file = await (await this.dir.getFileHandle(fileName(digest) + ".tar")).getFile();
-    return { read: async (offset, length) => new Uint8Array(await file.slice(offset, offset + length).arrayBuffer()) };
+    const handle = await this.dir.getFileHandle(fileName(digest) + ".tar");
+    const file = await handle.getFile();
+    const layer = { read: async (offset, length) => new Uint8Array(await file.slice(offset, offset + length).arrayBuffer()) };
+    // In the worker of a pod, a sync access handle reads straight into the
+    // memory of the guest (v86 calls readInto with a view of it), and v86
+    // answers the read of the guest at once. Pods share layers, so only the
+    // "read-only" mode works (Chrome 121+, Firefox 133+). A browser that
+    // does not know the mode takes an exclusive lock: a second handle shows
+    // whether the mode works. Else the Blob reads stay. The handle closes
+    // with the worker of the pod.
+    try {
+      const h = await handle.createSyncAccessHandle({ mode: "read-only" });
+      try {
+        (await handle.createSyncAccessHandle({ mode: "read-only" })).close();
+      } catch {
+        h.close();
+        return layer;
+      }
+      layer.readInto = (offset, dest) => h.read(dest, { at: offset });
+    } catch {
+      // no sync access handles here (not a dedicated worker, old browser)
+    }
+    return layer;
   }
 }
 

@@ -14,7 +14,7 @@
 // through a MessagePort that the tab relays. vm.js and gpu.js run in the
 // shared worker unchanged, with spawn in place of new Worker.
 
-import { vmAPI } from "./vm.js";
+import { vmAPI, postStart } from "./vm.js";
 import { gpuAPI } from "./gpu.js";
 
 // ---- the shared worker ----
@@ -211,8 +211,14 @@ function relay(url, p, workers) {
   workers.add(w);
   w.onmessage = ({ data }) => p.postMessage({ m: data }, buffers(data));
   w.onerror = (e) => { e.preventDefault(); p.postMessage({ error: e.message || "the worker failed" }); };
+  // The start message of a pod gets the Module of v86.wasm of this tab
+  // (postStart in vm.js). That takes a moment the first time: the messages
+  // keep their order.
+  let order = Promise.resolve();
   p.onmessage = ({ data }) => {
-    if (data.end) { w.terminate(); workers.delete(w); p.close(); } else w.postMessage(data.m, data.x || []);
+    if (data.end) { w.terminate(); workers.delete(w); p.close(); return; }
+    const m = data.m;
+    order = order.then(() => (m?.type === "start" && m.wasmURL ? postStart(w, m, data.x || []) : w.postMessage(m, data.x || [])));
   };
 }
 
