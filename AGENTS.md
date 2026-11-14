@@ -523,7 +523,20 @@ that name.
   reach Go at once, but kubectl still waits behind the goroutines of the
   controllers (no preemption): run -> start message 1.5 s after the prompt
   1023 -> 1007 ms, at the prompt 2690 -> 2403 ms, the prompt +100-300 ms
-  (5 rounds). Not kept.
+  (5 rounds). Not kept. What paid: the controllers share the client of
+  the controller-manager (`--use-service-account-credentials=false`, the
+  binding `tabernetes:kube-controller-manager` to `cluster-admin` in
+  `addons/bootstrap.yaml`) instead of a service account, a token and a
+  client with its own TLS connection each (~40). Headless Chromium, nginx,
+  first visit, 2 pods, medians, before -> after: `kubectl run` 1.5 s after
+  the prompt, run -> start message 1409 -> 292 ms and 1416 -> 841 ms (6 and
+  8 rounds), first pod 3160 -> 1861 and 2972 -> 2200 ms; at the prompt
+  2792 -> 2092 ms and 2.4 -> 2.2 s (that case is bimodal: sometimes kubectl
+  runs before the controllers start); 3 s after the prompt and the prompt
+  unchanged. `kubectl get sa -n kube-system` no longer lists a service
+  account per controller. Profiles of the worker over CDP overstate the
+  console: with DevTools attached, `console.debug` of each log line looked
+  like ~1 s; without it, no gain from dropping it (6 rounds).
 - **kubectl translations are off** (patch.go): loading them zipped and parsed
   the `.po` files during init (~0.1 s), and the terminal sets no `LANG`.
 - **Persistence rules**: the etcd snapshot is saved only after boot, and a
