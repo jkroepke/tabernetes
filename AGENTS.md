@@ -207,12 +207,33 @@ that name.
   pooled): first pod cold 5092 / 4913 / 5076 ms, return 2921 / 2873 /
   3002 ms, within the noise; the control plane is busy then (run -> start
   of the VM ~1.8 s), and the warm-up shares the CPU with it.
-- Parked (2026-11-14): booting the VM of the first pod ahead in the tab
-  (like the spare worker of `vm.js`). At page load it made the prompt of
-  a reload later (6188 -> 6541 ms). At the prompt the VM part of the first
-  pod got faster (start -> HTTP 1132 -> 964 ms), but with `kubectl run` at
-  the very prompt the whole first pod not (2978 -> 3139 ms, 6 rounds), it
-  competes with the control plane.
+- **The worker of the first pod is made at the prompt, with warm emulator
+  code** (`prepareWorker` in `vm.js`, `exercise` in `vmworker.js`, `warm`
+  in `vm/init/init.c`, 2026-11-14): V8 optimises the hot functions of
+  v86.wasm (the interpreter) only after they ran for a while, and a VM that
+  restores a state has run nothing. The first pod of a tab ran on baseline
+  code; only a kernel boot before it (no saved state yet) warmed the code.
+  Node.js, nginx as the first pod of a new process from a saved state: 849
+  ms, after a kernel boot 761 ms, after a full nginx start 695-750 ms; the
+  process CPU of that pod 2.06 -> 1.58 s. Now the tab makes the worker of
+  its first pod at the prompt: it restores (or boots) the VM, then a second
+  VM from the same state gets the line `warm` instead of `go`, and init
+  runs what a program start does (fork, exec, page faults, files, a pipe,
+  TCP over loopback, a loop that the JIT compiles): 23 million
+  instructions, ~0.2 s of the worker, then that VM is thrown away. One
+  child program warmed as well as eight (Node.js: 756 / 750 / 737 ms with
+  1 / 3 / 8). A pod that starts meanwhile ends the warm-up. The tab makes
+  the worker itself, not through the shared worker: that one is busy after
+  the prompt, and its answer came 1-3 s late. Later spare workers do not
+  warm up (the code is shared by the tab). Measured in headless Chromium
+  (nginx, `kubectl run` 3 s after the prompt to HTTP, medians of 8
+  alternating rounds, each a fresh visitor and a return visit): fresh
+  visitor 2983 -> 2465 ms, return visit 1313 -> 1040 ms. In an earlier
+  series the spare worker alone gave 1270 -> 1160 ms on a return visit, with
+  warm code 965 ms. `kubectl run` at the very prompt (7 rounds): 6243 ->
+  6167 ms and 3622 -> 3536 ms, noise: the control plane needs seconds
+  then. The older finding that a VM booted ahead did not pay was 6 rounds
+  of that last case.
 - **Direct kernel boot, no SeaBIOS** (`web/src/kernelboot.js`, since
   2026-11-12): the worker loads the segments of `vmlinux` (ELF, stripped),
   the initramfs and the zero page (E820, cmdline, initrd) into the VM and

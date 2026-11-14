@@ -77,7 +77,7 @@ export async function postStart(worker, m, transfer = []) {
 // the first pod: to vmAPI in this tab, or to relay (bridge.js) when the
 // shared worker asks for a worker.
 let prepared = null; // {url, worker, build}
-export function prepareWorker({ version, workerURL, wasmURL, kernelURL, initURL, jitURL }) {
+export function prepareWorker({ workerURL, registry, ...files }) {
   if (prepared) return;
   try {
     const url = new URL(workerURL, location.href).href;
@@ -85,7 +85,8 @@ export function prepareWorker({ version, workerURL, wasmURL, kernelURL, initURL,
     const p = (prepared = { url, worker, build: "" });
     worker.onmessage = ({ data: m }) => { if (m.type === "build") p.build = m.build; };
     worker.onerror = (e) => { e.preventDefault(); if (prepared === p) prepared = null; };
-    postStart(worker, { type: "warm", exercise: true, version, build: "", wasmURL, kernelURL, initURL, jitURL });
+    // files: the version of v86 and the URLs of what the VM needs
+    postStart(worker, { type: "warm", exercise: true, build: "", ...files });
   } catch {
     // no worker: the pod makes its own
   }
