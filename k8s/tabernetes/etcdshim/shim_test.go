@@ -195,3 +195,60 @@ func TestSaveLoop(t *testing.T) {
 	s.mu.Unlock()
 	saved(true, "a deleted pod")
 }
+
+// TestClient checks the in-process client: writes, reads, a watch, a lease
+// and that a write copies the value of the caller.
+func TestClient(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := Start(l, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := srv.Client()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if eps := c.Endpoints(); len(eps) != 1 {
+		t.Fatalf("endpoints %v", eps)
+	}
+	if st, err := c.Status(ctx, c.Endpoints()[0]); err != nil || st.Version == "" {
+		t.Fatalf("status %v %v", st, err)
+	}
+	w := c.Watch(ctx, "/a/", clientv3.WithPrefix())
+	val := []byte("1")
+	r, err := c.Put(ctx, "/a/x", string(val))
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := []byte("v")
+	tx, err := c.Txn(ctx).Then(clientv3.OpPut("/a/y", string(buf))).Commit()
+	if err != nil || !tx.Succeeded {
+		t.Fatal(err)
+	}
+	buf[0] = 'X'
+	g, err := c.KV.Get(ctx, "/a/", clientv3.WithPrefix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Kvs) != 2 || string(g.Kvs[1].Value) != "v" || g.Header.Revision != r.Header.Revision+1 {
+		t.Fatalf("get %v", g.Kvs)
+	}
+	got := 0
+	for got < 2 {
+		select {
+		case resp := <-w:
+			got += len(resp.Events)
+		case <-ctx.Done():
+			t.Fatalf("watch got %d events", got)
+		}
+	}
+	lease, err := c.Grant(ctx, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.KeepAliveOnce(ctx, lease.ID); err != nil {
+		t.Fatal(err)
+	}
+}

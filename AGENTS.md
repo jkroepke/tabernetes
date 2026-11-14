@@ -485,8 +485,8 @@ that name.
   first `kubectl apply` of a session takes ~1.15 s instead of ~0.15 s
   (it builds the v3 specs), the first `kubectl explain` ~0.33 instead of
   ~0.13 s. Upstream `TestUpdateOpenAPISpec` of k8s.io/apiserver/pkg/server
-  fails by design: it reads `StaticOpenAPISpec`, which only
-  apiextensions-apiserver fills now. What is left: `CreateServerChain`
+  fails by design: it reads `StaticOpenAPISpec`, which no server fills
+  now (see `StaticOpenAPISpecLazy` below). What is left: `CreateServerChain`
   (storage and handlers of every resource), `NewConfig` (admission
   plugins, authorizers), the creation of the RBAC roles on a first
   visit (~1.4 s) and ~0.6-0.9 s of lazy compilation of the Wasm functions
@@ -544,6 +544,38 @@ that name.
   account per controller. Profiles of the worker over CDP overstate the
   console: with DevTools attached, `console.debug` of each log line looked
   like ~1 s; without it, no gain from dropping it (6 rounds).
+- **kube-apiserver calls the etcd shim without gRPC**
+  (`etcdshim/client.go`, `factory/inprocess.go` in `k8s/_overlay`,
+  2026-11-14): the storage of kube-apiserver made one etcd client with its
+  own gRPC connection per resource, and every request went through HTTP/2
+  framing and protobuf both ways over the in-memory network: ~0.5 s of the
+  ~4.4 s of CPU of the shared worker to the prompt (CPU profile of the
+  worker from its start; under `syscall.Write` the profile shows nested
+  resumes of Go, not the console). Now `factory.InProcessClient` gives it
+  clients that call the shim like `v3client` of an embedded etcd (the
+  adapters of `grpcproxy/adapter`). Writes are copied (`copyWrites`),
+  answers hold the records of the store, which never change. The gRPC
+  server still listens on 2379. Headless Chromium, nginx, 2 pods, `kubectl
+  run` 3 s after the prompt, 8 alternating rounds, medians, before ->
+  after: prompt of a first visit 4354 -> 3802 ms, of a return visit 4585
+  -> 4111 ms; pods unchanged within the noise (first pod 1471 -> 1512 /
+  801 -> 795 ms). The boot of the seed in Node.js 5.4 -> 4.2 s.
+- **More of the OpenAPI work on the first request** (patch.go,
+  2026-11-14): apiextensions-apiserver and the kube-aggregator still built
+  their OpenAPI v2 spec at boot (~0.15 s). The CRD OpenAPI controller now
+  gets the spec of apiextensions-apiserver as a lazy value
+  (`StaticOpenAPISpecLazy`) and merges it with the CRDs on the first
+  request of `/openapi/v2`, like before; the aggregator builds its own
+  spec then too. `GetOpenAPIDefinitions` of the generated files was one
+  function with a map literal of 1500 entries; it is now a loop over two
+  tables that package init fills (so the heap snapshot holds them). Most
+  of what is left of it (~0.1 s) is V8 compiling the 1500 `schema_*`
+  functions on their first call, which kube-apiserver needs at boot for
+  the type converter of managed fields. Headless Chromium, nginx, first
+  visit, medians, before -> after: prompt 3923 -> 3740 ms (18 rounds),
+  return visit 4013 -> 3902 ms (8 rounds); first pod 1516 -> 1395 ms.
+  Tested: `kubectl explain`, `/openapi/v2` and `/openapi/v3`, and a CRD
+  that appears in `/openapi/v2` and in `kubectl explain`.
 - **kubectl translations are off** (patch.go): loading them zipped and parsed
   the `.po` files during init (~0.1 s), and the terminal sets no `LANG`.
 - **Persistence rules**: the etcd snapshot is saved only after boot, and a
