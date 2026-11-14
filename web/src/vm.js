@@ -70,7 +70,7 @@ export async function postStart(worker, m, transfer = []) {
 
 // spawn starts the worker. In the shared worker it is a worker of the tab
 // (bridge.js), since a shared worker cannot start workers.
-export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL, registry, spawn }) {
+export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL, stateURL, registry, spawn }) {
   const abs = (u) => new URL(u, location.href).href;
   // The ID of the saved VM states (vmstate.js) of this kernel and init, as
   // the worker of a pod computed it. Later pods look for a state with it
@@ -86,7 +86,7 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
     const w = newWorker();
     w.onmessage = ({ data: m }) => { if (m.type === "build") build = m.build; };
     w.onerror = (e) => { e.preventDefault(); if (spare === w) spare = null; };
-    const m = { type: "warm", version, build, wasmURL: abs(wasmURL), kernelURL: abs(kernelURL), initURL: abs(initURL), jitURL: jitURL && abs(jitURL) };
+    const m = { type: "warm", version, build, wasmURL: abs(wasmURL), kernelURL: abs(kernelURL), initURL: abs(initURL), jitURL: jitURL && abs(jitURL), stateURL: stateURL && abs(stateURL) };
     if (spawn) w.postMessage(m);
     else postStart(w, m);
     spare = w;
@@ -140,6 +140,7 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
         kernelURL: abs(kernelURL),
         initURL: abs(initURL),
         jitURL: jitURL && abs(jitURL),
+        stateURL: stateURL && abs(stateURL),
       };
       // With spawn, the tab adds the Module when it passes the message on.
       // Without, this is the tab: what follows waits for the start message.

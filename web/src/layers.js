@@ -241,12 +241,16 @@ class OPFSStore {
     this.persistent = true;
   }
 
-  // index returns the index of an unpacked layer, or null.
+  // index returns the index of an unpacked layer, or null. The tar must
+  // have the size that the index names: add does not flush the files to
+  // disk (see there), so after a crash of the system the index may be there
+  // without all of the tar.
   async index(digest) {
     try {
-      const f = await (await this.dir.getFileHandle(fileName(digest) + ".json")).getFile();
+      const name = fileName(digest);
+      const [f, tar] = await Promise.all([this.dir.getFileHandle(name + ".json").then((h) => h.getFile()), this.dir.getFileHandle(name + ".tar").then((h) => h.getFile())]);
       const idx = JSON.parse(await f.text());
-      return idx.version === VERSION ? idx : null;
+      return idx.version === VERSION && idx.size === tar.size ? idx : null;
     } catch {
       return null;
     }
@@ -255,6 +259,12 @@ class OPFSStore {
   // add unpacks a layer, once for all tabs. fetch() returns the stream of
   // the compressed layer and verify() throws when its digest is wrong; the
   // index is written only after it passed, so a bad layer is never used.
+  // Neither file is flushed: flush() waits until the disk has the data
+  // (fsync), ~80 ms for the 83 MB tar of a layer of nginx, on the thread
+  // that unpacks and before the pod can start. Without it, a crash of the
+  // browser loses nothing (the system has the data), a crash of the system
+  // may: index() then finds a tar that is too short and the layer is
+  // pulled again.
   async add(digest, fetch, verify, mediaType) {
     const run = async () => {
       const have = await this.index(digest);
@@ -269,7 +279,6 @@ class OPFSStore {
             if (h.write(chunk, { at }) !== chunk.length) throw new DOMException("short write", "QuotaExceededError");
           });
           verify();
-          h.flush();
           idx = { version: VERSION, size, entries };
         } catch (e) {
           h.truncate(0); // give the room back, the layer has no index anyway
@@ -283,7 +292,6 @@ class OPFSStore {
         const b = new TextEncoder().encode(JSON.stringify(idx));
         j.truncate(0);
         j.write(b, { at: 0 });
-        j.flush();
       } finally {
         j.close();
       }

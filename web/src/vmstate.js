@@ -1,8 +1,9 @@
 // vmstate keeps the saved states of booted pod VMs (vmworker.js) in the
 // origin private file system: tabernetes/vm/<build>-<memory in MiB>.state.
 // A pod boots the kernel only when there is no state for its memory size
-// yet; it saves one when init waits for the pod (vm/init/init.c). Every
-// later pod with that memory size restores the state instead, in every tab.
+// yet, and the build ships none for it (vmstate.bin, below); it saves one
+// when init waits for the pod (vm/init/init.c). Every later pod with that
+// memory size restores the state instead, in every tab.
 //
 // build is a hash of v86, the kernel and init: a new release makes new
 // states and deletes the old ones. forget deletes all of them (state.js).
@@ -108,6 +109,35 @@ async function sweep(d, build, others) {
       if (old || (others && !mine)) await d.removeEntry(n).catch(() => {});
     }
   }
+}
+
+// The state that the build ships (vmstate.bin, made by web/jit.mjs): the VM
+// of a pod with the default memory, booted to the point where init waits for
+// the pod, as a pod would save it. The first pod of a visitor restores it
+// instead of booting the kernel, so it needs neither the kernel nor init.
+// The file: a line "tabernetes-state <build> <memory in MiB>\n", padded with
+// spaces to 64 bytes, then the state as save_state of v86 made it,
+// compressed with zstd (restore_state of v86 unpacks it).
+const SHIPPED_HEADER = 64;
+
+// packState puts the header in front of a compressed state.
+export function packState(build, memory, state) {
+  const line = `tabernetes-state ${build} ${memory >> 20}\n`.padEnd(SHIPPED_HEADER, " ");
+  const out = new Uint8Array(SHIPPED_HEADER + state.byteLength);
+  out.set(new TextEncoder().encode(line));
+  out.set(new Uint8Array(state), SHIPPED_HEADER);
+  return out;
+}
+
+// parseState returns {build, memory, state} of a shipped state, or null.
+export function parseState(buf) {
+  if (buf.byteLength <= SHIPPED_HEADER) return null;
+  const line = new TextDecoder().decode(new Uint8Array(buf, 0, SHIPPED_HEADER));
+  const m = line.match(/^tabernetes-state (\S+) (\d+)\n/);
+  if (!m) return null;
+  const state = buf.slice(SHIPPED_HEADER);
+  if (!valid(state)) return null;
+  return { build: m[1], memory: Number(m[2]) * 2 ** 20, state };
 }
 
 // dropState deletes a state that did not restore.

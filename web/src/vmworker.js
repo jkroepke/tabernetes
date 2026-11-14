@@ -19,7 +19,7 @@ import { openStore, imageFSCapacity } from "./layers.js";
 import { SHA256 } from "./sha256.js";
 import { initramfs } from "./initramfs.js";
 import { bootKernel } from "./kernelboot.js";
-import { buildID, loadState, saveState, dropState } from "./vmstate.js";
+import { buildID, loadState, saveState, dropState, parseState } from "./vmstate.js";
 import { importJIT } from "./jit.js";
 
 const post = (m, transfer) => self.postMessage(m, transfer || []);
@@ -83,6 +83,7 @@ async function sha256(bytes) {
 // Pull fetches manifests and blobs, the config through the Cache Storage.
 class Pull {
   constructor(registry, ref) {
+    this.registry = registry;
     this.base = registry.replace(/\/+$/, "") + "/v2/" + ref.repo;
     this.ref = ref;
     this.fetched = 0; // bytes that came over the network
@@ -199,7 +200,10 @@ let store; // the image store (layers.js), once per worker
 // imagePullPolicy of the container: with IfNotPresent and Never, an image
 // that a pull of the same reference left complete is used without asking
 // the registry, as the kubelet does.
-async function pullImage(registry, image, policy, onFetching) {
+// on.fetching() is called when something of the image is missing, and
+// on.layers() once the layers download (or when there is nothing to
+// download).
+async function pullImage(registry, image, policy, on) {
   const ref = parseRef(image);
   if (ref.domain !== "docker.io") {
     throw new PullError(`failed to resolve reference "${ref.name}": the tab node pulls from Docker Hub only (through the registry mirror of this page)`);
@@ -214,69 +218,146 @@ async function pullImage(registry, image, policy, onFetching) {
     if (img) return img;
     if (policy === "Never") throw new NeverPullError(`Container image "${image}" is not present with pull policy of Never`);
   }
+  return pullFromRegistry(p, ref, on);
+}
+
+// pullFromRegistry resolves the reference at the registry and pulls what is
+// missing of the image.
+async function pullFromRegistry(p, ref, on) {
   let { digest, json: m } = await p.manifest(ref.reference, [...INDEX_TYPES, ...MANIFEST_TYPES]);
   const imageID = `${ref.domain}/${ref.repo}@${digest}`;
+  let matched = false; // the manifest of linux/386 in an index
   if (m.manifests) {
     const d = m.manifests.find((x) => x.platform?.os === PLATFORM.os && x.platform?.architecture === PLATFORM.architecture);
     if (!d) throw new PullError(`failed to pull and unpack image "${ref.name}": no match for platform in manifest: not found (the tab node runs linux/386 images, ${ref.name} has ${[...new Set(m.manifests.map((x) => x.platform && `${x.platform.os}/${x.platform.architecture}`).filter((x) => x && !x.startsWith("unknown")))].join(", ")})`);
     m = (await p.manifest(d.digest, MANIFEST_TYPES)).json;
+    matched = true;
   } else if (m.config) {
     // a single-platform image: it must be linux/386 itself
   } else {
     throw new PullError(`failed to pull and unpack image "${ref.name}": unsupported manifest`);
   }
-  const img = await unpackImage(p, ref, imageID, m, onFetching);
+  const img = await unpackImage(p, ref, imageID, m, { ...on, matched });
   await p.remember(imageID, m);
   return img;
 }
 
 // presentImage returns the image if all of it is in the browser, else null.
-const presentImage = (p, ref, imageID, m) => unpackImage(p, ref, imageID, m, null);
+const presentImage = (p, ref, imageID, m) => unpackImage(p, ref, imageID, m);
 
 // unpackImage fetches and unpacks what is missing of the image with the
-// manifest m. Without onFetching, it returns null if something is missing.
-async function unpackImage(p, ref, imageID, m, onFetching) {
+// manifest m. Without on.fetching, it returns null if something is missing.
+// matched tells that an index chose m for linux/386.
+async function unpackImage(p, ref, imageID, m, { fetching, layers: onLayers, matched = false } = {}) {
   const size = m.layers.reduce((n, l) => n + (l.size || 0), 0) + (m.config.size || 0);
   await Promise.all(m.layers.map((l) => store.use(l.digest)));
   const indexes = await Promise.all(m.layers.map((l) => store.index(l.digest)));
   const present = (await p.cached(m.config.digest)) && indexes.every(Boolean);
+  // The layer workers start while the config comes (~50 ms each). Not
+  // for an image that is present: kubectl run of a :latest image asks the
+  // registry on every start, and the workers would only cost CPU.
+  let pool = null;
   if (!present) {
-    if (!onFetching) return null;
-    onFetching();
+    if (!fetching) return null;
+    fetching();
+    pool = Array.from({ length: Math.min(PULL_PARALLEL, indexes.filter((x) => !x).length) }, layerWorker);
   }
-  const config = JSON.parse(new TextDecoder().decode(await p.blob(m.config.digest)));
-  if (config.architecture && config.architecture !== PLATFORM.architecture) {
-    throw new PullError(`failed to pull and unpack image "${ref.name}": no match for platform in manifest: not found (the tab node runs linux/386 images, this one is ${config.os}/${config.architecture})`);
-  }
+  const config = p.blob(m.config.digest).then((b) => {
+    const c = JSON.parse(new TextDecoder().decode(b));
+    if (c.architecture && c.architecture !== PLATFORM.architecture) {
+      throw new PullError(`failed to pull and unpack image "${ref.name}": no match for platform in manifest: not found (the tab node runs linux/386 images, this one is ${c.os}/${c.architecture})`);
+    }
+    return c;
+  });
+  config.catch(() => {});
+  // A manifest that an index chose for linux/386 has its layers for it:
+  // they download while the config comes, a round trip to the mirror less.
+  // Else the config must tell first.
+  if (!matched) await config;
+  const missing = m.layers.map((l, i) => i).filter((i) => !indexes[i]);
+  const n = Math.min(PULL_PARALLEL, missing.length);
+  const workers = pool ? pool.slice(0, n) : [];
+  for (const w of pool?.slice(n) ?? []) w?.terminate();
   // Up to PULL_PARALLEL layers download and unpack at once, as containerd
   // does (max_concurrent_downloads = 3). It saves the round trips and the
   // time the mirror needs to fetch a blob from Docker Hub. The order of the
   // layers matters only for the root file system, not for the download.
-  const add = async (l) => {
-    const { fetch, verify } = p.layer(l.digest, l.size);
-    try {
-      return await store.add(l.digest, fetch, verify, l.mediaType);
-    } catch (e) {
-      if (e instanceof PullError) throw e;
-      const why = e?.name === "QuotaExceededError" ? "no space left on device" : e?.message || String(e);
-      throw new PullError(`failed to extract layer ${l.digest}: write /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs: ${why}`);
-    }
-  };
-  const missing = m.layers.map((l, i) => i).filter((i) => !indexes[i]);
+  // Each of them unpacks in a layer worker of its own (see layerWorker).
   let next = 0, failed = false;
-  await Promise.all(Array.from({ length: Math.min(PULL_PARALLEL, missing.length) }, async () => {
-    while (!failed && next < missing.length) {
-      const i = missing[next++];
-      try {
-        indexes[i] = await add(m.layers[i]);
-      } catch (e) {
-        failed = true; // start no more layers, the pull fails anyway
-        throw e;
+  try {
+    const all = Promise.all([config.catch((e) => { failed = true; throw e; }), ...workers.map(async (w) => {
+      while (!failed && next < missing.length) {
+        const i = missing[next++];
+        try {
+          indexes[i] = await (w && !w.broken ? inWorker(w, p, m.layers[i]) : unpackLayer(p, m.layers[i]));
+        } catch (e) {
+          failed = true; // start no more layers, the pull fails anyway
+          throw e;
+        }
       }
-    }
-  }));
+    })]);
+    onLayers?.();
+    await all;
+  } finally {
+    for (const w of workers) w?.terminate();
+  }
   const layers = m.layers.map((l, i) => ({ id: l.digest, entries: indexes[i].entries }));
-  return { present, size, imageID, config: config.config || {}, layers };
+  return { present, size, imageID, config: (await config).config || {}, layers };
+}
+
+// unpackLayer fetches a layer, checks its digest and unpacks it into the
+// image store.
+async function unpackLayer(p, l) {
+  const { fetch, verify } = p.layer(l.digest, l.size);
+  try {
+    return await store.add(l.digest, fetch, verify, l.mediaType);
+  } catch (e) {
+    if (e instanceof PullError) throw e;
+    const why = e?.name === "QuotaExceededError" ? "no space left on device" : e?.message || String(e);
+    throw new PullError(`failed to extract layer ${l.digest}: write /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs: ${why}`);
+  }
+}
+
+// A layer worker is a worker of the worker of the pod (this script again)
+// that unpacks layers into the image store. The browser unpacks gzip on the
+// thread that reads the stream, and hashing (crypto.subtle), writing to OPFS
+// and the tar index run there too: with all layers in the worker of the pod,
+// the two large layers of nginx shared one thread, and the VM of the pod
+// waited for it. A pull of nginx from a local mirror took ~1.1 s of that
+// thread. Without workers in workers, or without OPFS (the layers must stay
+// in the memory of this worker), the layers unpack here as before.
+function layerWorker() {
+  if (!store.persistent || typeof Worker !== "function") return null;
+  try {
+    return new Worker(self.location.href, { name: "layer" });
+  } catch {
+    return null;
+  }
+}
+
+// inWorker unpacks the layer l in the layer worker w, or here if w fails
+// (a browser that does not start it, for example).
+function inWorker(w, p, l) {
+  return new Promise((resolve, reject) => {
+    w.onmessage = ({ data }) => (data.error != null ? reject(new PullError(data.error)) : resolve(data.index));
+    w.onerror = (e) => {
+      e.preventDefault?.();
+      w.onerror = w.onmessage = null;
+      w.broken = true;
+      unpackLayer(p, l).then(resolve, reject);
+    };
+    w.postMessage({ type: "layer", registry: p.registry, image: p.ref.name, layer: { digest: l.digest, size: l.size, mediaType: l.mediaType } });
+  });
+}
+
+// layerJob is the side of the layer worker.
+async function layerJob(m) {
+  try {
+    store ??= await openStore();
+    post({ type: "layer", index: await unpackLayer(new Pull(m.registry, parseRef(m.image)), m.layer) });
+  } catch (e) {
+    post({ type: "layer", error: e instanceof PullError ? e.message : `failed to pull and unpack image "${m.image}": ${e?.message || e}` });
+  }
 }
 
 // containerSpec merges the image config with the container of the pod, as
@@ -309,9 +390,23 @@ const fetchBytes = async (url) => new Uint8Array(await (await fetch(url)).arrayB
 // access-log-exporter, start and 50 scrapes).
 const KERNEL_CMDLINE = "console=ttyS0 quiet loglevel=3 tsc=reliable highres=off";
 
+// shippedState fetches the state that the build ships (vmstate.js), or
+// returns null: none, another memory size or another build.
+async function shippedState(m, memory, build) {
+  if (!m.stateURL) return null;
+  try {
+    const res = await fetch(m.stateURL);
+    const s = res.ok ? parseState(await res.arrayBuffer()) : null;
+    return s && s.memory === memory && (!build || s.build === build) ? s : null;
+  } catch {
+    return null;
+  }
+}
+
 // bootVM starts the VM of the pod, without its file system: from a saved
-// state, or by booting the kernel. It resolves once init waits for the pod.
-async function bootVM(m, memory) {
+// state, from the state of the build, or by booting the kernel. It resolves
+// once init waits for the pod. A restore waits for the promise gate.
+async function bootVM(m, memory, gate = null) {
   const base = {
     wasm_path: m.wasmURL,
     // the tab compiled v86.wasm already (postStart in vm.js)
@@ -351,27 +446,40 @@ async function bootVM(m, memory) {
     if (id) post({ type: "build", build: id });
     return id;
   };
-  const build = m.build || (await idOf());
-  const state = build && (await loadState(build, memory));
+  // Without the ID, jit.bin or the state of the build names it: a pod then
+  // fetches neither the kernel nor init (4.7 MB) to hash them.
+  let shipped = m.build || m.jit?.build ? null : await shippedState(m, memory, "");
+  const build = m.build || m.jit?.build || shipped?.build || (await idOf());
+  if (!m.build && build) post({ type: "build", build });
+  let state = build && (await loadState(build, memory));
+  if (!state) {
+    shipped ??= await shippedState(m, memory, build);
+    state = shipped?.state;
+  }
   if (state) {
     await ok;
+    await gate;
     try {
+      // The state of the build stays compressed: v86 unpacks it at every
+      // restore (~30 ms in Node.js). A spare worker that saved it unpacked
+      // to OPFS made the next pod 50-70 ms slower (headless Chromium).
       await e.restore_state(state);
       // the JIT modules of the kernel that the tab compiled (jit.js)
       importJIT(e, m.jit, build);
       return { emulator: e };
     } catch (err) {
       console.warn("tabernetes: the saved state of the VM does not restore, booting:", err);
-      dropState(build, memory).catch(() => {});
+      if (!shipped) dropState(build, memory).catch(() => {});
       e.destroy();
       e = new V86(base);
       ok = loaded(e);
     }
   }
   // No state: the kernel starts in this VM, which has run nothing yet. The
-  // ID that vm.js knew may be of another kernel by now (a new release).
+  // ID that vm.js knew, or that the state of the build named, may be of
+  // another kernel (a new release, a state that did not restore).
   const [kernel, init] = await fetchFiles();
-  const saveAs = m.build ? await idOf() : build;
+  const saveAs = m.build || shipped ? await idOf() : build;
   emulator = e;
   await ok;
   bootKernel(e.v86.cpu, { kernel, initrd: initramfs(init), cmdline: KERNEL_CMDLINE });
@@ -435,24 +543,30 @@ function address(e, m) {
 async function start(m) {
   const t0 = Date.now();
   const memory = memoryOf(m);
+  let go;
+  const layersDownload = new Promise((resolve) => (go = resolve));
   // The VM of a spare worker, or one that boots while the image is pulled.
   let vm;
   if (warm?.memory === memory) {
     vm = warm.vm.then((v) => (address(v.emulator, m), v), () => bootVM(m, memory));
   } else {
     warm?.vm.then((v) => v.emulator.destroy(), () => {});
-    vm = bootVM(m, memory);
+    // Restoring the VM takes the thread for ~60 ms: not before the layers
+    // download, else the manifests of a pull wait for it.
+    vm = bootVM(m, memory, layersDownload);
   }
   warm = null;
   vm.catch(() => {});
   let img;
   try {
-    img = await pullImage(m.registry, m.image, m.pullPolicy, () => post({ type: "pulling" }));
+    img = await pullImage(m.registry, m.image, m.pullPolicy, { fetching: () => post({ type: "pulling" }), layers: go });
   } catch (e) {
     vm.then((v) => v.emulator.destroy(), () => {});
+    go();
     post({ type: "error", pull: true, never: e instanceof NeverPullError, message: e instanceof PullError ? e.message : `failed to pull and unpack image "${m.image}": ${e.message}` });
     return;
   }
+  go();
   post({ type: "pulled", present: img.present, size: img.size, imageID: img.imageID, ms: Date.now() - t0 });
   // The layers of this pod are in use now; a new image may need room.
   if (!img.present) store.gc().catch((e) => console.warn("tabernetes: image garbage collection:", e));
@@ -550,6 +664,7 @@ function connect(id, port) {
 self.onmessage = ({ data: m }) => {
   switch (m.type) {
     case "warm": warmUp(m); break;
+    case "layer": layerJob(m); break;
     case "start": start(m).catch((e) => post({ type: "error", message: String(e?.message || e) })); break;
     case "connect": connect(m.id, m.port); break;
     case "write": conns.get(m.id)?.write(new Uint8Array(m.data)); break;
