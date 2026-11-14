@@ -39,27 +39,38 @@ export async function parseJIT(buf) {
     off += (len + 3) & ~3;
   }
   for (const mod of modules) mod.module = await mod.module;
-  compileNow(modules);
+  warm(modules);
   return { build: m[1], layout: head[2], modules };
 }
 
-// V8 compiles a function of a wasm module at its first call. That would be
-// in the worker of the first pod, on its critical path (~100 ms in Chromium
-// for 200 modules). So each function is called once here, in an instance of
-// its own with a scratch memory whose imports throw: it ends at its first
-// memory access outside the scratch memory, its first import or after its
-// loop limit. The code it ran is thrown away; the compiled code stays with
-// the Module.
-function compileNow(modules) {
-  const memory = new WebAssembly.Memory({ initial: 64 });
+// warm gets the modules optimised before a pod needs them. V8 compiles a
+// function of a wasm module with Liftoff at its first call, and with
+// TurboFan (on other threads) once it has used up its tiering budget, which
+// only normal returns and loop back edges count down. In the first pod that
+// cost ~0.8 s of CPU (headless Chromium, 50 modules). So each function is
+// called here, in an instance of its own with a scratch memory
+// whose imports throw, until V8 tiers it up: it reads zeroes as the TLB of
+// the guest, so it leaves at its first memory access, as if the page of the
+// access were not mapped (headless Chromium, 2026-11-14: 1000 calls tiered
+// 47 of 50 modules up, 2000 all of them; 50 x 3000 calls take ~40 ms). The
+// optimised code stays with the Module, which the tab posts to the workers
+// of its pods. The scratch memory must hold the statics of v86.wasm (~17
+// MiB): an access beyond it would end the calls of the module with a trap.
+const SCRATCH_PAGES = 512; // 32 MiB
+const CALLS = 3000;
+async function warm(modules) {
+  const memory = new WebAssembly.Memory({ initial: SCRATCH_PAGES });
   const stop = () => { throw new Error("stop"); };
   const e = new Proxy({}, { get: (_, k) => (k === "m" ? memory : stop) });
   for (const { module } of modules) {
     try {
-      new WebAssembly.Instance(module, { e }).exports.f(0);
+      const f = new WebAssembly.Instance(module, { e }).exports.f;
+      for (let i = 0; i < CALLS; i++) f(0);
     } catch {
-      // the expected end
+      // an import or a trap: thrown calls do not count for the tier-up
     }
+    // the tab stays responsive
+    await new Promise((r) => setTimeout(r, 0));
   }
 }
 

@@ -23,9 +23,10 @@ const IP = "10.0.0.2", GATEWAY = "10.0.0.1";
 // v86 compiles a page after this many instructions in the interpreter (750k
 // by default). 5k, 20k and 100k made the same pod starts within the noise.
 const THRESHOLD = 20_000;
-// The most entered modules only. V8 optimises the hot ones in the first pod
-// of a tab (TurboFan, ~1.5 us per byte, on other threads); that costs the
-// first pod, the later pods gain. Measured 2026-11-14 with nginx in Node.js
+// The most entered modules only. V8 optimises them with TurboFan (~1.5 us
+// per byte, on other threads) once per tab; the tab does that at the prompt
+// (warm in src/jit.js), else it cost the first pod. Without the warm-up,
+// measured 2026-11-14 with nginx in Node.js
 // on a busy 4-core machine, 4 alternating runs of a fresh process: the first
 // pod / a later pod, wall time against no modules: 25 modules +5 % / -4 %,
 // 50 +19 % / -18 %, 100 +47 % / -19 %, all (~200) +40 % / -30 %. Process

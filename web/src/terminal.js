@@ -96,6 +96,10 @@ export async function startTerminal(el, opts) {
   }
   const { session } = joined;
   globalThis.tabernetesNode = joined.name;
+  // The JIT modules of the kernel of the pods (jit.js) load, compile and get
+  // optimised now, not in the first pod. Not earlier: while the control
+  // plane boots, the work made the prompt of a reload ~0.35 s later.
+  if (opts.pods?.vm?.jitURL) prefetchJIT(opts.pods.vm.jitURL);
   keepStorage();
   // tabernetes.shell for tests and the DevTools console, as before.
   globalThis.tabernetes ??= {};
@@ -553,8 +557,6 @@ async function joinCluster(term, cluster, opts, crash) {
   }
   // proxy.js and vnc.js reach localhost of the Go through the session.
   globalThis.tabernetes = { proxy: joined.session.proxy, dial: joined.session.dial };
-  // the pods of this tab run in workers of this tab (bridge.js)
-  if (opts.pods?.vm?.jitURL) prefetchJIT(opts.pods.vm.jitURL);
   if (joined.forwards?.length) globalThis.tabernetesForwards?.(joined.forwards);
   return joined;
 }

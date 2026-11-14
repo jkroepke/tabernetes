@@ -168,9 +168,9 @@ that name.
   Node.js (Alpine linux/386 from docker, `JIT_ROOT_IMAGE`) and writes the
   50 most entered kernel modules to `dist/jit.bin` (1.2 MB, 0.18 MB
   gzip). The page passes it as `data-vm-jit` (the shortcode of the blog
-  needs it); the tab compiles it once (`prefetchJIT`, also calls every
-  function once, since V8 compiles at the first call), posts it with the
-  start message, and the worker installs it after the restore
+  needs it); the tab compiles and warms it once at the prompt
+  (`prefetchJIT`, `warm` in `jit.js`, see the next point), posts it with
+  the start message, and the worker installs it after the restore
   (`jit_import` of the fork, 2-5 ms). The file names its build (the ID of
   the saved states: v86 version, kernel, init); v86 also checks its layout
   and the bytes of every page, so a mismatch installs nothing. Measured
@@ -182,6 +182,37 @@ that name.
   755 ms. The Go binary to its first answer: 505 -> 535 ms first, 501 ->
   448 ms later. More modules make the first pod slower and the later ones
   faster (`web/jit.mjs`); headless Chromium showed the same.
+- **Warm the kernel JIT modules at the prompt** (`warm` in
+  `web/src/jit.js`, 2026-11-14): without it, V8 optimised the 50 modules
+  with TurboFan during the first pod of a tab (~0.8 s of CPU on other
+  threads). V8 tiers a wasm function up when its budget is used up, and
+  only normal returns and loop back edges count (a call that throws does
+  not). With a scratch memory that holds the statics of v86.wasm, a module
+  reads zeroes as the TLB, bails at its first memory access and returns:
+  50 x 3000 calls (~40 ms) tier all 50 up (1000 calls: 47). The optimised
+  code stays with the Module that the tab posts to its pods
+  (`--trace-wasm-compilation-times`: 50 TurboFan compiles before the first
+  pod, none in the pods). The scratch memory had 64 pages before: the
+  modules read statics up to ~17 MiB, and in the headless Chromium of the
+  sandbox any wasm out-of-bounds trap crashed the renderer, the real page
+  too. When: at the prompt. Started at page load (with the control plane
+  boot), it made the prompt of a reload later (10 rounds: 6188 -> 6538
+  ms); at the prompt it did not (6305 ms, noise). Measured in headless
+  Chromium with the real page (8 alternating rounds, nginx, `kubectl run`
+  -> HTTP; cold: new profile, image pulled from a local stand-in;
+  return: same profile, new browser), none / modules without warm-up /
+  with warm-up: run 3 s after the prompt (a person types): first pod cold
+  2344 / 2326 / 2253 ms, return 1155 / 1214 / 1033 ms; later pods 724-765 /
+  640-647 / 624-650 ms. `kubectl run` at the very prompt (22-27 runs
+  pooled): first pod cold 5092 / 4913 / 5076 ms, return 2921 / 2873 /
+  3002 ms, within the noise; the control plane is busy then (run -> start
+  of the VM ~1.8 s), and the warm-up shares the CPU with it.
+- Parked (2026-11-14): booting the VM of the first pod ahead in the tab
+  (like the spare worker of `vm.js`). At page load it made the prompt of
+  a reload later (6188 -> 6541 ms). At the prompt the VM part of the first
+  pod got faster (start -> HTTP 1132 -> 964 ms), but with `kubectl run` at
+  the very prompt the whole first pod not (2978 -> 3139 ms, 6 rounds), it
+  competes with the control plane.
 - **Direct kernel boot, no SeaBIOS** (`web/src/kernelboot.js`, since
   2026-11-12): the worker loads the segments of `vmlinux` (ELF, stripped),
   the initramfs and the zero page (E820, cmdline, initrd) into the VM and

@@ -49,7 +49,7 @@ function jitModules(url) {
   return jits.get(url);
 }
 
-// prefetchJIT loads and compiles jit.bin in this tab ahead of time.
+// prefetchJIT loads, compiles and warms jit.bin in this tab ahead of time.
 export function prefetchJIT(url) {
   setTimeout(() => jitModules(url), 0);
 }
@@ -72,8 +72,6 @@ export async function postStart(worker, m, transfer = []) {
 // (bridge.js), since a shared worker cannot start workers.
 export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL, registry, spawn }) {
   const abs = (u) => new URL(u, location.href).href;
-  // in a tab, the JIT modules load and compile before the first pod needs them
-  if (jitURL && !spawn) prefetchJIT(abs(jitURL));
   // The ID of the saved VM states (vmstate.js) of this kernel and init, as
   // the worker of a pod computed it. Later pods look for a state with it
   // first and need not fetch and hash the kernel.
