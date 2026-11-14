@@ -7,7 +7,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { installFS } from "./fs.js";
 import { clusterState, loadHome, saveHome, forget, sweepLayers, keepStorage } from "./state.js";
 import { zstdFrames, instantiate, runGo } from "./wasm.js";
-import { vmAPI, prefetchJIT } from "./vm.js";
+import { vmAPI, prefetchJIT, prepareWorker } from "./vm.js";
 import { gpuAPI } from "./gpu.js";
 
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
@@ -100,6 +100,8 @@ export async function startTerminal(el, opts) {
   // optimised now, not in the first pod. Not earlier: while the control
   // plane boots, the work made the prompt of a reload ~0.35 s later.
   if (opts.pods?.vm?.jitURL) prefetchJIT(opts.pods.vm.jitURL);
+  // The worker of the first pod, with its VM and warm code of the emulator.
+  if (opts.pods?.vm) setTimeout(() => prepareWorker(opts.pods.vm), 0);
   keepStorage();
   // tabernetes.shell for tests and the DevTools console, as before.
   globalThis.tabernetes ??= {};

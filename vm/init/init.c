@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/signalfd.h>
@@ -1173,6 +1174,115 @@ static void loop(int *reported) {
   }
 }
 
+// ---- warm ----
+
+// The page sends "warm" instead of "go" to a VM that it throws away
+// afterwards (web/src/vmworker.js). A restored VM has run nothing when its
+// pod starts, and the browser optimises the code of the emulator only after
+// it ran for a while. That code is shared by all pods of a tab: the first
+// pod of a tab ran on slow code. The work here is what the start of a
+// program does: fork, exec, page faults, files, pipes, TCP over loopback
+// and a loop that the JIT of the emulator compiles.
+
+#ifndef WARM_CHILDREN
+#define WARM_CHILDREN 2
+#endif
+
+static void warm_io(int in, int out, char *buf, size_t n, int rounds) {
+  for (int i = 0; i < rounds; i++) {
+    size_t done = 0;
+    while (done < n) {
+      ssize_t w = write(out, buf + done, n - done < 4096 ? n - done : 4096);
+      if (w <= 0) return;
+      ssize_t r = read(in, buf, w);
+      if (r <= 0) return;
+      done += w;
+    }
+  }
+}
+
+static int cmp_u32(const void *a, const void *b) {
+  uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+  return x < y ? -1 : x > y;
+}
+
+// warm_child is the program that warm starts, as /init with the name "warm".
+static int warm_child(void) {
+  // memory: page faults, then loops over it
+  size_t n = 256 << 10;
+  uint32_t *m = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) return 1;
+  uint32_t x = 2463534242u, sum = 0;
+  for (size_t i = 0; i < n / 4; i++) {
+    x ^= x << 13, x ^= x >> 17, x ^= x << 5;
+    m[i] = x;
+  }
+  for (int k = 0; k < 4; k++)
+    for (size_t i = 0; i < n / 4; i++) sum = sum * 31 + (m[i] >> (k & 7));
+  qsort(m, 2048, sizeof(*m), cmp_u32);
+  char *buf = (char *)m;
+  // text: what the C library does with strings
+  char line[256];
+  for (int i = 0; i < 300; i++) {
+    int l = snprintf(line, sizeof(line), "%d %s %08x %lld\n", i, "warm", sum + i, (long long)i * 1000003);
+    sum += strlen(line) + (memchr(line, '\n', l) != NULL) + strtol(line, NULL, 10);
+  }
+  // files of the kernel and of the initramfs
+  static const char *const files[] = {"/proc/self/status", "/proc/self/maps", "/proc/meminfo", "/proc/stat", "/proc/mounts", "/init"};
+  for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+    size_t len;
+    char *b = read_file(files[i], &len);
+    struct stat st;
+    stat(files[i], &st);
+    free(b);
+  }
+  int fd = open("/warm.tmp", O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd >= 0) {
+    for (int i = 0; i < 16; i++) (void)!write(fd, buf + i * 4096, 4096);
+    lseek(fd, 0, SEEK_SET);
+    while (read(fd, buf, 16384) > 0) {}
+    close(fd);
+    unlink("/warm.tmp");
+  }
+  // a pipe and a TCP connection over loopback
+  int p[2];
+  if (pipe(p) == 0) {
+    warm_io(p[0], p[1], buf, 32768, 1);
+    close(p[0]);
+    close(p[1]);
+  }
+  int l = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  socklen_t alen = sizeof(a);
+  if (l >= 0 && bind(l, (struct sockaddr *)&a, sizeof(a)) == 0 && listen(l, 1) == 0 && getsockname(l, (struct sockaddr *)&a, &alen) == 0) {
+    int c = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (c >= 0 && connect(c, (struct sockaddr *)&a, sizeof(a)) == 0) {
+      int s = accept(l, NULL, NULL);
+      if (s >= 0) {
+        warm_io(s, c, buf, 32768, 1);
+        close(s);
+      }
+    }
+    if (c >= 0) close(c);
+  }
+  if (l >= 0) close(l);
+  munmap(m, n);
+  return sum == 0;
+}
+
+static void warm(void) {
+  for (int i = 0; i < WARM_CHILDREN; i++) {
+    pid_t pid = fork();
+    if (pid == 0) {
+      char *argv[] = {"warm", NULL}, *envp[] = {NULL};
+      execve("/init", argv, envp);
+      _exit(127);
+    }
+    if (pid > 0) waitpid(pid, NULL, 0);
+  }
+  report("warmed");
+}
+
 // ---- stage 0 ----
 
 // What a container gets in /dev, /proc and /sys. Stage 0 mounts them before
@@ -1333,6 +1443,12 @@ static int stage0(void) {
     if (r < 0 && errno == EINTR) continue;
     if (r <= 0) return fail("read ttyS1: %s", r < 0 ? errtext(errno) : "EOF");
     n += r;
+    if (n >= 5 && !memcmp(line, "warm\n", 5)) {
+      // a VM that the page throws away: see warm
+      warm();
+      n = 0;
+      continue;
+    }
     if (memchr(line, '\n', n) || n == sizeof(line) - 1) break;
   }
   line[n] = 0;
@@ -1457,7 +1573,8 @@ int main(int argc, char **argv) {
     if (port) exec_port = atoi(port);
     control = dup(1);
     ok = 1;
-  } else if (getpid() == 1 && !strcmp(argv[0], "/init")) ok = stage0() == 0;
+  } else if (argv[0] && !strcmp(argv[0], "warm")) return warm_child();
+  else if (getpid() == 1 && !strcmp(argv[0], "/init")) ok = stage0() == 0;
   else {
     control = open("/dev/ttyS1", O_WRONLY | O_CLOEXEC);
     ok = 1;

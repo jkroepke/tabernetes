@@ -196,6 +196,28 @@ test("the kernel boots, init starts a pod, the saved VM restores", { skip, timeo
     }
   });
 
+  // "warm" (vmworker.js sends it to a VM that it throws away): init runs
+  // its warm-up and waits for the pod again
+  await t.test("init warms up on the restored VM, then starts a pod", async (t) => {
+    const r = new V86(options({}));
+    await new Promise((res) => r.add_listener("emulator-loaded", res));
+    await r.restore_state(state);
+    const control = lines(r, 1);
+    try {
+      const i0 = r.v86.cpu.instruction_counter[0];
+      const t0 = Date.now();
+      r.run();
+      r.serial_send_bytes(1, new TextEncoder().encode("warm\n"));
+      await until("warmed", () => control.includes("warmed") || control.some((l) => l.startsWith("exit ")));
+      t.diagnostic(`warmed after ${Date.now() - t0} ms, ${(((r.v86.cpu.instruction_counter[0] - i0) >>> 0) / 1e6).toFixed(1)} million instructions`);
+      assert.deepEqual(control, ["warmed"], `init: ${control.join(" | ")}`);
+      control.length = 0;
+      await startPod(r, control, t);
+    } finally {
+      await r.destroy();
+    }
+  });
+
   // like vmworker.js: the JIT modules of the kernel after the restore
   const jitSkip = !fs.existsSync(jitFile) && !process.env.CI ? `no ${jitFile} (mise run web)` : false;
   await t.test("a pod starts on the restored VM with the JIT modules of the kernel", { skip: jitSkip }, async (t) => {
