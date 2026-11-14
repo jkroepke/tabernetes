@@ -126,6 +126,10 @@ func newTabNode(ctx context.Context, name, ip string, host js.Value) (*tabNode, 
 		return nil, err
 	}
 	cfg.UserAgent = "kubelet/" + version.Get().GitVersion + " (tab)"
+	// The defaults of the kubelet (kubeAPIQPS, kubeAPIBurst). Those of
+	// client-go (5 and 10) ran out during the registration, which polls for
+	// the pod CIDR: the first status update of a pod then waited ~0.5 s.
+	cfg.QPS, cfg.Burst = 50, 100
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, err

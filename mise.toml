@@ -135,9 +135,10 @@ npx esbuild src/vmworker.js --bundle --minify --format=iife --target=es2022 \
   --external:crypto --external:node:crypto --external:fs --external:node:fs/promises --external:perf_hooks \
   --outfile="$out/vmworker.js"
 cp node_modules/v86/build/v86.wasm "$out/v86.wasm"
-# The JIT modules of the kernel of the pods (web/jit.mjs, vm.js), for this v86
-# and this kernel. The page passes the URL as data-vm-jit; without it the pods
-# start without them. The start that it records runs a busybox shell of
+# The JIT modules of the kernel of the pods (web/jit.mjs, vm.js) and the state
+# of their booted VM (vmstate.js), for this v86 and this kernel. The page
+# passes the URLs as data-vm-jit and data-vm-state; without them the pods
+# start without the modules, and the first pod boots the kernel. The start that it records runs a busybox shell of
 # Alpine (linux/386; docker only exports the files, so no emulation).
 root="../.build/jitroot-$(echo "$JIT_ROOT_IMAGE" | tr ":/" "__").tar"
 if [ ! -f "$root" ] && command -v docker > /dev/null; then
@@ -147,10 +148,10 @@ if [ ! -f "$root" ] && command -v docker > /dev/null; then
   docker rm "$c" > /dev/null
 fi
 if [ -f "$root" ]; then
-  node jit.mjs ../dist/vm "$root" "$out/jit.bin"
+  node jit.mjs ../dist/vm "$root" "$out/jit.bin" "$out/vmstate.bin"
 else
-  echo "no docker: dist/jit.bin is missing, pods start without the JIT modules of the kernel" >&2
-  rm -f "$out/jit.bin"
+  echo "no docker: dist/jit.bin and dist/vmstate.bin are missing, pods start without the JIT modules and the state of the kernel" >&2
+  rm -f "$out/jit.bin" "$out/vmstate.bin"
 fi
 cp node_modules/@xterm/xterm/css/xterm.css "$out/xterm.css"
 # The service worker of "proxy <port>". The page serves it as

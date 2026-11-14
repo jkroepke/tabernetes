@@ -242,6 +242,14 @@ func startControllers(after time.Duration) {
 }
 
 func runControllers() {
+	// The scheduler first: it is ready ~0.3 s after its start when it has the
+	// thread to itself, but took ~2.5 s while the controller-manager started
+	// beside it, and a pod created at the prompt waited for it. The
+	// controller-manager waits for it, at most 5 s.
+	scheduler := runScheduler()
+	if err := waitServing("https://127.0.0.1:10259/readyz", scheduler); err != nil {
+		fmt.Fprintln(os.Stderr, "tabernetes: kube-scheduler is not ready:", err)
+	}
 	run("kube-controller-manager", cmapp.NewControllerManagerCommand(), []string{
 		"--kubeconfig=" + p("controller-manager.kubeconfig"),
 		"--authentication-kubeconfig=" + p("controller-manager.kubeconfig"),
@@ -271,8 +279,10 @@ func runControllers() {
 		"--profiling=false",
 		"--v=1",
 	})
+}
 
-	run("kube-scheduler", schedapp.NewSchedulerCommand(), []string{
+func runScheduler() <-chan error {
+	return run("kube-scheduler", schedapp.NewSchedulerCommand(), []string{
 		"--kubeconfig=" + p("scheduler.kubeconfig"),
 		"--authentication-kubeconfig=" + p("scheduler.kubeconfig"),
 		"--authorization-kubeconfig=" + p("scheduler.kubeconfig"),
@@ -289,14 +299,30 @@ func runControllers() {
 func waitReady(c *cluster, url string, exited <-chan error) error {
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(c.ca.caPEM)
+	return poll(url, &tls.Config{RootCAs: pool}, c.adminToken, bootTimeout, exited)
+}
+
+// waitServing waits for /readyz of a component that serves with a
+// self-signed certificate (kube-scheduler). The connection never leaves the
+// process, and /readyz needs no login.
+func waitServing(url string, exited <-chan error) error {
+	return poll(url, &tls.Config{InsecureSkipVerify: true}, "", 5*time.Second, exited)
+}
+
+// poll asks url every 100 ms until it answers 200, the component exits or
+// timeout passes.
+func poll(url string, tlsConfig *tls.Config, token string, timeout time.Duration, exited <-chan error) error {
 	hc := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{RootCAs: pool},
+		TLSClientConfig: tlsConfig,
 		DialContext:     (&net.Dialer{}).DialContext, // force Go networking instead of fetch()
 	}}
-	deadline := time.After(bootTimeout)
+	defer hc.CloseIdleConnections()
+	deadline := time.After(timeout)
 	for {
 		req, _ := http.NewRequest(http.MethodGet, url+"?verbose", nil)
-		req.Header.Set("Authorization", "Bearer "+c.adminToken)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
 		resp, err := hc.Do(req)
 		if err == nil {
 			body, _ := io.ReadAll(resp.Body)
@@ -316,7 +342,7 @@ func waitReady(c *cluster, url string, exited <-chan error) error {
 		case exitErr := <-exited:
 			return exitErr
 		case <-deadline:
-			return fmt.Errorf("no answer after %v: %w", bootTimeout, err)
+			return fmt.Errorf("no answer after %v: %w", timeout, err)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}

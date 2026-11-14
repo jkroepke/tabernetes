@@ -160,6 +160,20 @@ that name.
   options that cost boot time: legacy PTYs (310 ms), gzip (LZ4 unpacks in
   a third of the time, in-guest zstd is 200 ms slower than LZ4); now the
   kernel ships unpacked (next point).
+- **The build ships the state** (`vmstate.bin`, `web/jit.mjs`, since
+  2026-11-14): the boot of `jit.mjs` saves the 256 MiB VM where init waits
+  for the pod (zstd 10.2 -> 2.4 MB; v86 unpacks zstd itself, ~30 ms more
+  per restore). The page passes it as `data-vm-state` (the shortcode of the
+  blog needs it). A pod without a local state restores it, and the build ID
+  comes from `jit.bin` or this file, so no pod fetches `vmlinux` and `init`
+  (4.7 MB) to hash them anymore. It is the kernel only, the same state that
+  every pod saved and restored before, not a state of an app. Measured in
+  headless Chromium (nginx, `kubectl run` 3 s after the prompt, medians):
+  first pod after a release (layers in OPFS, no state) 1369 -> 1117 ms,
+  start -> `started` 611 -> 262 ms; first pod of a fresh visitor 2259 ->
+  2221 ms (start -> `started` -113 ms; the pull hides the rest); a return
+  visit and later pods unchanged. A spare worker that saved the shipped
+  state unpacked to OPFS made the next pod 50-70 ms slower: not done.
 - **JIT modules of the kernel** (`web/src/jit.js`, `web/jit.mjs`, since
   2026-11-14): every pod restores the same state, so the kernel has the same
   code at the same physical pages in every pod, but each pod starts with an
@@ -368,9 +382,63 @@ that name.
   the workers of their pods and close their WebRTC connections, so Docker
   nodes end too. Without a SharedWorker, poweroff and reboot reload the page.
 - **Image pulls** download and unpack up to 3 layers at once, like
-  containerd's `max_concurrent_downloads`. On a fast link the browser is
-  CPU bound (gunzip, SHA-256, OPFS) and gains little; it saves round trips
-  through the mirror.
+  containerd's `max_concurrent_downloads`, each in a layer worker: a worker
+  of the worker of the pod (`layerWorker` in `vmworker.js`, the same
+  script). `DecompressionStream`, `crypto.subtle.digest` (it blocks the
+  calling thread in Chromium, ~55 ms for 32 MB) and the OPFS writes all run
+  on the thread that reads the stream, so the two large layers of nginx
+  shared one thread before (~1.2 s for 64 MB: gunzip ~550 ms, writes
+  ~120 ms, two fsyncs ~170 ms, hashing ~110 ms). The workers start once a layer is
+  missing, while the config comes (not for a complete image: `kubectl run`
+  of a `:latest` image asks the registry on every start); a manifest that an index chose for linux/386 downloads
+  its layers while the config comes; the VM restores (~60-80 ms of the
+  thread) only once the layers download, else the manifest replies waited
+  for it. The layers are not flushed (`flush()` is an fsync, ~80 ms per
+  83 MB); `index()` checks the size of the tar instead. Without nested
+  workers or without OPFS the layers unpack in the worker of the pod as
+  before. Measured 2026-11-14 in headless Chromium (nginx, fresh profile,
+  `kubectl run` 3 s after the prompt, 8 alternating rounds, medians), start
+  -> `started` of the first pod, layers from local disk (CPU bound):
+  workers 1335 -> 1054 ms, no flush -> 921 ms (first pod 2051 -> 1896 ->
+  1698 ms); early workers, layers before the config and the later restore
+  895 -> 861 ms (noise level). With 40 ms per request and a shared 50 MB/s
+  link: 2001 -> 1835 (workers, no flush) -> 1781 ms (all), first pod
+  2770 -> 2466 ms. Later pods unchanged. Per large layer a worker is still ~550 ms busy: gunzip
+  ~310 ms, OPFS writes ~85 ms, reads and copies ~65 ms; the tar index is
+  ~5 ms. Tried without gain: reading the blob as fast as it comes and
+  hashing it in the worker of the pod while the layer worker unpacks (start
+  -> `started` +40-80 ms, more threads at once on 4 cores); a faster tar
+  parser (not needed). A separate writer thread per layer could save
+  ~150 ms more, but only on links over ~900 Mbit/s.
+- **From `kubectl run` to the start message** (2026-11-14): measured with
+  marks in the Go code (apiserver requests, scheduler, etcd writes, tab
+  node), read from the shared worker over CDP. 3 s after the prompt it was
+  ~120 ms: kubectl ~55 ms (the first run of a tab ~30 ms more: first use of
+  the code), scheduling and binding ~20 ms, then the tab node wrote the pod
+  status (GET + PUT, ~25 ms) before it started the VM. At the very prompt
+  it was ~3 s: the scheduler was ready only ~2.6 s after its start and the
+  node got its pod CIDR from the IPAM controller after ~2.4 s, because the
+  controller-manager starts ~40 controllers at once beside them; then the
+  status update waited ~0.5 s more for the client rate limit of the tab
+  node (client-go 5/s, burst 10, used up by the poll for the pod CIDR).
+  Now the tab node has the limits of the kubelet (50/s, burst 100), writes
+  the first status while the VM starts (like the status manager of the
+  kubelet), the scheduler starts first and the controller-manager waits
+  for its `/readyz` (~0.3 s), and the controller-manager builds and runs
+  the node IPAM controller before the others (patch.go): the pod CIDR comes
+  ~0.1 s after its start. Headless Chromium, nginx, fresh profile, 16
+  alternating rounds (8 for 1.5 s), medians, before -> after: run -> start
+  message at the prompt 2.8-3.2 s -> 0.83-0.88 s, 1.5 s after it 1.64 ->
+  1.25 s, 3 s after it 121-140 -> 90 ms, later pods 66-77 -> 50 ms; run ->
+  HTTP of the first pod at the prompt 4.36-4.84 -> 3.21-3.31 s, 3 s after
+  it 1.65 s (unchanged within the noise); prompt and later pods unchanged.
+  What is left: Go in Wasm returns to the JavaScript event loop only when
+  no goroutine can run, so while the controller-manager starts (~2.2 s of
+  CPU, ~0.3-2.4 s after the prompt) no message of a tab reaches the worker,
+  and a command typed then waits. `--controller-start-interval=1s` (each
+  controller starts 1-2 s after the informers) only moved that window:
+  1.5 s after the prompt 1.25 -> 0.28 s, but 3 s after it 0.09 -> 0.80 s.
+  Not kept.
 - **kubectl translations are off** (patch.go): loading them zipped and parsed
   the `.po` files during init (~0.1 s), and the terminal sets no `LANG`.
 - **Persistence rules**: the etcd snapshot is saved only after boot, and a

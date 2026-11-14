@@ -99,6 +99,37 @@ func main() {
 		"\t\treturn nil\n",
 	)
 
+	// kube-controller-manager builds all its ~40 controllers, then starts the
+	// informers and all controllers at once. In Wasm they share one thread
+	// without preemption: the node IPAM controller gave the tab node its pod
+	// CIDR only ~2.3 s after the start, and the tab node runs no pod before
+	// it has one. Build and run that controller first, the others follow as
+	// before.
+	edit("cmd/kube-controller-manager/app/controllermanager.go",
+		"\t\t// Prepare all controllers in advance.\n",
+		`		// tabernetes: the node IPAM controller first (k8s/patch.go).
+		if d := controllerDescriptors[names.NodeIpamController]; d != nil {
+			first, err := BuildControllers(ctx, controllerContext, map[string]*ControllerDescriptor{d.Name(): d}, unsecuredMux, healthzHandler)
+			if err != nil {
+				return err
+			}
+			controllerContext.InformerFactory.Start(ctx.Done())
+			for _, c := range first {
+				go c.Run(ctx)
+			}
+			rest := make(map[string]*ControllerDescriptor, len(controllerDescriptors))
+			for name, desc := range controllerDescriptors {
+				if desc != d {
+					rest[name] = desc
+				}
+			}
+			controllerDescriptors = rest
+		}
+
+		// Prepare all controllers in advance.
+`,
+	)
+
 	// RSA key generation is painfully slow in single-threaded wasm: use ECDSA
 	// for self-signed certificates.
 	edit("staging/src/k8s.io/client-go/util/cert/cert.go",
