@@ -54,7 +54,7 @@ export async function parseJIT(buf) {
 // access were not mapped (headless Chromium, 2026-11-14: 1000 calls tiered
 // 47 of 50 modules up, 2000 all of them; 50 x 3000 calls take ~40 ms). The
 // optimised code stays with the Module, which the tab posts to the workers
-// of its pods. The scratch memory must hold the statics of v86.wasm (~17
+// of its pods. The scratch memory must hold the static data of v86.wasm (~17
 // MiB): an access beyond it would end the calls of the module with a trap.
 const SCRATCH_PAGES = 512; // 32 MiB
 const CALLS = 3000;

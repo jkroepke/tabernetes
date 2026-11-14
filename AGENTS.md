@@ -165,13 +165,13 @@ that name.
   code at the same physical pages in every pod, but each pod starts with an
   empty JIT, and the kernel (55 % of the instructions of an nginx start)
   ran in the interpreter. The web task records a generic busybox start in
-  Node.js (Alpine linux/386 from docker, `JIT_ROOT_IMAGE`) and writes the
+  Node.js (Alpine linux/386 from Docker, `JIT_ROOT_IMAGE`) and writes the
   50 most entered kernel modules to `dist/jit.bin` (1.2 MB, 0.18 MB
   gzip). The page passes it as `data-vm-jit` (the shortcode of the blog
   needs it); the tab compiles and warms it once at the prompt
   (`prefetchJIT`, `warm` in `jit.js`, see the next point), posts it with
   the start message, and the worker installs it after the restore
-  (`jit_import` of the fork, 2-5 ms). The file names its build (the ID of
+  (`jit_import` of the fork, 2-5 ms). The file states its build (the ID of
   the saved states: v86 version, kernel, init); v86 also checks its layout
   and the bytes of every page, so a mismatch installs nothing. Measured
   2026-11-14 in Node.js (v86 0.5.90-fork, nginx and the Go binary of
@@ -185,16 +185,16 @@ that name.
 - **Warm the kernel JIT modules at the prompt** (`warm` in
   `web/src/jit.js`, 2026-11-14): without it, V8 optimised the 50 modules
   with TurboFan during the first pod of a tab (~0.8 s of CPU on other
-  threads). V8 tiers a wasm function up when its budget is used up, and
+  threads). V8 tiers a Wasm function up when its budget is used up, and
   only normal returns and loop back edges count (a call that throws does
-  not). With a scratch memory that holds the statics of v86.wasm, a module
+  not). With a scratch memory that holds the static data of v86.wasm, a module
   reads zeroes as the TLB, bails at its first memory access and returns:
   50 x 3000 calls (~40 ms) tier all 50 up (1000 calls: 47). The optimised
   code stays with the Module that the tab posts to its pods
   (`--trace-wasm-compilation-times`: 50 TurboFan compiles before the first
   pod, none in the pods). The scratch memory had 64 pages before: the
-  modules read statics up to ~17 MiB, and in the headless Chromium of the
-  sandbox any wasm out-of-bounds trap crashed the renderer, the real page
+  modules read static data up to ~17 MiB, and in the headless Chromium of the
+  sandbox any Wasm out-of-bounds trap crashed the renderer, the real page
   too. When: at the prompt. Started at page load (with the control plane
   boot), it made the prompt of a reload later (10 rounds: 6188 -> 6538
   ms); at the prompt it did not (6305 ms, noise). Measured in headless
