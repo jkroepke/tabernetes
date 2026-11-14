@@ -7,7 +7,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { installFS } from "./fs.js";
 import { clusterState, loadHome, saveHome, forget, sweepLayers, keepStorage } from "./state.js";
 import { zstdFrames, instantiate, runGo } from "./wasm.js";
-import { vmAPI } from "./vm.js";
+import { vmAPI, prefetchJIT } from "./vm.js";
 import { gpuAPI } from "./gpu.js";
 
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
@@ -553,6 +553,8 @@ async function joinCluster(term, cluster, opts, crash) {
   }
   // proxy.js and vnc.js reach localhost of the Go through the session.
   globalThis.tabernetes = { proxy: joined.session.proxy, dial: joined.session.dial };
+  // the pods of this tab run in workers of this tab (bridge.js)
+  if (opts.pods?.vm?.jitURL) prefetchJIT(opts.pods.vm.jitURL);
   if (joined.forwards?.length) globalThis.tabernetesForwards?.(joined.forwards);
   return joined;
 }

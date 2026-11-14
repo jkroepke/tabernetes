@@ -7,7 +7,8 @@
 //
 //   node --test vm/test
 //
-// TABERNETES_VM sets another directory with vmlinux and init.
+// TABERNETES_VM sets another directory with vmlinux and init, TABERNETES_JIT
+// another jit.bin (web/jit.mjs; default dist/jit.bin).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -16,6 +17,8 @@ import { V86 } from "../../web/node_modules/v86/build/libv86.mjs";
 import { initramfs } from "../../web/src/initramfs.js";
 import { bootKernel } from "../../web/src/kernelboot.js";
 import { Tree, LayerStorage, modes } from "../../web/src/rootfs.js";
+import { buildID } from "../../web/src/vmstate.js";
+import { parseJIT, importJIT } from "../../web/src/jit.js";
 
 const root = new URL("../..", import.meta.url).pathname;
 const dir = process.env.TABERNETES_VM || path.join(root, "dist/vm");
@@ -24,6 +27,7 @@ const missing = files.filter((f) => !fs.existsSync(path.join(dir, f)));
 // CI builds the VM before the tests: there a missing file is an error.
 const skip = missing.length && !process.env.CI ? `no ${missing.join(", ")} in ${dir} (mise run vm)` : false;
 const read = (f) => new Uint8Array(fs.readFileSync(path.join(dir, f)));
+const jitFile = process.env.TABERNETES_JIT || path.join(root, "dist/jit.bin");
 
 // The VM of a pod with the size that most pods get.
 const MEMORY = 256 << 20;
@@ -182,6 +186,30 @@ test("the kernel boots, init starts a pod, the saved VM restores", { skip, timeo
     const r = new V86(options({}));
     await new Promise((res) => r.add_listener("emulator-loaded", res));
     await r.restore_state(state);
+    const control = lines(r, 1);
+    try {
+      await startPod(r, control, t);
+    } finally {
+      await r.destroy();
+    }
+  });
+
+  // like vmworker.js: the JIT modules of the kernel after the restore
+  const jitSkip = !fs.existsSync(jitFile) && !process.env.CI ? `no ${jitFile} (mise run web)` : false;
+  await t.test("a pod starts on the restored VM with the JIT modules of the kernel", { skip: jitSkip }, async (t) => {
+    const buf = fs.readFileSync(jitFile);
+    const jit = await parseJIT(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+    assert.ok(jit, "jit.bin does not parse");
+    const { version } = JSON.parse(fs.readFileSync(path.join(root, "web/node_modules/v86/package.json"), "utf8"));
+    const build = await buildID(version, kernel, init);
+    const r = new V86(options({}));
+    await new Promise((res) => r.add_listener("emulator-loaded", res));
+    await r.restore_state(state);
+    // another build gets nothing
+    assert.equal(importJIT(r, jit, "0000000000000000"), 0);
+    const n = importJIT(r, jit, build);
+    t.diagnostic(`installed ${n} of ${jit.modules.length} modules`);
+    assert.ok(n > jit.modules.length / 2, `installed ${n} of ${jit.modules.length} modules (build ${jit.build}, this one ${build})`);
     const control = lines(r, 1);
     try {
       await startPod(r, control, t);

@@ -160,6 +160,28 @@ that name.
   options that cost boot time: legacy PTYs (310 ms), gzip (LZ4 unpacks in
   a third of the time, in-guest zstd is 200 ms slower than LZ4); now the
   kernel ships unpacked (next point).
+- **JIT modules of the kernel** (`web/src/jit.js`, `web/jit.mjs`, since
+  2026-11-14): every pod restores the same state, so the kernel has the same
+  code at the same physical pages in every pod, but each pod starts with an
+  empty JIT, and the kernel (55 % of the instructions of an nginx start)
+  ran in the interpreter. The web task records a generic busybox start in
+  Node.js (Alpine linux/386 from docker, `JIT_ROOT_IMAGE`) and writes the
+  50 most entered kernel modules to `dist/jit.bin` (1.2 MB, 0.18 MB
+  gzip). The page passes it as `data-vm-jit` (the shortcode of the blog
+  needs it); the tab compiles it once (`prefetchJIT`, also calls every
+  function once, since V8 compiles at the first call), posts it with the
+  start message, and the worker installs it after the restore
+  (`jit_import` of the fork, 2-5 ms). The file names its build (the ID of
+  the saved states: v86 version, kernel, init); v86 also checks its layout
+  and the bytes of every page, so a mismatch installs nothing. Measured
+  2026-11-14 in Node.js (v86 0.5.90-fork, nginx and the Go binary of
+  pod-bench, 4 alternating runs of 3 pods per process): nginx, the first
+  pod of a process: wall 626 -> 657 ms, main thread 601 -> 512 ms, process
+  CPU 1.27 -> 1.71 s (V8 optimises the modules then, once per tab); every
+  later pod: wall 566 -> 465 ms, main thread 556 -> 444 ms, process 805 ->
+  755 ms. The Go binary to its first answer: 505 -> 535 ms first, 501 ->
+  448 ms later. More modules make the first pod slower and the later ones
+  faster (`web/jit.mjs`); headless Chromium showed the same.
 - **Direct kernel boot, no SeaBIOS** (`web/src/kernelboot.js`, since
   2026-11-12): the worker loads the segments of `vmlinux` (ELF, stripped),
   the initramfs and the zero page (E820, cmdline, initrd) into the VM and
