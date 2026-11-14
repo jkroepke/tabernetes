@@ -14,13 +14,16 @@ ARG KERNEL_IMAGE=mirror.gcr.io/library/ubuntu:26.04
 FROM --platform=$BUILDPLATFORM ${KERNEL_IMAGE} AS kernel
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bc bison clang flex libelf-dev libssl-dev lld llvm lz4 make \
+  && apt-get install -y --no-install-recommends bc bison clang flex libelf-dev libssl-dev lld llvm lz4 make patch \
   && rm -rf /var/lib/apt/lists/*
 ADD --checksum=7595a62d45ee1a2297eafa5f2ef5d0a45142d84d https://github.com/gregkh/linux.git#v7.3.4 /src
 WORKDIR /src
 COPY kernel.config /kernel.config
+# Small changes to the kernel for pods; the head of each file says why.
+COPY kernel-patches/ /kernel-patches/
 ENV ARCH=i386 LLVM=1
 RUN set -eux; \
+    for p in /kernel-patches/*.patch; do patch -p1 --forward < "$p"; done; \
     make -s tinyconfig; \
     ./scripts/kconfig/merge_config.sh -m .config /kernel.config >/dev/null; \
     make -s olddefconfig; \

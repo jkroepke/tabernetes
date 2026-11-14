@@ -354,8 +354,11 @@ that name.
 - v86 sends qid version 0 for every file, and Linux 9p then opens the file
   without the page cache: every read() was a 9p request. init mounts with
   `ignoreqv` (2026-11-14): glibc text tools -17 % CPU, 9p reads 9900 ->
-  2100. Measured without gain: msize 64/128/512 KiB (256 KiB is best;
-  readdir allocates and maps an msize buffer per directory), `cache=mmap`,
+  2100. Linux allocated, zeroed and mapped a readdir buffer of msize for
+  every directory: `vm/kernel-patches/9p-readdir-buffer.patch` caps it at
+  16 KiB (glibc text tools -3.3 % CPU). `vm/Dockerfile` applies the files
+  of `vm/kernel-patches`; a new kernel version may need them updated.
+  Measured without gain: msize 64/128/512 KiB (256 KiB is best), `cache=mmap`,
   a smaller readahead, large folios for 9p with 64 KiB exec folios,
   fault_around_bytes 16 KiB.
 
