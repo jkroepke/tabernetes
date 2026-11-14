@@ -43,11 +43,21 @@ type Options struct {
 // ServeWith starts the shim like Serve, from a snapshot and saving one now
 // and then.
 func ServeWith(l net.Listener, o Options) error {
+	srv, err := Start(l, o)
+	if err != nil {
+		return err
+	}
+	return srv.serve(l)
+}
+
+// Start makes the shim like ServeWith, but returns once the store is ready
+// and does not serve: the caller serves it on l (Serve) or uses Client.
+func Start(l net.Listener, o Options) (*Server, error) {
 	s := newStore()
 	s.volatile = o.Volatile
 	if o.Snapshot != nil {
 		if err := s.restore(o.Snapshot); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if o.Save != nil {
@@ -56,7 +66,7 @@ func ServeWith(l net.Listener, o Options) error {
 		}
 		go s.saveLoop(o.Save, o.Interval, o.Ready)
 	}
-	return serve(l, s)
+	return newServer(l, s), nil
 }
 
 func (s *store) saveLoop(save func([]byte), every time.Duration, ready <-chan struct{}) {

@@ -36,7 +36,19 @@ func Serve(l net.Listener) error {
 }
 
 func serve(l net.Listener, st *store) error {
-	srv := &Server{s: st, url: "http://" + l.Addr().String()}
+	return newServer(l, st).serve(l)
+}
+
+func newServer(l net.Listener, st *store) *Server {
+	return &Server{s: st, url: "http://" + l.Addr().String()}
+}
+
+// Serve answers gRPC on l.
+func (srv *Server) Serve(l net.Listener) error {
+	return srv.serve(l)
+}
+
+func (srv *Server) serve(l net.Listener) error {
 	// The etcd client pings every 30s. gRPC allows one ping per 5 minutes by
 	// default and answers more with GOAWAY "too_many_pings". Same as etcd.
 	g := grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{

@@ -71,6 +71,13 @@ func main() {
 
 	copyTree("_overlay", ".")
 
+	// kube-apiserver talks to the etcd shim in the same process, without
+	// gRPC (factory/inprocess.go in _overlay/).
+	edit("staging/src/k8s.io/apiserver/pkg/storage/storagebackend/factory/etcd3.go",
+		"var newETCD3Client = func(c storagebackend.TransportConfig) (*kubernetes.Client, error) {\n",
+		"var newETCD3Client = func(c storagebackend.TransportConfig) (*kubernetes.Client, error) {\n\tif InProcessClient != nil {\n\t\treturn InProcessClient(c)\n\t}\n",
+	)
+
 	// mount-utils: move the unix syscalls into mount_helper_sys_{unix,js}.go.
 	edit("staging/src/k8s.io/mount-utils/mount_helper_unix.go",
 		"\t\terr = syscall.Access(path, syscall.F_OK)\n\t\tif err == nil {",

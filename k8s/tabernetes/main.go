@@ -19,8 +19,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	etcdkube "go.etcd.io/etcd/client/v3/kubernetes"
 
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/apiserver/pkg/storage/storagebackend"
+	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
 	"k8s.io/client-go/rest"
 	logsapi "k8s.io/component-base/logs/api/v1"
 
@@ -133,7 +136,14 @@ func boot() (*cluster, error) {
 	if makeSeed.Type() == js.TypeFunction {
 		opts.Save = seedSaver(makeSeed)
 	}
-	go func() { must(etcdshim.ServeWith(l, opts)) }()
+	shim, err := etcdshim.Start(l, opts)
+	must(err)
+	go func() { must(shim.Serve(l)) }()
+	// kube-apiserver calls the shim directly instead of over gRPC (one
+	// connection per resource, ~0.5 s of the boot).
+	factory.InProcessClient = func(storagebackend.TransportConfig) (*etcdkube.Client, error) {
+		return shim.Client(), nil
+	}
 
 	status("starting kube-apiserver")
 	apiserver := run("kube-apiserver", app.NewAPIServerCommand(), apiserverArgs())
