@@ -1344,8 +1344,11 @@ static int stage0(void) {
   if (add_entropy(seed) < 0) return -1;
 
   mkdir(NEW_ROOT, 0755);
-  // cache=loose: only the guest changes the files, it may keep them
-  if (mount(ROOT_TAG, NEW_ROOT, "9p", 0, "trans=virtio,version=9p2000.L,cache=loose,msize=262144") < 0) return fail("mount 9p: %s", errtext(errno));
+  // cache=loose: only the guest changes the files, it may keep them.
+  // ignoreqv: v86 sends version 0 in the qid of every file, and Linux reads
+  // and writes such files without the page cache, one 9p request per read
+  // call. With the page cache, a file is read once and with readahead.
+  if (mount(ROOT_TAG, NEW_ROOT, "9p", 0, "trans=virtio,version=9p2000.L,cache=loose,ignoreqv,msize=262144") < 0) return fail("mount 9p: %s", errtext(errno));
   if (load_config(NEW_ROOT "/.tabernetes/config.json", &staged_config) < 0) return -1;
   if (setup_network(staged_config.ip, staged_config.gateway) < 0) return -1;
   // /dev (with /dev/pts and /dev/shm), /proc and /sys move into the root of

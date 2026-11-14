@@ -14,19 +14,24 @@ ARG KERNEL_IMAGE=mirror.gcr.io/library/ubuntu:26.04
 FROM --platform=$BUILDPLATFORM ${KERNEL_IMAGE} AS kernel
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bc bison clang flex libelf-dev libssl-dev lld llvm lz4 make \
+  && apt-get install -y --no-install-recommends bc bison clang flex libelf-dev libssl-dev lld llvm lz4 make patch perl python3 \
   && rm -rf /var/lib/apt/lists/*
 ADD --checksum=7595a62d45ee1a2297eafa5f2ef5d0a45142d84d https://github.com/gregkh/linux.git#v7.3.4 /src
 WORKDIR /src
 COPY kernel.config /kernel.config
+# Small changes to the kernel for pods; the head of each file says why.
+COPY kernel-patches/ /kernel-patches/
 ENV ARCH=i386 LLVM=1
 RUN set -eux; \
+    for p in /kernel-patches/*.patch; do patch -p1 --forward < "$p"; done; \
     make -s tinyconfig; \
     ./scripts/kconfig/merge_config.sh -m .config /kernel.config >/dev/null; \
     make -s olddefconfig; \
-    for o in X86_32 M686 SERIAL_8250_CONSOLE VIRTIO_PCI VIRTIO_NET NET_9P_VIRTIO 9P_FS DEVTMPFS BLK_DEV_INITRD COMPAT_32BIT_TIME HIGHMEM4G KERNEL_LZ4 NO_HZ_IDLE; do \
+    for o in X86_32 M686 SERIAL_8250_CONSOLE VIRTIO_PCI VIRTIO_NET NET_9P_VIRTIO 9P_FS DEVTMPFS BLK_DEV_INITRD COMPAT_32BIT_TIME HIGHMEM4G KERNEL_LZ4 NO_HZ_IDLE X86_LOCAL_APIC LTO_CLANG_FULL; do \
       grep -q "^CONFIG_$o=y" .config || { echo "kernel.config: CONFIG_$o did not make it into .config" >&2; exit 1; }; \
     done; \
+    # SLUB_TINY must be off; the loop above checks only options that are on.
+    ! grep -q "^CONFIG_SLUB_TINY=y" .config || { echo "kernel.config: CONFIG_SLUB_TINY is still on" >&2; exit 1; }; \
     make -s -j"$(nproc)" vmlinux; \
     mkdir /out; \
     # The kernel unpacked: a bzImage unpacks itself on the emulated CPU,

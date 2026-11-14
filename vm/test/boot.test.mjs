@@ -42,6 +42,7 @@ function options(extra) {
     disable_speaker: true,
     // like web/src/vmworker.js: a small VGA memory keeps the state small
     vga_memory_size: 256 << 10,
+    acpi: true,
     preserve_mac_from_state_image: true,
     net_device: { type: "virtio", relay_url: "fetch", vm_ip: IP, router_ip: GATEWAY },
     ...extra,
@@ -157,7 +158,7 @@ test("the kernel boots, init starts a pod, the saved VM restores", { skip, timeo
   const control = lines(e, 1);
   await new Promise((r) => e.add_listener("emulator-loaded", r));
   const t0 = Date.now();
-  bootKernel(e.v86.cpu, { kernel, initrd: initramfs(init), cmdline: "console=ttyS0 quiet loglevel=3" });
+  bootKernel(e.v86.cpu, { kernel, initrd: initramfs(init), cmdline: "console=ttyS0 quiet loglevel=3 tsc=reliable highres=off" });
   e.run();
   try {
     await until("ready", () => control.includes("ready") || control.some((l) => l.startsWith("exit ")));

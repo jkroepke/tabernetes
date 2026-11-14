@@ -1,0 +1,53 @@
+9p: read directories into a buffer of 16 KiB, not of msize
+
+v9fs allocates the readdir buffer of a directory with msize bytes
+(256 KiB in tabernetes) and kvzalloc, and maps it page by page for each
+Treaddir request. Most directories fit into a few pages, so a pod paid
+for 64 pages per directory it listed. Measured with the glibc text tools
+of tools/pod-bench (jkroepke/v86): getdents64 22k -> 10k guest
+instructions per call, CPU time -3.3 %.
+
+diff --git a/fs/9p/vfs_dir.c b/fs/9p/vfs_dir.c
+index 323f853..7366325 100644
+--- a/fs/9p/vfs_dir.c
++++ b/fs/9p/vfs_dir.c
+@@ -9,6 +9,7 @@
+ #include <linux/module.h>
+ #include <linux/errno.h>
+ #include <linux/fs.h>
++#include <linux/sizes.h>
+ #include <linux/file.h>
+ #include <linux/stat.h>
+ #include <linux/string.h>
+@@ -60,6 +61,13 @@ static inline int dt_type(struct p9_wstat *mistat)
+ 	return rettype;
+ }
+ 
++/*
++ * A directory is read into a buffer of at most this size, not of msize:
++ * the buffer is allocated, zeroed and mapped page by page for each open
++ * directory, and most directories fit into a few pages.
++ */
++#define V9FS_RDIR_BUFLEN (SZ_16K - sizeof(struct p9_rdir))
++
+ /**
+  * v9fs_alloc_rdir_buf - Allocate buffer used for read and readdir
+  * @filp: opened file structure
+@@ -96,7 +104,7 @@ static int v9fs_dir_readdir(struct file *file, struct dir_context *ctx)
+ 	p9_debug(P9_DEBUG_VFS, "name %pD\n", file);
+ 	fid = file->private_data;
+ 
+-	buflen = fid->clnt->msize - P9_IOHDRSZ;
++	buflen = min_t(int, fid->clnt->msize - P9_IOHDRSZ, V9FS_RDIR_BUFLEN);
+ 
+ 	rdir = v9fs_alloc_rdir_buf(file, buflen);
+ 	if (!rdir)
+@@ -162,7 +170,7 @@ static int v9fs_dir_readdir_dotl(struct file *file, struct dir_context *ctx)
+ 	p9_debug(P9_DEBUG_VFS, "name %pD\n", file);
+ 	fid = file->private_data;
+ 
+-	buflen = fid->clnt->msize - P9_READDIRHDRSZ;
++	buflen = min_t(int, fid->clnt->msize - P9_READDIRHDRSZ, V9FS_RDIR_BUFLEN);
+ 
+ 	rdir = v9fs_alloc_rdir_buf(file, buflen);
+ 	if (!rdir)
