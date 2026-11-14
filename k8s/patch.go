@@ -178,13 +178,27 @@ func main() {
 		)
 	}
 
+	// GetOpenAPIDefinitions was one function with a map literal of 1500
+	// entries: V8 compiled it on its first call at every boot (~0.12 s).
+	// As tables that package init fills (so the heap snapshot holds them),
+	// it is a small loop.
+	for _, f := range []string{
+		"pkg/generated/openapi/zz_generated.openapi.go",
+		"staging/src/k8s.io/apiextensions-apiserver/pkg/generated/openapi/zz_generated.openapi.go",
+		"staging/src/k8s.io/kube-aggregator/pkg/generated/openapi/zz_generated.openapi.go",
+	} {
+		openAPITable(f)
+	}
+
 	// OpenAPI: kube-apiserver built its OpenAPI v2 spec and the v3 spec of
 	// every group version before it served, and the aggregator marshalled
 	// all v3 specs to hash them for /openapi/v3 (~1.3 s of the boot). Only
 	// kubectl explain, client-side validation and the like read them. Build
 	// each spec on the first request for it instead; the content is the
-	// same. apiextensions-apiserver keeps its v2 spec: its CRD OpenAPI
-	// controller reads StaticOpenAPISpec.
+	// same. The CRD OpenAPI controller of apiextensions-apiserver merges
+	// its v2 spec with the CRDs: it gets it as a lazy value too
+	// (StaticOpenAPISpecLazy), and the kube-aggregator builds its own v2
+	// spec on the first request as well (~0.15 s of the boot together).
 	edit("staging/src/k8s.io/apiserver/pkg/server/routes/openapi.go",
 		`	for gv, ws := range grouped {
 		spec, err := builder3.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(ws), oa.V3Config)
@@ -216,9 +230,9 @@ func main() {
 		"// Install adds the SwaggerUI webservice to the given mux.\nfunc (oa OpenAPI) InstallV2(",
 		`// InstallV2Lazy is InstallV2 without the spec: it is built on the first
 // request. Added by tabernetes (k8s/patch.go).
-func (oa OpenAPI) InstallV2Lazy(c *restful.Container, mux *mux.PathRecorderMux) *handler.OpenAPIService {
+func (oa OpenAPI) InstallV2Lazy(c *restful.Container, mux *mux.PathRecorderMux) (*handler.OpenAPIService, cached.Value[*spec.Swagger]) {
 	webServices := c.RegisteredWebServices()
-	s := handler.NewOpenAPIServiceLazy(cached.Once(cached.Func(func() (*spec.Swagger, string, error) {
+	v := cached.Once(cached.Func(func() (*spec.Swagger, string, error) {
 		spec, err := builder2.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(webServices), oa.Config)
 		if err != nil {
 			klog.Errorf("Failed to build open api spec for root: %v", err)
@@ -226,9 +240,10 @@ func (oa OpenAPI) InstallV2Lazy(c *restful.Container, mux *mux.PathRecorderMux) 
 		}
 		spec.Definitions = handler.PruneDefaults(spec.Definitions)
 		return spec, "static", nil
-	})))
+	}))
+	s := handler.NewOpenAPIServiceLazy(v)
 	s.RegisterOpenAPIVersionedService("/openapi/v2", mux)
-	return s
+	return s, v
 }
 
 // Install adds the SwaggerUI webservice to the given mux.
@@ -238,13 +253,52 @@ func (oa OpenAPI) InstallV2(`,
 	edit("staging/src/k8s.io/apiserver/pkg/server/genericapiserver.go",
 		`	if s.openAPIConfig != nil && !s.skipOpenAPIInstallation {
 		s.OpenAPIVersionedService, s.StaticOpenAPISpec = routes.OpenAPI{`,
-		`	// tabernetes: lazy, but not for apiextensions-apiserver (k8s/patch.go)
-	if s.openAPIConfig != nil && !s.skipOpenAPIInstallation && s.Handler.Director.(director).name != "apiextensions-apiserver" {
-		s.OpenAPIVersionedService = routes.OpenAPI{
+		`	// tabernetes: lazy (k8s/patch.go)
+	if s.openAPIConfig != nil && !s.skipOpenAPIInstallation {
+		s.OpenAPIVersionedService, s.StaticOpenAPISpecLazy = routes.OpenAPI{
 			Config: s.openAPIConfig,
 		}.InstallV2Lazy(s.Handler.GoRestfulContainer, s.Handler.NonGoRestfulMux)
-	} else if s.openAPIConfig != nil && !s.skipOpenAPIInstallation {
+	} else if false {
 		s.OpenAPIVersionedService, s.StaticOpenAPISpec = routes.OpenAPI{`,
+		"\tStaticOpenAPISpec *spec.Swagger\n",
+		"\tStaticOpenAPISpec *spec.Swagger\n\n\t// StaticOpenAPISpecLazy builds the spec of StaticOpenAPISpec on its first\n\t// use. Added by tabernetes (k8s/patch.go).\n\tStaticOpenAPISpecLazy cached.Value[*spec.Swagger]\n",
+	)
+	addImport("staging/src/k8s.io/apiserver/pkg/server/genericapiserver.go", "k8s.io/kube-openapi/pkg/cached")
+	edit("staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/apiserver.go",
+		"if s.GenericAPIServer.StaticOpenAPISpec != nil {",
+		"if s.GenericAPIServer.StaticOpenAPISpecLazy != nil {",
+		"go openapiController.Run(s.GenericAPIServer.StaticOpenAPISpec,",
+		"go openapiController.Run(s.GenericAPIServer.StaticOpenAPISpecLazy,",
+	)
+	edit("staging/src/k8s.io/apiextensions-apiserver/pkg/controller/openapi/controller.go",
+		"\tstaticSpec *spec.Swagger\n",
+		"\tstaticSpec cached.Value[*spec.Swagger]\n",
+		"func (c *Controller) Run(staticSpec *spec.Swagger,",
+		"func (c *Controller) Run(staticSpec cached.Value[*spec.Swagger],",
+		"\t\tmergedSpec, err := builder.MergeSpecs(c.staticSpec, localCRDSpec...)\n",
+		"\t\tstaticSpec, _, err := c.staticSpec.Get()\n\t\tif err != nil {\n\t\t\treturn nil, \"\", err\n\t\t}\n\t\tmergedSpec, err := builder.MergeSpecs(staticSpec, localCRDSpec...)\n",
+	)
+	edit("staging/src/k8s.io/kube-aggregator/pkg/controllers/openapi/aggregator/aggregator.go",
+		`	aggregatorOpenAPISpec, err := builder.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(webServices), config)
+	if err != nil {
+		return nil, err
+	}
+	aggregatorOpenAPISpec.Definitions = handler.PruneDefaults(aggregatorOpenAPISpec.Definitions)
+`,
+		`	// tabernetes: built on the first request (k8s/patch.go).
+	aggregatorOpenAPISpec := cached.Once(cached.Func(func() (*spec.Swagger, string, error) {
+		s, err := builder.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(webServices), config)
+		if err != nil {
+			return nil, "", err
+		}
+		s.Definitions = handler.PruneDefaults(s.Definitions)
+		return s, "never-changes", nil
+	}))
+`,
+		"func buildAndRegisterSpecAggregatorForLocalServices(downloader *Downloader, aggregatorSpec *spec.Swagger,",
+		"func buildAndRegisterSpecAggregatorForLocalServices(downloader *Downloader, aggregatorSpec cached.Value[*spec.Swagger],",
+		"\tcachedAggregatorSpec := cached.Static(aggregatorSpec, \"never-changes\")\n",
+		"\tcachedAggregatorSpec := aggregatorSpec\n",
 	)
 	// The aggregator asks the local servers for their /openapi/v3 discovery
 	// at once, and again every second; their answer hashes every spec.
@@ -501,6 +555,48 @@ func vendorModule(path, version string, pkgs ...string) {
 	b, err := os.ReadFile(filepath.Join(mod.Dir, "LICENSE"))
 	must(err)
 	must(os.WriteFile(filepath.Join(dst, "LICENSE"), b, 0o644))
+}
+
+// openAPITable turns the map literal of a generated GetOpenAPIDefinitions
+// into a table of names and functions and a loop over them.
+func openAPITable(path string) {
+	const head = "func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenAPIDefinition {\n\treturn map[string]common.OpenAPIDefinition{\n"
+	const tail = "\n\t}\n}\n"
+	s := read(path)
+	i := strings.Index(s, head)
+	if i < 0 {
+		fail("%s: GetOpenAPIDefinitions not found", path)
+	}
+	body := s[i+len(head):]
+	j := strings.Index(body, tail)
+	if j < 0 {
+		fail("%s: end of GetOpenAPIDefinitions not found", path)
+	}
+	var names, funcs strings.Builder
+	n := 0
+	for _, line := range strings.Split(body[:j], "\n") {
+		k := strings.LastIndex(line, ": ")
+		if k < 0 {
+			fail("%s: unexpected line %q", path, line)
+		}
+		key, fn := strings.TrimSpace(line[:k]), strings.TrimSpace(line[k+2:])
+		if !strings.HasSuffix(fn, "(ref),") || strings.ContainsAny(strings.TrimSuffix(fn, "(ref),"), " ()") {
+			fail("%s: unexpected line %q", path, line)
+		}
+		names.WriteString("\t" + key + ",\n")
+		funcs.WriteString("\t" + strings.TrimSuffix(fn, "(ref),") + ",\n")
+		n++
+	}
+	if n < 10 {
+		fail("%s: only %d definitions", path, n)
+	}
+	repl := "// tabernetes: tables instead of one large map literal, see patch.go.\n" +
+		"var openAPINames = [...]string{\n" + names.String() + "}\n\n" +
+		"var openAPIFuncs = [...]func(common.ReferenceCallback) common.OpenAPIDefinition{\n" + funcs.String() + "}\n\n" +
+		"func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenAPIDefinition {\n" +
+		"\tm := make(map[string]common.OpenAPIDefinition, len(openAPIFuncs))\n" +
+		"\tfor i, f := range openAPIFuncs {\n\t\tm[openAPINames[i]] = f(ref)\n\t}\n\treturn m\n}\n"
+	write(path, s[:i]+repl+body[j+len(tail):])
 }
 
 func must(err error) {
