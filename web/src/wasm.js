@@ -46,17 +46,123 @@ function frameEnd(b) {
 // wasm_exec.js that will run the instance; a binary with a snapshot of the
 // heap after init (k8s/snapshot.mjs) puts its description on go.snapshot.
 export async function instantiate(stream, go) {
+  // The data segments (the heap of the snapshot, ~140 MB) do not go through
+  // the compiler: they are copied into the memory of the instance.
+  const { code, segments } = splitData(stream);
   let result;
   if (WebAssembly.instantiateStreaming) {
-    const resp = new Response(stream, { headers: { "Content-Type": "application/wasm" } });
+    const resp = new Response(code, { headers: { "Content-Type": "application/wasm" } });
     result = await WebAssembly.instantiateStreaming(resp, go.importObject);
   } else {
-    const bytes = await new Response(stream).arrayBuffer();
+    const bytes = await new Response(code).arrayBuffer();
     result = await WebAssembly.instantiate(bytes, go.importObject);
+  }
+  const mem = new Uint8Array(result.instance.exports.mem.buffer);
+  for (const { offset, parts } of await segments) {
+    let at = offset;
+    for (const p of parts) {
+      mem.set(p, at);
+      at += p.length;
+    }
   }
   const [sec] = WebAssembly.Module.customSections(result.module, "tabernetes.snapshot");
   if (sec) go.snapshot = JSON.parse(new TextDecoder().decode(sec));
   return result.instance;
+}
+
+// splitData takes the active data segments out of a wasm binary while it
+// streams. code is the binary with an empty data section (and a data count
+// of 0); segments resolves to [{offset, parts}] once the stream has ended.
+// Streaming compilation of the data section cost the thread that feeds it
+// ~0.3 s for the ~140 MB of the heap snapshot; copying them into the memory
+// takes ~40 ms. The parts are views of the chunks of the stream, no copies.
+export function splitData(stream) {
+  const reader = stream.getReader();
+  let chunk = new Uint8Array(0), pos = 0;
+  const more = async () => {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return false;
+      if (value.length) {
+        chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+        pos = 0;
+        return true;
+      }
+    }
+  };
+  const byte = async () => {
+    if (pos === chunk.length && !(await more())) throw new Error("wasm: the binary is truncated");
+    return chunk[pos++];
+  };
+  const uleb = async () => {
+    let v = 0, shift = 0, b;
+    do {
+      b = await byte();
+      v += (b & 127) * 2 ** shift;
+      shift += 7;
+    } while (b & 128);
+    return v;
+  };
+  // take hands n bytes to fn, as views of the chunks.
+  const take = async (n, fn) => {
+    while (n > 0) {
+      if (pos === chunk.length && !(await more())) throw new Error("wasm: the binary is truncated");
+      const k = Math.min(n, chunk.length - pos);
+      fn(chunk.subarray(pos, pos + k));
+      pos += k;
+      n -= k;
+    }
+  };
+  let done;
+  const segments = new Promise((resolve, reject) => { done = { resolve, reject }; });
+  segments.catch(() => {});
+  const code = new ReadableStream({
+    async start(ctl) {
+      try {
+        const list = [];
+        await take(8, (b) => ctl.enqueue(b)); // magic and version
+        while (pos < chunk.length || (await more())) {
+          const id = await byte();
+          const size = await uleb();
+          if (id === 11 || id === 12) {
+            // data, data count: no segment for the compiler
+            ctl.enqueue(Uint8Array.of(id, 1, 0));
+            if (id === 12) {
+              await take(size, () => {});
+              continue;
+            }
+            for (let n = await uleb(); n > 0; n--) {
+              const flags = await uleb();
+              // Go writes active segments of memory 0 with an i32.const offset.
+              if (flags !== 0 || (await byte()) !== 0x41) throw new Error("wasm: unexpected data segment");
+              let offset = 0, shift = 0, b;
+              do {
+                b = await byte();
+                offset += (b & 127) * 2 ** shift;
+                shift += 7;
+              } while (b & 128);
+              if (b & 0x40) offset -= 2 ** shift; // sign
+              if ((await byte()) !== 0x0b) throw new Error("wasm: unexpected data segment");
+              const parts = [];
+              await take(await uleb(), (b) => parts.push(b));
+              list.push({ offset: offset >>> 0, parts });
+            }
+            continue;
+          }
+          let head = [id], s = size;
+          do { head.push((s & 127) | (s > 127 ? 128 : 0)); s = Math.floor(s / 128); } while (s > 0);
+          ctl.enqueue(Uint8Array.from(head));
+          await take(size, (b) => ctl.enqueue(b));
+        }
+        ctl.close();
+        done.resolve(list);
+      } catch (e) {
+        ctl.error(e);
+        done.reject(e);
+      }
+    },
+  });
+  return { code, segments };
 }
 
 // runGo runs the Go program like go.run(instance). With a snapshot, the

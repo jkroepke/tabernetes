@@ -452,6 +452,45 @@ that name.
   controller starts 1-2 s after the informers) only moved that window:
   1.5 s after the prompt 1.25 -> 0.28 s, but 3 s after it 0.09 -> 0.80 s.
   Not kept.
+- **Time to the prompt** (2026-11-14): the shared worker is busy all the
+  time from the first chunk of the binary to the prompt; nothing waits on
+  the network or a timer except the one-second `wait.Poll` of two hooks.
+  Split of a first visit (Go marks, `tmark` in a patched tree, read over
+  CDP; page ms): binary sent and compiled ~1.2 s (the worker fed the
+  streaming compiler ~0.75 s), PKI and etcd 0.1 s, kube-apiserver
+  `NewConfig` 0.5 s, `CreateServerChain` 1.25 s, `PrepareRun` 1.4 s
+  (OpenAPI v2 and v3 of kube-apiserver 0.75 s, v3 discovery of the
+  aggregator 0.55 s), post-start hooks to `/readyz` 2.4 s (1 s of it the
+  first wait of rbac/bootstrap-roles and the priority classes; the type
+  converter of MutatingAdmissionPolicy fetched /openapi/v3 at once, which
+  built and hashed every v3 spec, ~0.7 s), addons 1.05 s (kubectl
+  validated them against /openapi/v3). A return visit had the same
+  apiserver part (~5.2 s) without the addons. Now: OpenAPI specs are
+  built on the first request (patch.go), those two hooks try at once,
+  the addons skip client-side validation, the data segments of the
+  binary (the heap snapshot) bypass the streaming compiler (`splitData` in
+  `wasm.js`, ~0.3 s), and GOGC is 400 during the boot (~0.1-0.25 s, +35
+  MiB of memory). Headless Chromium, `kubectl run` nginx 3 s after the
+  prompt, 8 alternating rounds, medians, before -> after: prompt of a
+  first visit 7960 -> 5793 ms, of a return visit 6209 -> 4477 ms; first
+  pod 1619 -> 1620 ms (first visit) and 990 -> 1028 ms (return), run ->
+  start message 84 -> 82 / 152 -> 150 ms (noise). The cost moved: the
+  first `kubectl apply` of a session takes ~1.15 s instead of ~0.15 s
+  (it builds the v3 specs), the first `kubectl explain` ~0.33 instead of
+  ~0.13 s. Upstream `TestUpdateOpenAPISpec` of k8s.io/apiserver/pkg/server
+  fails by design: it reads `StaticOpenAPISpec`, which only
+  apiextensions-apiserver fills now. What is left: `CreateServerChain`
+  (storage and handlers of every resource), `NewConfig` (admission
+  plugins, authorizers), the creation of the RBAC roles on a first
+  visit (~1.4 s) and ~0.6-0.9 s of lazy compilation of the Wasm functions
+  that the boot runs (`--no-wasm-lazy-compilation` made the apiserver
+  part 0.6-0.9 s shorter, but the compile 2.9 s longer). Tried without
+  gain: holding the first etcd snapshot back for 2 s (its encode is
+  ~0.1 s before the prompt; a return visit then often found no
+  snapshot). GOGC 400 alone, 8 rounds: 6385 / 4782 -> 6145 / 4668 ms.
+  Not tried: a code cache of the compiled Wasm (needs the unpacked
+  binary in Cache Storage, ~300 MB), shorter `/readyz` polling (each
+  poll costs a request of the apiserver).
 - **kubectl translations are off** (patch.go): loading them zipped and parsed
   the `.po` files during init (~0.1 s), and the terminal sets no `LANG`.
 - **Persistence rules**: the etcd snapshot is saved only after boot, and a

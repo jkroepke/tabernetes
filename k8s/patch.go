@@ -171,6 +171,175 @@ func main() {
 		)
 	}
 
+	// OpenAPI: kube-apiserver built its OpenAPI v2 spec and the v3 spec of
+	// every group version before it served, and the aggregator marshalled
+	// all v3 specs to hash them for /openapi/v3 (~1.3 s of the boot). Only
+	// kubectl explain, client-side validation and the like read them. Build
+	// each spec on the first request for it instead; the content is the
+	// same. apiextensions-apiserver keeps its v2 spec: its CRD OpenAPI
+	// controller reads StaticOpenAPISpec.
+	edit("staging/src/k8s.io/apiserver/pkg/server/routes/openapi.go",
+		`	for gv, ws := range grouped {
+		spec, err := builder3.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(ws), oa.V3Config)
+		if err != nil {
+			klog.Errorf("Failed to build OpenAPI v3 for group %s, %q", gv, err)
+			continue
+		}
+		if group, version, ok := groupVersionFromPath(gv); ok {
+			filterScopedGVKs(spec, group, version)
+		}
+		openAPIVersionedService.UpdateGroupVersion(gv, spec)
+	}
+`,
+		`	// tabernetes: each spec is built on the first request (k8s/patch.go).
+	for gv, ws := range grouped {
+		openAPIVersionedService.UpdateGroupVersionLazy(gv, cached.Once(cached.Func(func() (*spec3.OpenAPI, string, error) {
+			spec, err := builder3.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(ws), oa.V3Config)
+			if err != nil {
+				klog.Errorf("Failed to build OpenAPI v3 for group %s, %q", gv, err)
+				return nil, "", err
+			}
+			if group, version, ok := groupVersionFromPath(gv); ok {
+				filterScopedGVKs(spec, group, version)
+			}
+			return spec, gv, nil
+		})))
+	}
+`,
+		"// Install adds the SwaggerUI webservice to the given mux.\nfunc (oa OpenAPI) InstallV2(",
+		`// InstallV2Lazy is InstallV2 without the spec: it is built on the first
+// request. Added by tabernetes (k8s/patch.go).
+func (oa OpenAPI) InstallV2Lazy(c *restful.Container, mux *mux.PathRecorderMux) *handler.OpenAPIService {
+	webServices := c.RegisteredWebServices()
+	s := handler.NewOpenAPIServiceLazy(cached.Once(cached.Func(func() (*spec.Swagger, string, error) {
+		spec, err := builder2.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(webServices), oa.Config)
+		if err != nil {
+			klog.Errorf("Failed to build open api spec for root: %v", err)
+			return nil, "", err
+		}
+		spec.Definitions = handler.PruneDefaults(spec.Definitions)
+		return spec, "static", nil
+	})))
+	s.RegisterOpenAPIVersionedService("/openapi/v2", mux)
+	return s
+}
+
+// Install adds the SwaggerUI webservice to the given mux.
+func (oa OpenAPI) InstallV2(`,
+	)
+	addImport("staging/src/k8s.io/apiserver/pkg/server/routes/openapi.go", "k8s.io/kube-openapi/pkg/cached")
+	edit("staging/src/k8s.io/apiserver/pkg/server/genericapiserver.go",
+		`	if s.openAPIConfig != nil && !s.skipOpenAPIInstallation {
+		s.OpenAPIVersionedService, s.StaticOpenAPISpec = routes.OpenAPI{`,
+		`	// tabernetes: lazy, but not for apiextensions-apiserver (k8s/patch.go)
+	if s.openAPIConfig != nil && !s.skipOpenAPIInstallation && s.Handler.Director.(director).name != "apiextensions-apiserver" {
+		s.OpenAPIVersionedService = routes.OpenAPI{
+			Config: s.openAPIConfig,
+		}.InstallV2Lazy(s.Handler.GoRestfulContainer, s.Handler.NonGoRestfulMux)
+	} else if s.openAPIConfig != nil && !s.skipOpenAPIInstallation {
+		s.OpenAPIVersionedService, s.StaticOpenAPISpec = routes.OpenAPI{`,
+	)
+	// The aggregator asks the local servers for their /openapi/v3 discovery
+	// at once, and again every second; their answer hashes every spec.
+	// Until someone asks the aggregator for /openapi/v3, skip them.
+	const v3aggregator = "staging/src/k8s.io/kube-aggregator/pkg/controllers/openapiv3/aggregator/aggregator.go"
+	edit(v3aggregator,
+		`	apiService, exists := s.apiServiceInfo[apiServiceName]
+	if !exists {
+		return ErrAPIServiceNotFound
+	}
+`,
+		`	apiService, exists := s.apiServiceInfo[apiServiceName]
+	if !exists {
+		return ErrAPIServiceNotFound
+	}
+	// tabernetes: not before the first request (k8s/patch.go)
+	if IsLocalAPIService(apiServiceName) && !s.wanted.Load() {
+		return nil
+	}
+`,
+		"\topenAPIV2ConverterHandler *handler3.OpenAPIService\n}\n",
+		`	openAPIV2ConverterHandler *handler3.OpenAPIService
+
+	// wanted: someone asked for /openapi/v3 (tabernetes, k8s/patch.go)
+	wanted atomic.Bool
+}
+
+// want reads the discovery of the local servers on the first request.
+func (s *specProxier) want() {
+	if s.wanted.Load() {
+		return
+	}
+	s.rwMutex.Lock()
+	defer s.rwMutex.Unlock()
+	if s.wanted.Swap(true) {
+		return
+	}
+	for name := range s.apiServiceInfo {
+		if IsLocalAPIService(name) {
+			if err := s.updateAPIServiceSpecLocked(name); err != nil {
+				klog.Errorf("OpenAPI v3 of %s: %v", name, err)
+			}
+		}
+	}
+}
+`,
+		"func (s *specProxier) handleDiscovery(w http.ResponseWriter, r *http.Request) {\n",
+		"func (s *specProxier) handleDiscovery(w http.ResponseWriter, r *http.Request) {\n\ts.want()\n",
+		"func (s *specProxier) handleGroupVersion(w http.ResponseWriter, r *http.Request) {\n",
+		"func (s *specProxier) handleGroupVersion(w http.ResponseWriter, r *http.Request) {\n\ts.want()\n",
+	)
+	addImport(v3aggregator, "sync/atomic")
+	// MutatingAdmissionPolicy fetches the /openapi/v3 paths right at the
+	// start and every 5 s, for the type converters of its patches. Start
+	// that with the first patch that needs one.
+	const typeConverter = "staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/patch/typeconverter.go"
+	edit(typeConverter,
+		"\t\tlastFetchedPaths:    make(map[schema.GroupVersion]openapi.GroupVersion),\n\t}\n}\n",
+		"\t\tlastFetchedPaths:    make(map[schema.GroupVersion]openapi.GroupVersion),\n\t\tused:                make(chan struct{}),\n\t}\n}\n",
+		"\tlastFetchedPaths map[schema.GroupVersion]openapi.GroupVersion\n}\n",
+		`	lastFetchedPaths map[schema.GroupVersion]openapi.GroupVersion
+
+	// tabernetes: closed on the first use (k8s/patch.go)
+	used     chan struct{}
+	usedOnce sync.Once
+}
+`,
+		`func (t *typeConverterManager) Run(ctx context.Context) {
+	// Loop every 5s refershing the OpenAPI schema list to know which
+	// schemas have been invalidated. This should use e-tags under the hood
+	_ = wait.PollUntilContextCancel(ctx, 5*time.Second, true, func(_ context.Context) (done bool, err error) {
+		paths, err := t.openapiClient.Paths()
+`,
+		`func (t *typeConverterManager) Run(ctx context.Context) {
+	select {
+	case <-t.used:
+	case <-ctx.Done():
+		return
+	}
+	// Loop every 5s refershing the OpenAPI schema list to know which
+	// schemas have been invalidated. This should use e-tags under the hood
+	_ = wait.PollUntilContextCancel(ctx, 5*time.Second, true, func(_ context.Context) (done bool, err error) {
+		return t.fetchPaths()
+	})
+}
+
+func (t *typeConverterManager) fetchPaths() (done bool, err error) {
+	{
+		paths, err := t.openapiClient.Paths()
+`,
+		"\t\tt.lastFetchedPaths = parsedPaths\n\t\treturn false, nil\n\t})\n}\n",
+		"\t\tt.lastFetchedPaths = parsedPaths\n\t\treturn false, nil\n\t}\n}\n",
+		"\tgv := gvk.GroupVersion()\n\n\texisting, entry, err := func()",
+		"\tt.usedOnce.Do(func() {\n\t\t_, _ = t.fetchPaths()\n\t\tclose(t.used)\n\t})\n\n\tgv := gvk.GroupVersion()\n\n\texisting, entry, err := func()",
+	)
+	// The RBAC roles and the priority classes are created by post-start
+	// hooks that wait a second before their first try (wait.Poll), and the
+	// apiserver is not ready before they are done. Try at once.
+	for _, f := range []string{"pkg/registry/rbac/rest/storage_rbac.go", "pkg/registry/scheduling/rest/storage_scheduling.go"} {
+		edit(f, "err := wait.Poll(1*time.Second, 30*time.Second,", "err := wait.PollImmediate(1*time.Second, 30*time.Second,")
+	}
+
 	// The shell of the terminal. Its only other dependencies, golang.org/x/sys
 	// and golang.org/x/term, are vendored by Kubernetes already.
 	vendorModule("mvdan.cc/sh/v3", os.Getenv("MVDAN_SH_VERSION"),
