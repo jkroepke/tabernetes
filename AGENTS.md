@@ -388,6 +388,35 @@ that name.
   -> `started` +40-80 ms, more threads at once on 4 cores); a faster tar
   parser (not needed). A separate writer thread per layer could save
   ~150 ms more, but only on links over ~900 Mbit/s.
+- **From `kubectl run` to the start message** (2026-11-14): measured with
+  marks in the Go code (apiserver requests, scheduler, etcd writes, tab
+  node), read from the shared worker over CDP. 3 s after the prompt it was
+  ~120 ms: kubectl ~55 ms (the first run of a tab ~30 ms more: first use of
+  the code), scheduling and binding ~20 ms, then the tab node wrote the pod
+  status (GET + PUT, ~25 ms) before it started the VM. At the very prompt
+  it was ~3 s: the scheduler was ready only ~2.6 s after its start and the
+  node got its pod CIDR from the IPAM controller after ~2.4 s, because the
+  controller-manager starts ~40 controllers at once beside them; then the
+  status update waited ~0.5 s more for the client rate limit of the tab
+  node (client-go 5/s, burst 10, used up by the poll for the pod CIDR).
+  Now the tab node has the limits of the kubelet (50/s, burst 100), writes
+  the first status while the VM starts (like the status manager of the
+  kubelet), the scheduler starts first and the controller-manager waits
+  for its `/readyz` (~0.3 s), and the controller-manager builds and runs
+  the node IPAM controller before the others (patch.go): the pod CIDR comes
+  ~0.1 s after its start. Headless Chromium, nginx, fresh profile, 16
+  alternating rounds (8 for 1.5 s), medians, before -> after: run -> start
+  message at the prompt 2.8-3.2 s -> 0.83-0.88 s, 1.5 s after it 1.64 ->
+  1.25 s, 3 s after it 121-140 -> 90 ms, later pods 66-77 -> 50 ms; run ->
+  HTTP of the first pod at the prompt 4.36-4.84 -> 3.21-3.31 s, 3 s after
+  it 1.65 s (unchanged within the noise); prompt and later pods unchanged.
+  What is left: Go in Wasm returns to the JavaScript event loop only when
+  no goroutine can run, so while the controller-manager starts (~2.2 s of
+  CPU, ~0.3-2.4 s after the prompt) no message of a tab reaches the worker,
+  and a command typed then waits. `--controller-start-interval=1s` (each
+  controller starts 1-2 s after the informers) only moved that window:
+  1.5 s after the prompt 1.25 -> 0.28 s, but 3 s after it 0.09 -> 0.80 s.
+  Not kept.
 - **kubectl translations are off** (patch.go): loading them zipped and parsed
   the `.po` files during init (~0.1 s), and the terminal sets no `LANG`.
 - **Persistence rules**: the etcd snapshot is saved only after boot, and a
