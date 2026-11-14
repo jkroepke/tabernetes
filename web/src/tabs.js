@@ -116,8 +116,10 @@ export async function connectCluster(url, tries = 0) {
         for (const r = stream.getReader(); ;) {
           const { value, done } = await r.read();
           if (done) break;
-          // a copy: the other branch of the tee reads the same chunk
-          const b = value.slice().buffer;
+          // The chunks are the unpacked zstd frames, each in a buffer of its
+          // own: hand it over without a copy (~25 ms per 32 MiB).
+          const whole = value.byteOffset === 0 && value.byteLength === value.buffer.byteLength;
+          const b = whole ? value.buffer : value.slice().buffer;
           port.postMessage({ type: "chunk", data: b }, [b]);
         }
         port.postMessage({ type: "chunk", done: true });
