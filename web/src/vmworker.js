@@ -19,7 +19,7 @@ import { openStore, imageFSCapacity } from "./layers.js";
 import { SHA256 } from "./sha256.js";
 import { initramfs } from "./initramfs.js";
 import { bootKernel } from "./kernelboot.js";
-import { buildID, loadState, saveState, dropState } from "./vmstate.js";
+import { buildID, loadState, saveState, dropState, parseState } from "./vmstate.js";
 import { importJIT } from "./jit.js";
 
 const post = (m, transfer) => self.postMessage(m, transfer || []);
@@ -309,8 +309,22 @@ const fetchBytes = async (url) => new Uint8Array(await (await fetch(url)).arrayB
 // access-log-exporter, start and 50 scrapes).
 const KERNEL_CMDLINE = "console=ttyS0 quiet loglevel=3 tsc=reliable highres=off";
 
+// shippedState fetches the state that the build ships (vmstate.js), or
+// returns null: none, another memory size or another build.
+async function shippedState(m, memory, build) {
+  if (!m.stateURL) return null;
+  try {
+    const res = await fetch(m.stateURL);
+    const s = res.ok ? parseState(await res.arrayBuffer()) : null;
+    return s && s.memory === memory && (!build || s.build === build) ? s : null;
+  } catch {
+    return null;
+  }
+}
+
 // bootVM starts the VM of the pod, without its file system: from a saved
-// state, or by booting the kernel. It resolves once init waits for the pod.
+// state, from the state of the build, or by booting the kernel. It resolves
+// once init waits for the pod.
 async function bootVM(m, memory) {
   const base = {
     wasm_path: m.wasmURL,
@@ -351,27 +365,39 @@ async function bootVM(m, memory) {
     if (id) post({ type: "build", build: id });
     return id;
   };
-  const build = m.build || (await idOf());
-  const state = build && (await loadState(build, memory));
+  // Without the ID, jit.bin or the state of the build names it: a pod then
+  // fetches neither the kernel nor init (4.7 MB) to hash them.
+  let shipped = m.build || m.jit?.build ? null : await shippedState(m, memory, "");
+  const build = m.build || m.jit?.build || shipped?.build || (await idOf());
+  if (!m.build && build) post({ type: "build", build });
+  let state = build && (await loadState(build, memory));
+  if (!state) {
+    shipped ??= await shippedState(m, memory, build);
+    state = shipped?.state;
+  }
   if (state) {
     await ok;
     try {
+      // The state of the build stays compressed: v86 unpacks it at every
+      // restore (~30 ms in Node.js). A spare worker that saved it unpacked
+      // to OPFS made the next pod 50-70 ms slower (headless Chromium).
       await e.restore_state(state);
       // the JIT modules of the kernel that the tab compiled (jit.js)
       importJIT(e, m.jit, build);
       return { emulator: e };
     } catch (err) {
       console.warn("tabernetes: the saved state of the VM does not restore, booting:", err);
-      dropState(build, memory).catch(() => {});
+      if (!shipped) dropState(build, memory).catch(() => {});
       e.destroy();
       e = new V86(base);
       ok = loaded(e);
     }
   }
   // No state: the kernel starts in this VM, which has run nothing yet. The
-  // ID that vm.js knew may be of another kernel by now (a new release).
+  // ID that vm.js knew, or that the state of the build named, may be of
+  // another kernel (a new release, a state that did not restore).
   const [kernel, init] = await fetchFiles();
-  const saveAs = m.build ? await idOf() : build;
+  const saveAs = m.build || shipped ? await idOf() : build;
   emulator = e;
   await ok;
   bootKernel(e.v86.cpu, { kernel, initrd: initramfs(init), cmdline: KERNEL_CMDLINE });

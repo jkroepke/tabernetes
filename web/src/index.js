@@ -23,6 +23,8 @@ const pods = {
     initURL: abs(d.vmInit),
     // optional: the JIT modules of the kernel (web/jit.mjs, vm.js)
     jitURL: abs(d.vmJit),
+    // optional: the state of a booted pod VM (web/jit.mjs, vmstate.js)
+    stateURL: abs(d.vmState),
     registry: d.registry,
   } : undefined,
 };

@@ -1,21 +1,24 @@
 // jit.mjs makes jit.bin, the JIT modules of the kernel of the pods
-// (src/jit.js explains why). It boots the kernel like vmworker.js, starts a
+// (src/jit.js explains why), and vmstate.bin, the state of the booted VM
+// (src/vmstate.js). It boots the kernel like vmworker.js, saves the VM when
+// init waits for the pod, starts a
 // pod with a generic start (a busybox shell: processes, files over 9p,
 // pipes, TCP over loopback) and a low JIT threshold, and exports the most
 // used modules of the kernel code. They fit only this v86 build, kernel and
 // init: the file names their build (vmstate.js), and v86 also checks its own
 // build and the bytes of every page before it installs a module.
 //
-//   node jit.mjs <dir with vmlinux and init> <rootfs.tar of a linux/386 alpine> <out>
+//   node jit.mjs <dir with vmlinux and init> <rootfs.tar of a linux/386 alpine> <jit.bin> <vmstate.bin>
 import fs from "node:fs";
+import zlib from "node:zlib";
 import { V86 } from "v86";
 import { initramfs } from "./src/initramfs.js";
 import { bootKernel } from "./src/kernelboot.js";
 import { Tree, LayerStorage, modes } from "./src/rootfs.js";
-import { buildID } from "./src/vmstate.js";
+import { buildID, packState } from "./src/vmstate.js";
 import { packJIT } from "./src/jit.js";
 
-const [vmDir, rootTar, out] = process.argv.slice(2);
+const [vmDir, rootTar, out, stateOut] = process.argv.slice(2);
 // as in vmworker.js
 const KERNEL_CMDLINE = "console=ttyS0 quiet loglevel=3 tsc=reliable highres=off";
 const MEMORY = 256 << 20;
@@ -98,6 +101,11 @@ bootKernel(e.v86.cpu, {
 });
 e.run();
 await control;
+// init waits for the pod: the state that every pod with this memory size
+// restores (vmworker.js saves the same at this point)
+await e.stop();
+const state = await e.save_state();
+e.run();
 
 // the pod: the image and its config, as vmworker.js builds them
 const buf = new Uint8Array(fs.readFileSync(rootTar));
@@ -126,4 +134,10 @@ const { version } = JSON.parse(fs.readFileSync(new URL(import.meta.resolve("v86/
 const build = await buildID(version, new Uint8Array(fs.readFileSync(`${vmDir}/vmlinux`)), new Uint8Array(fs.readFileSync(`${vmDir}/init`)));
 fs.writeFileSync(out, packJIT(build, blob));
 console.log(`${out}: build ${build}, ${(blob.byteLength / 2 ** 20).toFixed(2)} MiB`);
+if (stateOut) {
+  // zstd: 10.2 -> 2.4 MB (gzip -9: 3.0 MB); restore_state of v86 unpacks it
+  const packed = zlib.zstdCompressSync(new Uint8Array(state), { params: { [zlib.constants.ZSTD_c_compressionLevel]: 19 } });
+  fs.writeFileSync(stateOut, packState(build, MEMORY, packed));
+  console.log(`${stateOut}: ${(state.byteLength / 2 ** 20).toFixed(1)} MiB, zstd ${(packed.byteLength / 2 ** 20).toFixed(1)} MiB`);
+}
 process.exit(0);

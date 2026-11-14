@@ -160,6 +160,20 @@ that name.
   options that cost boot time: legacy PTYs (310 ms), gzip (LZ4 unpacks in
   a third of the time, in-guest zstd is 200 ms slower than LZ4); now the
   kernel ships unpacked (next point).
+- **The build ships the state** (`vmstate.bin`, `web/jit.mjs`, since
+  2026-11-14): the boot of `jit.mjs` saves the 256 MiB VM where init waits
+  for the pod (zstd 10.2 -> 2.4 MB; v86 unpacks zstd itself, ~30 ms more
+  per restore). The page passes it as `data-vm-state` (the shortcode of the
+  blog needs it). A pod without a local state restores it, and the build ID
+  comes from `jit.bin` or this file, so no pod fetches `vmlinux` and `init`
+  (4.7 MB) to hash them anymore. It is the kernel only, the same state that
+  every pod saved and restored before, not a state of an app. Measured in
+  headless Chromium (nginx, `kubectl run` 3 s after the prompt, medians):
+  first pod after a release (layers in OPFS, no state) 1369 -> 1117 ms,
+  start -> `started` 611 -> 262 ms; first pod of a fresh visitor 2259 ->
+  2221 ms (start -> `started` -113 ms; the pull hides the rest); a return
+  visit and later pods unchanged. A spare worker that saved the shipped
+  state unpacked to OPFS made the next pod 50-70 ms slower: not done.
 - **JIT modules of the kernel** (`web/src/jit.js`, `web/jit.mjs`, since
   2026-11-14): every pod restores the same state, so the kernel has the same
   code at the same physical pages in every pod, but each pod starts with an

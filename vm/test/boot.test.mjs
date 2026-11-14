@@ -8,7 +8,8 @@
 //   node --test vm/test
 //
 // TABERNETES_VM sets another directory with vmlinux and init, TABERNETES_JIT
-// another jit.bin (web/jit.mjs; default dist/jit.bin).
+// another jit.bin and TABERNETES_STATE another vmstate.bin (web/jit.mjs;
+// default dist/jit.bin and dist/vmstate.bin).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -17,7 +18,7 @@ import { V86 } from "../../web/node_modules/v86/build/libv86.mjs";
 import { initramfs } from "../../web/src/initramfs.js";
 import { bootKernel } from "../../web/src/kernelboot.js";
 import { Tree, LayerStorage, modes } from "../../web/src/rootfs.js";
-import { buildID } from "../../web/src/vmstate.js";
+import { buildID, parseState } from "../../web/src/vmstate.js";
 import { parseJIT, importJIT } from "../../web/src/jit.js";
 
 const root = new URL("../..", import.meta.url).pathname;
@@ -28,6 +29,7 @@ const missing = files.filter((f) => !fs.existsSync(path.join(dir, f)));
 const skip = missing.length && !process.env.CI ? `no ${missing.join(", ")} in ${dir} (mise run vm)` : false;
 const read = (f) => new Uint8Array(fs.readFileSync(path.join(dir, f)));
 const jitFile = process.env.TABERNETES_JIT || path.join(root, "dist/jit.bin");
+const stateFile = process.env.TABERNETES_STATE || path.join(root, "dist/vmstate.bin");
 
 // The VM of a pod with the size that most pods get.
 const MEMORY = 256 << 20;
@@ -210,6 +212,34 @@ test("the kernel boots, init starts a pod, the saved VM restores", { skip, timeo
     const n = importJIT(r, jit, build);
     t.diagnostic(`installed ${n} of ${jit.modules.length} modules`);
     assert.ok(n > jit.modules.length / 2, `installed ${n} of ${jit.modules.length} modules (build ${jit.build}, this one ${build})`);
+    const control = lines(r, 1);
+    try {
+      await startPod(r, control, t);
+    } finally {
+      await r.destroy();
+    }
+  });
+
+  // like vmworker.js: the first pod of a visitor restores the state that the
+  // build ships, then installs the JIT modules of the same build
+  const stateSkip = !fs.existsSync(stateFile) && !process.env.CI ? `no ${stateFile} (mise run web)` : false;
+  await t.test("a pod starts on the state of the build", { skip: stateSkip }, async (t) => {
+    const buf = fs.readFileSync(stateFile);
+    const shipped = parseState(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+    assert.ok(shipped, "vmstate.bin does not parse");
+    const { version } = JSON.parse(fs.readFileSync(path.join(root, "web/node_modules/v86/package.json"), "utf8"));
+    assert.equal(shipped.build, await buildID(version, kernel, init), "vmstate.bin is of another build");
+    assert.equal(shipped.memory, MEMORY);
+    const r = new V86(options({}));
+    await new Promise((res) => r.add_listener("emulator-loaded", res));
+    const t0 = Date.now();
+    await r.restore_state(shipped.state);
+    t.diagnostic(`restored in ${Date.now() - t0} ms`);
+    if (fs.existsSync(jitFile)) {
+      const j = fs.readFileSync(jitFile);
+      const jit = await parseJIT(j.buffer.slice(j.byteOffset, j.byteOffset + j.byteLength));
+      t.diagnostic(`installed ${importJIT(r, jit, shipped.build)} JIT modules`);
+    }
     const control = lines(r, 1);
     try {
       await startPod(r, control, t);
