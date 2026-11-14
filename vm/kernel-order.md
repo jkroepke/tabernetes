@@ -39,7 +39,7 @@ With the order, the same instructions are on far fewer pages, and a
 function often sits on the page of the function that calls it:
 
 | nginx start, kernel of v1.13.0 | link order | ordered |
-|---|---|---|
+| --- | --- | --- |
 | pages that hold 90 % of the kernel instructions | 96 | 48-50 |
 | pages that hold 99 % | 254 | 134-137 |
 | kernel instructions that run in JIT code (with `jit.bin`) | 52 % | 77 % |
@@ -58,21 +58,21 @@ workloads warm, goapp and glibc only, so nginx shows what a workload that
 was not in the recording gains:
 
 | workload | link order | ordered | |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | nginx, first pod of a process, modules warmed like `jit.js` (12 runs) | 556 ms | 510 ms | -8 % |
 | nginx, later pods (24 runs) | 516 ms | 457 ms | -11 % |
 | nginx without kernel JIT modules (16 runs) | 562 ms | 538 ms | -4 % |
 | glibc text tools (6 runs) | 3442 ms | 3074 ms | -11 % |
 | goapp, a Go binary up and 20 scrapes (15 runs) | 1110 ms | 1059 ms | -5 % |
 | goapp, first pod of a process (8 runs) | 1107 ms | 1105 ms | 0 |
-| cpu, a JIT-bound shell loop with gzip (6 runs) | 3906 ms | 3946 ms | 0 (noise) |
+| CPU workload, a JIT-bound shell loop with gzip (6 runs) | 3906 ms | 3946 ms | 0 (noise) |
 
 Headless Chromium, the same runs in a module worker (v86.wasm compiled by the
 page, a new browser for every run, so the first round is the first pod of a
 tab; image reads synchronous like the OPFS handles of `layers.js`):
 
 | workload | link order | ordered | |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | nginx, first pod (8 runs) | 662 ms | 554 ms | -16 % |
 | nginx, later pods (16) | 444 ms | 408 ms | -8 % |
 | goapp, first pod (12) | 1242 ms | 1215 ms | -2 % (noise) |

@@ -275,7 +275,7 @@ that name.
   functions in C3 order from a v86 profile (`korder.cjs` of pod-bench in
   jkroepke/v86), so they fit on ~50 pages; kernel code in JIT code with
   `jit.bin`: nginx 52 -> 77 %, goapp 37 -> 67 %. Node.js: nginx first pod
-  -8 %, later pods -11 %, glibc -11 %, goapp -5 %, cpu no change;
+  -8 %, later pods -11 %, glibc -11 %, goapp -5 %, the CPU workload no change;
   headless Chromium: nginx first pod 662 -> 554 ms, later 444 -> 408 ms; `jit.bin`
   ~0.9 -> ~1.7 MB. The order belongs to one kernel: after a kernel minor
   upgrade, check it with `kpages.cjs` and renew it (`vm/kernel-order.md`).
