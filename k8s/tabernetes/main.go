@@ -305,6 +305,11 @@ func runControllers() {
 		"--service-cluster-ip-range=" + serviceCIDR,
 		"--leader-elect=false",
 		"--profiling=false",
+		// A pause of 20-40 ms between the starts of the ~40 controllers.
+		// Go in Wasm gives the JavaScript event loop a turn only when no
+		// goroutine can run; without a pause the start was ~2 s of solid
+		// CPU after the prompt, and a kubectl run typed then waited for it.
+		"--controller-start-interval=20ms",
 		"--v=1",
 	})
 }
