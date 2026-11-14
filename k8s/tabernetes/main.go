@@ -283,7 +283,13 @@ func runControllers() {
 		"--cluster-signing-key-file=" + p("ca.key"),
 		"--root-ca-file=" + p("ca.crt"),
 		"--service-account-private-key-file=" + p("sa.key"),
-		"--use-service-account-credentials=true",
+		// All controllers use the client of the controller-manager (the
+		// binding tabernetes:kube-controller-manager in addons/bootstrap.yaml),
+		// not a service account and a token each: ~40 clients, tokens and TLS
+		// connections less while the controllers start, right after the
+		// prompt. Measured in headless Chromium (kubectl run 1.5 s after the
+		// prompt, 14 rounds): run -> start message ~1.4 s -> 0.3-0.8 s.
+		"--use-service-account-credentials=false",
 		// The client of the controller-manager waits to stay under 20
 		// requests per second (burst 30). With a service account and a
 		// token for each of its ~40 controllers, that alone took ~5 s on the
@@ -299,6 +305,11 @@ func runControllers() {
 		"--service-cluster-ip-range=" + serviceCIDR,
 		"--leader-elect=false",
 		"--profiling=false",
+		// A pause of 20-40 ms between the starts of the ~40 controllers.
+		// Go in Wasm gives the JavaScript event loop a turn only when no
+		// goroutine can run; without a pause the start was ~2 s of solid
+		// CPU after the prompt, and a kubectl run typed then waited for it.
+		"--controller-start-interval=20ms",
 		"--v=1",
 	})
 }

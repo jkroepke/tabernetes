@@ -451,7 +451,14 @@ that name.
   and a command typed then waits. `--controller-start-interval=1s` (each
   controller starts 1-2 s after the informers) only moved that window:
   1.5 s after the prompt 1.25 -> 0.28 s, but 3 s after it 0.09 -> 0.80 s.
-  Not kept.
+  Not kept. `--controller-start-interval=20ms` is kept: the controller
+  manager sleeps 20-40 ms between two controllers, Go goes idle and the
+  messages of the tabs get through, and all controllers still run ~1.2 s
+  after the start. Headless Chromium, nginx, fresh profile, 14 alternating
+  rounds, medians, before -> after: first pod (`kubectl run` -> HTTP) at
+  the prompt 3588 -> 3206 ms, 1.5 s after it 2102 -> 1610 ms (run -> start
+  message 789 -> 396 ms), 3 s after it 1538 -> 1574 ms (noise); prompt and
+  later pods unchanged.
 - **Time to the prompt** (2026-11-14): the shared worker is busy all the
   time from the first chunk of the binary to the prompt; nothing waits on
   the network or a timer except the one-second `wait.Poll` of two hooks.
@@ -523,7 +530,20 @@ that name.
   reach Go at once, but kubectl still waits behind the goroutines of the
   controllers (no preemption): run -> start message 1.5 s after the prompt
   1023 -> 1007 ms, at the prompt 2690 -> 2403 ms, the prompt +100-300 ms
-  (5 rounds). Not kept.
+  (5 rounds). Not kept. What paid: the controllers share the client of
+  the controller-manager (`--use-service-account-credentials=false`, the
+  binding `tabernetes:kube-controller-manager` to `cluster-admin` in
+  `addons/bootstrap.yaml`) instead of a service account, a token and a
+  client with its own TLS connection each (~40). Headless Chromium, nginx,
+  first visit, 2 pods, medians, before -> after: `kubectl run` 1.5 s after
+  the prompt, run -> start message 1409 -> 292 ms and 1416 -> 841 ms (6 and
+  8 rounds), first pod 3160 -> 1861 and 2972 -> 2200 ms; at the prompt
+  2792 -> 2092 ms and 2.4 -> 2.2 s (that case is bimodal: sometimes kubectl
+  runs before the controllers start); 3 s after the prompt and the prompt
+  unchanged. `kubectl get sa -n kube-system` no longer lists a service
+  account per controller. Profiles of the worker over CDP overstate the
+  console: with DevTools attached, `console.debug` of each log line looked
+  like ~1 s; without it, no gain from dropping it (6 rounds).
 - **kubectl translations are off** (patch.go): loading them zipped and parsed
   the `.po` files during init (~0.1 s), and the terminal sets no `LANG`.
 - **Persistence rules**: the etcd snapshot is saved only after boot, and a
