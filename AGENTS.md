@@ -366,8 +366,9 @@ that name.
   calling thread in Chromium, ~55 ms for 32 MB) and the OPFS writes all run
   on the thread that reads the stream, so the two large layers of nginx
   shared one thread before (~1.2 s for 64 MB: gunzip ~550 ms, writes
-  ~120 ms, two fsyncs ~170 ms, hashing ~110 ms). The workers start while the
-  manifests come; a manifest that an index chose for linux/386 downloads
+  ~120 ms, two fsyncs ~170 ms, hashing ~110 ms). The workers start once a layer is
+  missing, while the config comes (not for a complete image: `kubectl run`
+  of a `:latest` image asks the registry on every start); a manifest that an index chose for linux/386 downloads
   its layers while the config comes; the VM restores (~60-80 ms of the
   thread) only once the layers download, else the manifest replies waited
   for it. The layers are not flushed (`flush()` is an fsync, ~80 ms per
