@@ -166,8 +166,9 @@ that name.
   empty JIT, and the kernel (55 % of the instructions of an nginx start)
   ran in the interpreter. The web task records a generic busybox start in
   Node.js (Alpine linux/386 from Docker, `JIT_ROOT_IMAGE`) and writes the
-  50 most entered kernel modules to `dist/jit.bin` (1.2 MB, 0.18 MB
-  gzip). The page passes it as `data-vm-jit` (the shortcode of the blog
+  100 most entered kernel modules to `dist/jit.bin` (2.0 MB, 0.3 MB
+  gzip; 50 until the worker of the first pod was made at the prompt, see
+  `web/jit.mjs` for the numbers of 50, 100 and all). The page passes it as `data-vm-jit` (the shortcode of the blog
   needs it); the tab compiles and warms it once at the prompt
   (`prefetchJIT`, `warm` in `jit.js`, see the next point), posts it with
   the start message, and the worker installs it after the restore
