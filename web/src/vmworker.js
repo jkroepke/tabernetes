@@ -218,18 +218,12 @@ async function pullImage(registry, image, policy, on) {
     if (img) return img;
     if (policy === "Never") throw new NeverPullError(`Container image "${image}" is not present with pull policy of Never`);
   }
-  // The layer workers start while the manifests come (~50 ms each).
-  const pool = Array.from({ length: PULL_PARALLEL }, layerWorker);
-  try {
-    return await pullFromRegistry(p, ref, on, pool);
-  } finally {
-    for (const w of pool) w?.terminate();
-  }
+  return pullFromRegistry(p, ref, on);
 }
 
 // pullFromRegistry resolves the reference at the registry and pulls what is
 // missing of the image.
-async function pullFromRegistry(p, ref, on, pool) {
+async function pullFromRegistry(p, ref, on) {
   let { digest, json: m } = await p.manifest(ref.reference, [...INDEX_TYPES, ...MANIFEST_TYPES]);
   const imageID = `${ref.domain}/${ref.repo}@${digest}`;
   let matched = false; // the manifest of linux/386 in an index
@@ -243,7 +237,7 @@ async function pullFromRegistry(p, ref, on, pool) {
   } else {
     throw new PullError(`failed to pull and unpack image "${ref.name}": unsupported manifest`);
   }
-  const img = await unpackImage(p, ref, imageID, m, { ...on, matched, pool });
+  const img = await unpackImage(p, ref, imageID, m, { ...on, matched });
   await p.remember(imageID, m);
   return img;
 }
@@ -253,16 +247,20 @@ const presentImage = (p, ref, imageID, m) => unpackImage(p, ref, imageID, m);
 
 // unpackImage fetches and unpacks what is missing of the image with the
 // manifest m. Without on.fetching, it returns null if something is missing.
-// matched tells that an index chose m for linux/386, pool holds the layer
-// workers.
-async function unpackImage(p, ref, imageID, m, { fetching, layers: onLayers, matched = false, pool = null } = {}) {
+// matched tells that an index chose m for linux/386.
+async function unpackImage(p, ref, imageID, m, { fetching, layers: onLayers, matched = false } = {}) {
   const size = m.layers.reduce((n, l) => n + (l.size || 0), 0) + (m.config.size || 0);
   await Promise.all(m.layers.map((l) => store.use(l.digest)));
   const indexes = await Promise.all(m.layers.map((l) => store.index(l.digest)));
   const present = (await p.cached(m.config.digest)) && indexes.every(Boolean);
+  // The layer workers start while the config comes (~50 ms each). Not
+  // for an image that is present: kubectl run of a :latest image asks the
+  // registry on every start, and the workers would only cost CPU.
+  let pool = null;
   if (!present) {
     if (!fetching) return null;
     fetching();
+    pool = Array.from({ length: Math.min(PULL_PARALLEL, indexes.filter((x) => !x).length) }, layerWorker);
   }
   const config = p.blob(m.config.digest).then((b) => {
     const c = JSON.parse(new TextDecoder().decode(b));
@@ -278,7 +276,8 @@ async function unpackImage(p, ref, imageID, m, { fetching, layers: onLayers, mat
   if (!matched) await config;
   const missing = m.layers.map((l, i) => i).filter((i) => !indexes[i]);
   const n = Math.min(PULL_PARALLEL, missing.length);
-  const workers = pool ? pool.slice(0, n) : Array.from({ length: n }, layerWorker);
+  const workers = pool ? pool.slice(0, n) : [];
+  for (const w of pool?.slice(n) ?? []) w?.terminate();
   // Up to PULL_PARALLEL layers download and unpack at once, as containerd
   // does (max_concurrent_downloads = 3). It saves the round trips and the
   // time the mirror needs to fetch a blob from Docker Hub. The order of the
