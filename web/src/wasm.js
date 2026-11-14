@@ -67,6 +67,9 @@ export async function instantiate(stream, go) {
   }
   const [sec] = WebAssembly.Module.customSections(result.module, "tabernetes.snapshot");
   if (sec) go.snapshot = JSON.parse(new TextDecoder().decode(sec));
+  // The cluster that a first visit starts from (k8s/tabernetes/seed.go).
+  const [seed] = WebAssembly.Module.customSections(result.module, "tabernetes.seed");
+  if (seed) globalThis.tabernetesSeed = new Uint8Array(seed);
   return result.instance;
 }
 

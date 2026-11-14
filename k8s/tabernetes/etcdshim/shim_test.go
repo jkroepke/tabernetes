@@ -142,6 +142,17 @@ func TestSnapshot(t *testing.T) {
 	if err := r.restore([]byte("tbs1\x05")); err == nil {
 		t.Fatal("a cut snapshot restored")
 	}
+	w, err := Without(s.snapshot(), "/c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r = newStore()
+	if err := r.restore(w); err != nil {
+		t.Fatal(err)
+	}
+	if r.current("/c") != nil || r.current("/a") == nil || r.rev != s.rev {
+		t.Fatalf("Without: /c %v, /a %v, rev %d", r.current("/c"), r.current("/a"), r.rev)
+	}
 }
 
 func TestSaveLoop(t *testing.T) {

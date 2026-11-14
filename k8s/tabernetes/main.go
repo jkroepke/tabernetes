@@ -97,6 +97,15 @@ func boot() (*cluster, error) {
 	} else {
 		c = newCluster()
 	}
+	// A first visit starts from the cluster that the build booted
+	// (seed.go): its objects without its PKI.
+	seed := (*savedState)(nil)
+	if st == nil {
+		seed = loadSeed()
+	} else {
+		js.Global().Delete("tabernetesSeed")
+	}
+	makeSeed := js.Global().Get("tabernetesMakeSeed")
 	cfg, err := os.ReadFile(p("admin.kubeconfig"))
 	must(err)
 	must(os.MkdirAll("/root/.kube", 0o755))
@@ -115,8 +124,14 @@ func boot() (*cluster, error) {
 		Ready:    booted,
 		Volatile: []string{"/registry/leases/", "/registry/masterleases/", "/registry/peerserverleases/"},
 	}
-	if st != nil {
+	switch {
+	case st != nil:
 		opts.Snapshot = st.Etcd
+	case seed != nil:
+		opts.Snapshot = seed.Etcd
+	}
+	if makeSeed.Type() == js.TypeFunction {
+		opts.Save = seedSaver(makeSeed)
 	}
 	go func() { must(etcdshim.ServeWith(l, opts)) }()
 
@@ -139,6 +154,8 @@ func boot() (*cluster, error) {
 	// A restored cluster has its addons, maybe changed by the user. It gets
 	// them again only when this build brings other ones.
 	switch {
+	case st == nil && seed != nil:
+		// the seed has them
 	case st == nil:
 		status("installing addons")
 		if err := installAddons(context.Background(), false); err != nil {
@@ -157,6 +174,11 @@ func boot() (*cluster, error) {
 	// ~1.5 s, and Go in Wasm has no preemption. First the tab that waits
 	// for the cluster opens its session and shows the prompt (~0.8 s sooner
 	// on the first visit than when they shared the CPU with the addons).
+	if makeSeed.Type() == js.TypeFunction {
+		// The seed is the cluster before the controllers ran.
+		close(booted)
+		return c, nil
+	}
 	startControllers(250 * time.Millisecond)
 	close(booted)
 	status("ready")
