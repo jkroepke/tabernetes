@@ -21,6 +21,9 @@ WORKDIR /src
 COPY kernel.config /kernel.config
 # Small changes to the kernel for pods; the head of each file says why.
 COPY kernel-patches/ /kernel-patches/
+# The hot kernel functions of pods first, those that call each other on the
+# same page (kernel-patches/kernel-order.patch says why).
+COPY kernel-order.txt /kernel-order.txt
 ENV ARCH=i386 LLVM=1
 RUN set -eux; \
     for p in /kernel-patches/*.patch; do patch -p1 --forward < "$p"; done; \
@@ -32,7 +35,18 @@ RUN set -eux; \
     done; \
     # SLUB_TINY must be off; the loop above checks only options that are on.
     ! grep -q "^CONFIG_SLUB_TINY=y" .config || { echo "kernel.config: CONFIG_SLUB_TINY is still on" >&2; exit 1; }; \
-    make -s -j"$(nproc)" vmlinux; \
+    make -s -j"$(nproc)" vmlinux KERNEL_ORDER=/kernel-order.txt; \
+    first="$(head -n 1 /kernel-order.txt)"; \
+    addr="$(awk -v s="$first" '$3 == s { print $1; exit }' System.map)"; \
+    stext="$(awk '$3 == "_stext" { print $1 }' System.map)"; \
+    [ -n "$addr" ] && [ $((0x$addr - 0x$stext)) -lt 65536 ] \
+      || { echo "kernel-order.txt: $first is not at the start of .text" >&2; exit 1; }; \
+    # A stale order (renamed functions after a kernel upgrade) only makes
+    # pods slower; below 90 % of the names, make a new one (kernel-order.md).
+    found="$(awk 'NR == FNR { want[$1] = 1; n++; next } ($3 in want) && !seen[$3]++ { m++ } END { printf "%d %d", m, n }' /kernel-order.txt System.map)"; \
+    echo "kernel-order.txt: ${found% *} of ${found#* } functions found"; \
+    [ $(( ${found% *} * 100 )) -ge $(( ${found#* } * 90 )) ] \
+      || { echo "kernel-order.txt is stale for this kernel, see vm/kernel-order.md" >&2; exit 1; }; \
     mkdir /out; \
     # The kernel unpacked: a bzImage unpacks itself on the emulated CPU,
     # which took longer than the BIOS. Without symbols it has 5.6 MB, 2 MB

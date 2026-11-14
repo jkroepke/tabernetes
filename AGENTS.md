@@ -304,6 +304,19 @@ that name.
   kernel; first pod in a fresh process (pod-bench, main thread CPU, 16
   alternating runs): nginx -9.1 %, goapp -6.2 %; with the kernel JIT
   modules (14 runs) nginx -15.6 %, goapp -3.0 %.
+- **Kernel functions in the order of a pod** (2026-11-14,
+  `vm/kernel-order.txt`, details in `vm/kernel-order.md`): the JIT of v86
+  works per page of 4 KiB, and in link order 90 % of the kernel
+  instructions of a pod start were on ~100 pages. lld now places the
+  functions in C3 order from a v86 profile (`korder.cjs` of pod-bench in
+  jkroepke/v86), so they fit on ~50 pages; kernel code in JIT code with
+  `jit.bin`: nginx 52 -> 77 %, goapp 37 -> 67 %. Node.js: nginx first pod
+  -8 %, later pods -11 %, glibc -11 %, goapp -5 %, the CPU workload no change;
+  headless Chromium: nginx first pod 662 -> 554 ms, later 444 -> 408 ms; `jit.bin`
+  ~0.9 -> ~1.7 MB. The order belongs to one kernel: after a kernel minor
+  upgrade, check it with `kpages.cjs` and renew it (`vm/kernel-order.md`).
+  The build fails when it is not applied or when less than 90 % of its
+  names exist.
 - **Where the instructions go now** (Node.js profile, 256 MiB): boot to
   `ready` is memory init (~19 %, grows with the RAM), alternatives
   patching (~9 %), sysfs, kobjects and uevents (~15 %), printk into the log

@@ -1,0 +1,31 @@
+kbuild: a function order for vmlinux, as a list of symbols for lld
+
+make KERNEL_ORDER=<file> passes the file to ld.lld as
+--symbol-ordering-file. With full LTO, lld puts every function in its own
+section, so the listed functions come first in .text, in this order;
+names that the kernel does not have are skipped without a warning.
+
+v86 compiles guest code per page of 4 KiB: a page gets a JIT module once
+it ran enough instructions, and a module ends at every jump into another
+page. In the normal link order, 90 % of the kernel instructions of a pod
+start are spread over ~100-130 pages; vm/kernel-order.txt (made with
+korder.cjs of tools/pod-bench in jkroepke/v86) puts the hot functions that
+call each other on the same pages. vm/kernel-order.md explains it, and how
+to check and renew the order after a kernel upgrade.
+
+diff --git a/Makefile b/Makefile
+index 05c5b682a..bad57f2ef 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1262,6 +1262,11 @@ ifdef CONFIG_LD_ORPHAN_WARN
+ LDFLAGS_vmlinux += --orphan-handling=$(CONFIG_LD_ORPHAN_WARN_LEVEL)
+ endif
+ 
++# The order of the functions in .text: make KERNEL_ORDER=<file> (lld)
++ifdef KERNEL_ORDER
++LDFLAGS_vmlinux += --symbol-ordering-file=$(KERNEL_ORDER) --no-warn-symbol-ordering
++endif
++
+ ifneq ($(CONFIG_ARCH_VMLINUX_NEEDS_RELOCS),)
+ LDFLAGS_vmlinux	+= --emit-relocs --discard-none
+ endif
