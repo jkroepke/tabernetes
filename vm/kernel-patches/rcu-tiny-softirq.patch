@@ -1,0 +1,57 @@
+rcu: tiny RCU runs its callbacks without waking ksoftirqd
+
+Tiny RCU (the RCU of a kernel without SMP) notes a quiescent state in
+every context switch and, when callbacks wait, raises RCU_SOFTIRQ. A
+softirq raised in task context wakes ksoftirqd, so a context switch made
+two more. A pod start frees much with RCU (files, maple tree nodes, 9p
+request ids, processes): during the nginx start ksoftirqd ran ~475 times,
+about two thirds of all context switches.
+
+The softirq is now only marked as pending. It runs at the next interrupt
+exit or local_bh_enable(), at the latest at the next tick (10 ms), and the
+idle loop runs it before the CPU sleeps, so no callback waits for long and
+NO_HZ does not report pending softirq work.
+
+Measured with tools/pod-bench (jkroepke/v86), the first pod of a fresh
+process, 12 alternating runs: nginx 46.8M -> 45.3M guest instructions,
+CPU time of the main thread -3.4 %.
+
+diff --git a/kernel/rcu/tiny.c b/kernel/rcu/tiny.c
+index dccccd6be..e94a01a43 100644
+--- a/kernel/rcu/tiny.c
++++ b/kernel/rcu/tiny.c
+@@ -56,7 +56,15 @@ void rcu_qs(void)
+ 	local_irq_save(flags);
+ 	if (rcu_ctrlblk.donetail != rcu_ctrlblk.curtail) {
+ 		rcu_ctrlblk.donetail = rcu_ctrlblk.curtail;
+-		raise_softirq_irqoff(RCU_SOFTIRQ);
++		/*
++		 * Only mark the softirq as pending: the context switch
++		 * that calls this would otherwise wake ksoftirqd, which
++		 * costs two more context switches. The callbacks run at
++		 * the next interrupt exit or local_bh_enable(), at the
++		 * latest at the next tick, or in do_idle() when the CPU
++		 * has nothing else to do.
++		 */
++		__raise_softirq_irqoff(RCU_SOFTIRQ);
+ 	}
+ 	WRITE_ONCE(rcu_ctrlblk.gp_seq, rcu_ctrlblk.gp_seq + 2);
+ 	local_irq_restore(flags);
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index eb73b65ce..95b23df63 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -293,6 +293,13 @@ static void do_idle(void)
+ 	 */
+ 	nohz_run_idle_balance(cpu);
+ 
++	/*
++	 * Tiny RCU marks its softirq as pending in a context switch
++	 * without waking ksoftirqd. Run it before the CPU sleeps.
++	 */
++	if (IS_ENABLED(CONFIG_TINY_RCU) && local_softirq_pending())
++		do_softirq();
++
+ 	/*
+ 	 * If the arch has a polling bit, we maintain an invariant:
+ 	 *

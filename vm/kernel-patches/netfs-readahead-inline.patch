@@ -1,0 +1,128 @@
+netfs: collect and free a readahead request in the caller
+
+netfs hands the collection of every readahead request to a work item, and
+frees every request in another one. On a pod, 9p over virtio answers a
+read while it is sent: the reads are done when netfs_readahead() returns,
+yet the reader then waited for a kworker to unlock the folios, and a
+second kworker freed the request. That was ~190 kworker runs (and two
+context switches each) during the nginx start.
+
+netfs_readahead() now collects the result itself when all its reads have
+completed, and frees the request at once. Reads that are still in flight
+(another transport, a cache) keep the work item: the flag that offloads
+the collection is set after the reads are issued, and the work item is
+queued then for the reads that completed in between.
+
+Measured with tools/pod-bench (jkroepke/v86), the first pod of a fresh
+process, alternating runs, together with rcu-tiny-softirq.patch (16 runs):
+nginx 46.8M -> 43.9M guest instructions (kernel -11.6 %), CPU time of the
+main thread -9.1 %; goapp (a static Go binary) 88.6M -> 86.5M, -6.2 %.
+With the kernel JIT modules (14 runs): nginx -15.6 %, goapp -3.0 %.
+
+diff --git a/fs/netfs/buffered_read.c b/fs/netfs/buffered_read.c
+index e6506942a..5f0fbb9a8 100644
+--- a/fs/netfs/buffered_read.c
++++ b/fs/netfs/buffered_read.c
+@@ -387,6 +387,31 @@ static void netfs_read_to_pagecache(struct netfs_io_request *rreq)
+ 	cmpxchg(&rreq->error, 0, ret);
+ }
+ 
++/*
++ * Collect the results of a readahead request in the caller when its reads
++ * completed while they were issued (9p over virtio answers at once on a VM),
++ * and hand the collection to a work item only for reads that are still in
++ * flight. A work item costs a wakeup and two context switches per request,
++ * and the reader waits for the folio locks that the collection releases.
++ */
++static bool netfs_readahead_collect(struct netfs_io_request *rreq)
++{
++	if (netfs_check_rreq_in_progress(rreq) && netfs_read_collection(rreq)) {
++		/* Drop the ref from the NETFS_RREQ_IN_PROGRESS flag. */
++		netfs_put_request(rreq, netfs_rreq_trace_put_work_ip);
++		return true;
++	}
++
++	/* Reads that complete from now on queue the work item.  Queue it
++	 * here too for those that completed before the flag was set.
++	 */
++	set_bit(NETFS_RREQ_OFFLOAD_COLLECTION, &rreq->flags);
++	smp_mb__after_atomic();
++	if (netfs_check_rreq_in_progress(rreq))
++		netfs_wake_collector(rreq);
++	return false;
++}
++
+ /**
+  * netfs_readahead - Helper to manage a read request
+  * @ractl: The description of the readahead request
+@@ -407,6 +432,7 @@ void netfs_readahead(struct readahead_control *ractl)
+ 	struct netfs_io_request *rreq;
+ 	struct netfs_inode *ictx = netfs_inode(ractl->mapping->host);
+ 	ssize_t added;
++	bool collected;
+ 	uoff_t start = readahead_pos(ractl);
+ 	size_t size = readahead_length(ractl);
+ 	int ret;
+@@ -416,7 +442,9 @@ void netfs_readahead(struct readahead_control *ractl)
+ 	if (IS_ERR(rreq))
+ 		return;
+ 
+-	__set_bit(NETFS_RREQ_OFFLOAD_COLLECTION, &rreq->flags);
++	/* The collection is offloaded only after the reads are issued, see
++	 * netfs_readahead_collect().
++	 */
+ 
+ 	ret = netfs_begin_cache_read(rreq, ictx);
+ 	if (ret == -ENOMEM || ret == -EINTR || ret == -ERESTARTSYS)
+@@ -445,7 +473,11 @@ void netfs_readahead(struct readahead_control *ractl)
+ 	netfs_read_set_unlock_at(rreq);
+ 
+ 	netfs_read_to_pagecache(rreq);
++	collected = netfs_readahead_collect(rreq);
+ 	netfs_maybe_bulk_drop_ra_refs(rreq);
++	if (collected)
++		/* No work item ever ran: free the request here. */
++		return netfs_put_request_sync(rreq, netfs_rreq_trace_put_return);
+ 	return netfs_put_request(rreq, netfs_rreq_trace_put_return);
+ 
+ cleanup_free:
+diff --git a/fs/netfs/internal.h b/fs/netfs/internal.h
+index 786af76da..1fdae23e4 100644
+--- a/fs/netfs/internal.h
++++ b/fs/netfs/internal.h
+@@ -94,6 +94,7 @@ void netfs_get_request(struct netfs_io_request *rreq, enum netfs_rreq_ref_trace
+ void netfs_clear_subrequests(struct netfs_io_request *rreq);
+ void netfs_put_request(struct netfs_io_request *rreq, enum netfs_rreq_ref_trace what);
+ void netfs_put_failed_request(struct netfs_io_request *rreq);
++void netfs_put_request_sync(struct netfs_io_request *rreq, enum netfs_rreq_ref_trace what);
+ struct netfs_io_subrequest *netfs_alloc_subrequest(struct netfs_io_request *rreq);
+ 
+ static inline void netfs_see_request(struct netfs_io_request *rreq,
+diff --git a/fs/netfs/objects.c b/fs/netfs/objects.c
+index ad549daa9..502aed9d3 100644
+--- a/fs/netfs/objects.c
++++ b/fs/netfs/objects.c
+@@ -186,6 +186,23 @@ void netfs_put_request(struct netfs_io_request *rreq, enum netfs_rreq_ref_trace
+ 	}
+ }
+ 
++/*
++ * Drop a ref and free the request at once if it was the last one, instead
++ * of in a work item (a wakeup and two context switches).  Only for a caller
++ * that may sleep and whose request never queued its collection work item.
++ */
++void netfs_put_request_sync(struct netfs_io_request *rreq, enum netfs_rreq_ref_trace what)
++{
++	unsigned int debug_id = rreq->debug_id;
++	bool dead;
++	int r;
++
++	dead = __refcount_dec_and_test(&rreq->ref, &r);
++	trace_netfs_rreq_ref(debug_id, r - 1, what);
++	if (dead)
++		netfs_free_request(&rreq->cleanup_work);
++}
++
+ /*
+  * Free a request (synchronously) that was just allocated but has
+  * failed before it could be submitted.

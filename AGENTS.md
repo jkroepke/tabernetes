@@ -254,6 +254,20 @@ that name.
   2.35 -> 0.94 million instructions, ~100 -> ~40 ms; nginx from `go` to
   HTTP ~2.2 -> ~1.95 s (3 x 4 rounds); boot to `ready` 11.1 -> 11.4
   million instructions (once per memory size); state 7.6 -> 8.4 MiB.
+- **Fewer context switches** (2026-11-14, `vm/kernel-patches`): the
+  scheduler was ~12 % of the kernel instructions of the nginx start, for
+  ~1400 context switches on one CPU. Two thirds were ksoftirqd: tiny RCU
+  raises its softirq in every context switch while callbacks wait, and a
+  softirq raised in task context wakes ksoftirqd (`rcu-tiny-softirq.patch`
+  only marks it pending; the idle loop runs it before the CPU sleeps). The
+  rest were kworkers of netfs: every readahead request was collected and
+  freed in work items, although 9p has answered when the reads return
+  (`netfs-readahead-inline.patch` does both in the caller). Count them with
+  `ctxt` of `/proc/stat` and `voluntary_ctxt_switches` of each task. nginx
+  start 46.8M -> 43.9M instructions, scheduler 12 % -> 2.5 % of the
+  kernel; first pod in a fresh process (pod-bench, main thread CPU, 16
+  alternating runs): nginx -9.1 %, goapp -6.2 %; with the kernel JIT
+  modules (14 runs) nginx -15.6 %, goapp -3.0 %.
 - **Where the instructions go now** (Node.js profile, 256 MiB): boot to
   `ready` is memory init (~19 %, grows with the RAM), alternatives
   patching (~9 %), sysfs, kobjects and uevents (~15 %), printk into the log
