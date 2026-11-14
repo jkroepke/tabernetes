@@ -360,9 +360,33 @@ that name.
   the workers of their pods and close their WebRTC connections, so Docker
   nodes end too. Without a SharedWorker, poweroff and reboot reload the page.
 - **Image pulls** download and unpack up to 3 layers at once, like
-  containerd's `max_concurrent_downloads`. On a fast link the browser is
-  CPU bound (gunzip, SHA-256, OPFS) and gains little; it saves round trips
-  through the mirror.
+  containerd's `max_concurrent_downloads`, each in a layer worker: a worker
+  of the worker of the pod (`layerWorker` in `vmworker.js`, the same
+  script). `DecompressionStream`, `crypto.subtle.digest` (it blocks the
+  calling thread in Chromium, ~55 ms for 32 MB) and the OPFS writes all run
+  on the thread that reads the stream, so the two large layers of nginx
+  shared one thread before (~1.2 s for 64 MB: gunzip ~550 ms, writes
+  ~120 ms, two fsyncs ~170 ms, hashing ~110 ms). The workers start while the
+  manifests come; a manifest that an index chose for linux/386 downloads
+  its layers while the config comes; the VM restores (~60-80 ms of the
+  thread) only once the layers download, else the manifest replies waited
+  for it. The layers are not flushed (`flush()` is an fsync, ~80 ms per
+  83 MB); `index()` checks the size of the tar instead. Without nested
+  workers or without OPFS the layers unpack in the worker of the pod as
+  before. Measured 2026-11-14 in headless Chromium (nginx, fresh profile,
+  `kubectl run` 3 s after the prompt, 8 alternating rounds, medians), start
+  -> `started` of the first pod, layers from local disk (CPU bound):
+  workers 1335 -> 1054 ms, no flush -> 921 ms (first pod 2051 -> 1896 ->
+  1698 ms); early workers, layers before the config and the later restore
+  895 -> 861 ms (noise level). With 40 ms per request and a shared 50 MB/s
+  link: 2001 -> 1835 (workers, no flush) -> 1781 ms (all), first pod
+  2770 -> 2466 ms. Later pods unchanged. Per large layer a worker is still ~550 ms busy: gunzip
+  ~310 ms, OPFS writes ~85 ms, reads and copies ~65 ms; the tar index is
+  ~5 ms. Tried without gain: reading the blob as fast as it comes and
+  hashing it in the worker of the pod while the layer worker unpacks (start
+  -> `started` +40-80 ms, more threads at once on 4 cores); a faster tar
+  parser (not needed). A separate writer thread per layer could save
+  ~150 ms more, but only on links over ~900 Mbit/s.
 - **kubectl translations are off** (patch.go): loading them zipped and parsed
   the `.po` files during init (~0.1 s), and the terminal sets no `LANG`.
 - **Persistence rules**: the etcd snapshot is saved only after boot, and a
