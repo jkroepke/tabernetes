@@ -136,8 +136,6 @@ func boot() (*cluster, error) {
 		}
 	}
 
-	startControllers()
-
 	// A restored cluster has its addons, maybe changed by the user. It gets
 	// them again only when this build brings other ones.
 	switch {
@@ -154,6 +152,12 @@ func boot() (*cluster, error) {
 			status("the addons are not up to date: " + err.Error())
 		}
 	}
+	// The controllers start after the addons, which need none of them, and
+	// a moment after the cluster is ready: their start takes the CPU for
+	// ~1.5 s, and Go in Wasm has no preemption. First the tab that waits
+	// for the cluster opens its session and shows the prompt (~0.8 s sooner
+	// on the first visit than when they shared the CPU with the addons).
+	startControllers(250 * time.Millisecond)
 	close(booted)
 	status("ready")
 	current = c
@@ -228,8 +232,16 @@ func apiserverArgs() []string {
 	}
 }
 
-func startControllers() {
+// startControllers starts kube-controller-manager and kube-scheduler after
+// a delay. The status lines come at once: later ones would end up below the
+// prompt.
+func startControllers(after time.Duration) {
 	status("starting kube-controller-manager")
+	status("starting kube-scheduler")
+	time.AfterFunc(after, runControllers)
+}
+
+func runControllers() {
 	run("kube-controller-manager", cmapp.NewControllerManagerCommand(), []string{
 		"--kubeconfig=" + p("controller-manager.kubeconfig"),
 		"--authentication-kubeconfig=" + p("controller-manager.kubeconfig"),
@@ -242,6 +254,15 @@ func startControllers() {
 		"--root-ca-file=" + p("ca.crt"),
 		"--service-account-private-key-file=" + p("sa.key"),
 		"--use-service-account-credentials=true",
+		// The client of the controller-manager waits to stay under 20
+		// requests per second (burst 30). With a service account and a
+		// token for each of its ~40 controllers, that alone took ~5 s on the
+		// first visit, idle time in which no controller ran: no pod CIDR
+		// for the node, no default service account, the not-ready taint.
+		// kubectl run failed or waited. All of it runs in this process,
+		// there is nothing to protect.
+		"--kube-api-qps=1000",
+		"--kube-api-burst=1000",
 		"--controllers=*,bootstrapsigner,tokencleaner",
 		"--allocate-node-cidrs=true",
 		"--cluster-cidr=" + clusterCIDR,
@@ -251,7 +272,6 @@ func startControllers() {
 		"--v=1",
 	})
 
-	status("starting kube-scheduler")
 	run("kube-scheduler", schedapp.NewSchedulerCommand(), []string{
 		"--kubeconfig=" + p("scheduler.kubeconfig"),
 		"--authentication-kubeconfig=" + p("scheduler.kubeconfig"),
