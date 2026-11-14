@@ -67,7 +67,10 @@ func installAddons(ctx context.Context, update bool) error {
 			return err
 		}
 	}
-	args, tries := []string{"apply", "--server-side", "-f", dir}, 10
+	// --validate=false: kubectl validated the manifests against the
+	// OpenAPI v3 specs of the apiserver, which it built for that alone
+	// (~0.6 s). They are ours and known to be valid.
+	args, tries := []string{"apply", "--server-side", "--validate=false", "-f", dir}, 10
 	if update {
 		args, tries = append(args, "--force-conflicts"), 3
 	}
