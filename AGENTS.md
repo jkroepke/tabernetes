@@ -491,6 +491,39 @@ that name.
   Not tried: a code cache of the compiled Wasm (needs the unpacked
   binary in Cache Storage, ~300 MB), shorter `/readyz` polling (each
   poll costs a request of the apiserver).
+- **A first visit starts from a seed** (`k8s/tabernetes/seed.go`, since
+  2026-11-14): the build (`k8s/snapshot.mjs`, after the heap snapshot)
+  lets the binary go on in Node.js and boot the control plane (~5 s), and
+  keeps the etcd data right after the addons, before the controllers ran,
+  as the custom section `tabernetes.seed` of the binary (~165 KiB).
+  `wasm.js` hands it to Go as `globalThis.tabernetesSeed`; a visit without
+  a saved cluster starts etcd from it, like a return visit, and skips the
+  addons. It holds the bootstrap objects of kube-apiserver (RBAC,
+  priority classes, flow control, namespaces, the kubernetes Service) and
+  the addons, nothing of a visitor and no app. The PKI, tokens and
+  kubeconfigs are not in it: every cluster makes its own. The ConfigMap
+  `extension-apiserver-authentication` is left out (`etcdshim.Without`):
+  kube-apiserver adds its CAs to the ones that are there, so the CA of the
+  build would stay trusted. The objects keep the time of the build as
+  their creation time (`kubectl get ns` shows the age of the release).
+  The seed must come from the same build (version and addons), else Go
+  ignores it and boots as before. Measured in headless Chromium (nginx,
+  `kubectl run` 3 s after the prompt, 2 pods, 8 alternating rounds,
+  medians): prompt of a first visit 5925 -> 4338 ms (a return visit:
+  4567 ms); first pod 1469 -> 1526 ms, later pods 594 -> 645 ms; return
+  visits unchanged. The pods are a bit slower because the command comes
+  sooner after the start of the controller-manager (next point).
+- **The controller-manager after the prompt**: the shared worker is busy
+  for ~3 s after the prompt while the controllers start (CPU profile of the
+  worker, 1 s buckets), and a command typed then waits for it. Go in Wasm
+  returns to the event loop only when no goroutine can run. Tried
+  (2026-11-14): a patched runtime (`go build -overlay`) that hands control
+  back to JavaScript every 20 ms while goroutines still run (a pause with
+  a timeout of 0 ms through a MessageChannel). The messages of the tab then
+  reach Go at once, but kubectl still waits behind the goroutines of the
+  controllers (no preemption): run -> start message 1.5 s after the prompt
+  1023 -> 1007 ms, at the prompt 2690 -> 2403 ms, the prompt +100-300 ms
+  (5 rounds). Not kept.
 - **kubectl translations are off** (patch.go): loading them zipped and parsed
   the `.po` files during init (~0.1 s), and the terminal sets no `LANG`.
 - **Persistence rules**: the etcd snapshot is saved only after boot, and a
