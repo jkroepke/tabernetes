@@ -14,7 +14,7 @@
 // through a MessagePort that the tab relays. vm.js and gpu.js run in the
 // shared worker unchanged, with spawn in place of new Worker.
 
-import { vmAPI, postStart } from "./vm.js";
+import { vmAPI, postStart, takeWorker } from "./vm.js";
 import { gpuAPI } from "./gpu.js";
 
 // ---- the shared worker ----
@@ -63,7 +63,6 @@ export async function serveTab(port, cfg) {
         session.shell(d.src, (s) => port.postMessage({ t: "out", s }), builtins).then((v) => ret(d.seq, v), (e) => fail(d.seq, e));
         break;
       }
-      case "prepare": host.vm?.prepare?.(d.x); break;
       case "biw": builtinCalls.get(d.id)?.write(d.s); break;
       case "bir": {
         const c = builtinCalls.get(d.id);
@@ -165,7 +164,6 @@ export function tabSession(port, { status }) {
         port.postMessage({ t: "shell", seq, src, names: Object.keys(fns) });
       });
     },
-    prepare(x) { port.postMessage({ t: "prepare", x }); },
     incomplete: method("incomplete"),
     commands: method("commands"),
     key: method("key"),
@@ -209,8 +207,10 @@ function gpuAdapter() {
 // relay starts a worker for the shared worker and passes the messages on.
 // workers holds it while it runs.
 function relay(url, p, workers) {
-  const w = new Worker(url);
+  // the worker that the tab made at the prompt, for its first pod (vm.js)
+  const { worker: w, build } = takeWorker(url);
   workers.add(w);
+  if (build) p.postMessage({ m: { type: "build", build } });
   w.onmessage = ({ data }) => p.postMessage({ m: data }, buffers(data));
   w.onerror = (e) => { e.preventDefault(); p.postMessage({ error: e.message || "the worker failed" }); };
   // The start message of a pod gets the Module of v86.wasm of this tab

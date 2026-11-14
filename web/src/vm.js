@@ -68,6 +68,40 @@ export async function postStart(worker, m, transfer = []) {
   }
 }
 
+// The first pod of a tab gets a worker that is made at the prompt
+// (prepareWorker): its VM is restored (or booted) by then, like the VM of the
+// spare worker of later pods, and it has warmed the emulator (vmworker.js
+// "warm" with exercise). The tab makes it itself, also when the kubelet runs
+// in the shared worker: that one is busy for seconds after the prompt, and a
+// message to it and back made the worker 1-3 s late. takeWorker hands it to
+// the first pod: to vmAPI in this tab, or to relay (bridge.js) when the
+// shared worker asks for a worker.
+let prepared = null; // {url, worker, build}
+export function prepareWorker({ version, workerURL, wasmURL, kernelURL, initURL, jitURL }) {
+  if (prepared) return;
+  try {
+    const url = new URL(workerURL, location.href).href;
+    const worker = new Worker(url);
+    const p = (prepared = { url, worker, build: "" });
+    worker.onmessage = ({ data: m }) => { if (m.type === "build") p.build = m.build; };
+    worker.onerror = (e) => { e.preventDefault(); if (prepared === p) prepared = null; };
+    postStart(worker, { type: "warm", exercise: true, version, build: "", wasmURL, kernelURL, initURL, jitURL });
+  } catch {
+    // no worker: the pod makes its own
+  }
+}
+
+// takeWorker returns the prepared worker of url ({worker, build}; build is
+// the ID that it reported, or ""), or a new worker.
+export function takeWorker(url) {
+  const p = prepared;
+  if (!p || p.url !== url) return { worker: new Worker(url), build: "" };
+  prepared = null;
+  p.worker.onmessage = null;
+  p.worker.onerror = null;
+  return p;
+}
+
 // spawn starts the worker. In the shared worker it is a worker of the tab
 // (bridge.js), since a shared worker cannot start workers.
 export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL, registry, spawn }) {
@@ -76,17 +110,22 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
   // the worker of a pod computed it. Later pods look for a state with it
   // first and need not fetch and hash the kernel.
   let build = "";
-  const newWorker = () => (spawn ? spawn(abs(workerURL)) : new Worker(abs(workerURL)));
+  const newWorker = () => {
+    if (spawn) return spawn(abs(workerURL));
+    const p = takeWorker(abs(workerURL));
+    build ||= p.build;
+    return p.worker;
+  };
   // A spare worker boots the VM of the next pod ahead of time (vmworker.js
   // "warm"): it is made 2 s after a pod of this tab has started, and the
   // next pod takes it. That saves the start of the worker and the restore
   // of the VM state.
   let spare = null;
-  const warmUp = (exercise = false) => {
+  const warmUp = () => {
     const w = newWorker();
     w.onmessage = ({ data: m }) => { if (m.type === "build") build = m.build; };
     w.onerror = (e) => { e.preventDefault(); if (spare === w) spare = null; };
-    const m = { type: "warm", exercise, version, build, wasmURL: abs(wasmURL), kernelURL: abs(kernelURL), initURL: abs(initURL), jitURL: jitURL && abs(jitURL) };
+    const m = { type: "warm", version, build, wasmURL: abs(wasmURL), kernelURL: abs(kernelURL), initURL: abs(initURL), jitURL: jitURL && abs(jitURL) };
     if (spawn) w.postMessage(m);
     else postStart(w, m);
     spare = w;
@@ -98,8 +137,6 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
     timer = setTimeout(() => { timer = 0; if (!spare) warmUp(); }, 2000);
   };
   return {
-    // prepare makes the first spare worker, at the prompt.
-    prepare(exercise = true) { if (!spare && !timer) warmUp(exercise); },
     version, // of v86, for the container runtime of the node
     registry,
 

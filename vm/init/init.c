@@ -1184,7 +1184,9 @@ static void loop(int *reported) {
 // program does: fork, exec, page faults, files, pipes, TCP over loopback
 // and a loop that the JIT of the emulator compiles.
 
-#define WARM_CHILDREN 6
+#ifndef WARM_CHILDREN
+#define WARM_CHILDREN 2
+#endif
 
 static void warm_io(int in, int out, char *buf, size_t n, int rounds) {
   for (int i = 0; i < rounds; i++) {
@@ -1207,7 +1209,7 @@ static int cmp_u32(const void *a, const void *b) {
 // warm_child is the program that warm starts, as /init with the name "warm".
 static int warm_child(void) {
   // memory: page faults, then loops over it
-  size_t n = 1 << 20;
+  size_t n = 256 << 10;
   uint32_t *m = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (m == MAP_FAILED) return 1;
   uint32_t x = 2463534242u, sum = 0;
@@ -1217,11 +1219,11 @@ static int warm_child(void) {
   }
   for (int k = 0; k < 4; k++)
     for (size_t i = 0; i < n / 4; i++) sum = sum * 31 + (m[i] >> (k & 7));
-  qsort(m, 8192, sizeof(*m), cmp_u32);
+  qsort(m, 2048, sizeof(*m), cmp_u32);
   char *buf = (char *)m;
   // text: what the C library does with strings
   char line[256];
-  for (int i = 0; i < 2000; i++) {
+  for (int i = 0; i < 300; i++) {
     int l = snprintf(line, sizeof(line), "%d %s %08x %lld\n", i, "warm", sum + i, (long long)i * 1000003);
     sum += strlen(line) + (memchr(line, '\n', l) != NULL) + strtol(line, NULL, 10);
   }
@@ -1236,7 +1238,7 @@ static int warm_child(void) {
   }
   int fd = open("/warm.tmp", O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
   if (fd >= 0) {
-    for (int i = 0; i < 64; i++) (void)!write(fd, buf + i * 4096, 4096);
+    for (int i = 0; i < 16; i++) (void)!write(fd, buf + i * 4096, 4096);
     lseek(fd, 0, SEEK_SET);
     while (read(fd, buf, 16384) > 0) {}
     close(fd);
@@ -1245,7 +1247,7 @@ static int warm_child(void) {
   // a pipe and a TCP connection over loopback
   int p[2];
   if (pipe(p) == 0) {
-    warm_io(p[0], p[1], buf, 65536, 2);
+    warm_io(p[0], p[1], buf, 32768, 1);
     close(p[0]);
     close(p[1]);
   }
@@ -1257,7 +1259,7 @@ static int warm_child(void) {
     if (c >= 0 && connect(c, (struct sockaddr *)&a, sizeof(a)) == 0) {
       int s = accept(l, NULL, NULL);
       if (s >= 0) {
-        warm_io(s, c, buf, 65536, 2);
+        warm_io(s, c, buf, 32768, 1);
         close(s);
       }
     }
