@@ -14,7 +14,7 @@ ARG KERNEL_IMAGE=mirror.gcr.io/library/ubuntu:26.04
 FROM --platform=$BUILDPLATFORM ${KERNEL_IMAGE} AS kernel
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bc bison clang flex libelf-dev libssl-dev lld llvm lz4 make patch \
+  && apt-get install -y --no-install-recommends bc bison clang flex libelf-dev libssl-dev lld llvm lz4 make patch perl python3 \
   && rm -rf /var/lib/apt/lists/*
 ADD --checksum=7595a62d45ee1a2297eafa5f2ef5d0a45142d84d https://github.com/gregkh/linux.git#v7.3.4 /src
 WORKDIR /src
