@@ -21,6 +21,8 @@ const pods = {
     wasmURL: abs(d.vmWasm),
     kernelURL: abs(d.vmKernel),
     initURL: abs(d.vmInit),
+    // optional: the JIT modules of the kernel (web/jit.mjs, vm.js)
+    jitURL: abs(d.vmJit),
     registry: d.registry,
   } : undefined,
 };

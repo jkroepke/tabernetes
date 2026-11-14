@@ -160,6 +160,59 @@ that name.
   options that cost boot time: legacy PTYs (310 ms), gzip (LZ4 unpacks in
   a third of the time, in-guest zstd is 200 ms slower than LZ4); now the
   kernel ships unpacked (next point).
+- **JIT modules of the kernel** (`web/src/jit.js`, `web/jit.mjs`, since
+  2026-11-14): every pod restores the same state, so the kernel has the same
+  code at the same physical pages in every pod, but each pod starts with an
+  empty JIT, and the kernel (55 % of the instructions of an nginx start)
+  ran in the interpreter. The web task records a generic busybox start in
+  Node.js (Alpine linux/386 from Docker, `JIT_ROOT_IMAGE`) and writes the
+  50 most entered kernel modules to `dist/jit.bin` (1.2 MB, 0.18 MB
+  gzip). The page passes it as `data-vm-jit` (the shortcode of the blog
+  needs it); the tab compiles and warms it once at the prompt
+  (`prefetchJIT`, `warm` in `jit.js`, see the next point), posts it with
+  the start message, and the worker installs it after the restore
+  (`jit_import` of the fork, 2-5 ms). The file states its build (the ID of
+  the saved states: v86 version, kernel, init); v86 also checks its layout
+  and the bytes of every page, so a mismatch installs nothing. Measured
+  2026-11-14 in Node.js (v86 0.5.90-fork, nginx and the Go binary of
+  pod-bench, 4 alternating runs of 3 pods per process): nginx, the first
+  pod of a process: wall 626 -> 657 ms, main thread 601 -> 512 ms, process
+  CPU 1.27 -> 1.71 s (V8 optimises the modules then, once per tab); every
+  later pod: wall 566 -> 465 ms, main thread 556 -> 444 ms, process 805 ->
+  755 ms. The Go binary to its first answer: 505 -> 535 ms first, 501 ->
+  448 ms later. More modules make the first pod slower and the later ones
+  faster (`web/jit.mjs`); headless Chromium showed the same.
+- **Warm the kernel JIT modules at the prompt** (`warm` in
+  `web/src/jit.js`, 2026-11-14): without it, V8 optimised the 50 modules
+  with TurboFan during the first pod of a tab (~0.8 s of CPU on other
+  threads). V8 tiers a Wasm function up when its budget is used up, and
+  only normal returns and loop back edges count (a call that throws does
+  not). With a scratch memory that holds the static data of v86.wasm, a module
+  reads zeroes as the TLB, bails at its first memory access and returns:
+  50 x 3000 calls (~40 ms) tier all 50 up (1000 calls: 47). The optimised
+  code stays with the Module that the tab posts to its pods
+  (`--trace-wasm-compilation-times`: 50 TurboFan compiles before the first
+  pod, none in the pods). The scratch memory had 64 pages before: the
+  modules read static data up to ~17 MiB, and in the headless Chromium of the
+  sandbox any Wasm out-of-bounds trap crashed the renderer, the real page
+  too. When: at the prompt. Started at page load (with the control plane
+  boot), it made the prompt of a reload later (10 rounds: 6188 -> 6538
+  ms); at the prompt it did not (6305 ms, noise). Measured in headless
+  Chromium with the real page (8 alternating rounds, nginx, `kubectl run`
+  -> HTTP; cold: new profile, image pulled from a local stand-in;
+  return: same profile, new browser), none / modules without warm-up /
+  with warm-up: run 3 s after the prompt (a person types): first pod cold
+  2344 / 2326 / 2253 ms, return 1155 / 1214 / 1033 ms; later pods 724-765 /
+  640-647 / 624-650 ms. `kubectl run` at the very prompt (22-27 runs
+  pooled): first pod cold 5092 / 4913 / 5076 ms, return 2921 / 2873 /
+  3002 ms, within the noise; the control plane is busy then (run -> start
+  of the VM ~1.8 s), and the warm-up shares the CPU with it.
+- Parked (2026-11-14): booting the VM of the first pod ahead in the tab
+  (like the spare worker of `vm.js`). At page load it made the prompt of
+  a reload later (6188 -> 6541 ms). At the prompt the VM part of the first
+  pod got faster (start -> HTTP 1132 -> 964 ms), but with `kubectl run` at
+  the very prompt the whole first pod not (2978 -> 3139 ms, 6 rounds), it
+  competes with the control plane.
 - **Direct kernel boot, no SeaBIOS** (`web/src/kernelboot.js`, since
   2026-11-12): the worker loads the segments of `vmlinux` (ELF, stripped),
   the initramfs and the zero page (E820, cmdline, initrd) into the VM and
@@ -201,6 +254,20 @@ that name.
   2.35 -> 0.94 million instructions, ~100 -> ~40 ms; nginx from `go` to
   HTTP ~2.2 -> ~1.95 s (3 x 4 rounds); boot to `ready` 11.1 -> 11.4
   million instructions (once per memory size); state 7.6 -> 8.4 MiB.
+- **Fewer context switches** (2026-11-14, `vm/kernel-patches`): the
+  scheduler was ~12 % of the kernel instructions of the nginx start, for
+  ~1400 context switches on one CPU. Two thirds were ksoftirqd: tiny RCU
+  raises its softirq in every context switch while callbacks wait, and a
+  softirq raised in task context wakes ksoftirqd (`rcu-tiny-softirq.patch`
+  only marks it pending; the idle loop runs it before the CPU sleeps). The
+  rest were kworkers of netfs: every readahead request was collected and
+  freed in work items, although 9p has answered when the reads return
+  (`netfs-readahead-inline.patch` does both in the caller). Count them with
+  `ctxt` of `/proc/stat` and `voluntary_ctxt_switches` of each task. nginx
+  start 46.8M -> 43.9M instructions, scheduler 12 % -> 2.5 % of the
+  kernel; first pod in a fresh process (pod-bench, main thread CPU, 16
+  alternating runs): nginx -9.1 %, goapp -6.2 %; with the kernel JIT
+  modules (14 runs) nginx -15.6 %, goapp -3.0 %.
 - **Where the instructions go now** (Node.js profile, 256 MiB): boot to
   `ready` is memory init (~19 %, grows with the RAM), alternatives
   patching (~9 %), sysfs, kobjects and uevents (~15 %), printk into the log

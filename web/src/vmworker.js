@@ -20,6 +20,7 @@ import { SHA256 } from "./sha256.js";
 import { initramfs } from "./initramfs.js";
 import { bootKernel } from "./kernelboot.js";
 import { buildID, loadState, saveState, dropState } from "./vmstate.js";
+import { importJIT } from "./jit.js";
 
 const post = (m, transfer) => self.postMessage(m, transfer || []);
 const CACHE = "tabernetes-configs"; // the configs of the images, small JSON blobs
@@ -356,6 +357,8 @@ async function bootVM(m, memory) {
     await ok;
     try {
       await e.restore_state(state);
+      // the JIT modules of the kernel that the tab compiled (jit.js)
+      importJIT(e, m.jit, build);
       return { emulator: e };
     } catch (err) {
       console.warn("tabernetes: the saved state of the VM does not restore, booting:", err);
@@ -390,6 +393,8 @@ async function bootVM(m, memory) {
     e.run();
     if (saved) saveState(saveAs, memory, saved).catch((err) => console.warn("tabernetes: save the state of the VM:", err));
   }
+  // the kernel has its code in place now (the saved state has no JIT code)
+  importJIT(e, m.jit, saveAs);
   return { emulator: e };
 }
 

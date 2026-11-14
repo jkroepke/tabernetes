@@ -3,6 +3,8 @@
 // worker (vmworker.js) with an x86 emulator in it. Stopping the pod ends the
 // worker, and with it the VM.
 
+import { parseJIT } from "./jit.js";
+
 // The tab compiles v86.wasm once and gives the WebAssembly.Module to the
 // worker of every pod. A worker that compiles the file itself starts with
 // baseline code, and V8 optimises the hot functions again for every pod
@@ -28,13 +30,38 @@ function wasmModule(url) {
   return modules.get(url);
 }
 
+// The JIT modules of the kernel (jit.js): compiled once per tab, like
+// v86.wasm, and posted to every pod. Without the file, the pods start
+// without them.
+const jits = new Map(); // URL -> Promise<object | null>
+function jitModules(url) {
+  if (!url) return Promise.resolve(null);
+  if (!jits.has(url)) {
+    jits.set(url, (async () => {
+      try {
+        const res = await fetch(url);
+        return res.ok ? await parseJIT(await res.arrayBuffer()) : null;
+      } catch {
+        return null;
+      }
+    })());
+  }
+  return jits.get(url);
+}
+
+// prefetchJIT loads, compiles and warms jit.bin in this tab ahead of time.
+export function prefetchJIT(url) {
+  setTimeout(() => jitModules(url), 0);
+}
+
 // postStart posts the start message m to the worker of a pod, with the
-// Module of m.wasmURL. Only a tab can do that: a shared worker cannot post
-// a Module (messageerror), so there the tab adds it (relay in bridge.js).
+// Module of m.wasmURL and the modules of m.jitURL. Only a tab can do that:
+// a shared worker cannot post a Module (messageerror), so there the tab
+// adds them (relay in bridge.js).
 export async function postStart(worker, m, transfer = []) {
-  const module = await wasmModule(m.wasmURL);
+  const [module, jit] = await Promise.all([wasmModule(m.wasmURL), jitModules(m.jitURL)]);
   try {
-    worker.postMessage(module ? { ...m, wasmModule: module } : m, transfer);
+    worker.postMessage(module ? { ...m, wasmModule: module, jit } : m, transfer);
   } catch {
     // the Module does not clone (another agent cluster): without it
     worker.postMessage(m, transfer);
@@ -43,7 +70,7 @@ export async function postStart(worker, m, transfer = []) {
 
 // spawn starts the worker. In the shared worker it is a worker of the tab
 // (bridge.js), since a shared worker cannot start workers.
-export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, registry, spawn }) {
+export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL, registry, spawn }) {
   const abs = (u) => new URL(u, location.href).href;
   // The ID of the saved VM states (vmstate.js) of this kernel and init, as
   // the worker of a pod computed it. Later pods look for a state with it
@@ -59,7 +86,7 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, registr
     const w = newWorker();
     w.onmessage = ({ data: m }) => { if (m.type === "build") build = m.build; };
     w.onerror = (e) => { e.preventDefault(); if (spare === w) spare = null; };
-    const m = { type: "warm", version, build, wasmURL: abs(wasmURL), kernelURL: abs(kernelURL), initURL: abs(initURL) };
+    const m = { type: "warm", version, build, wasmURL: abs(wasmURL), kernelURL: abs(kernelURL), initURL: abs(initURL), jitURL: jitURL && abs(jitURL) };
     if (spawn) w.postMessage(m);
     else postStart(w, m);
     spare = w;
@@ -112,6 +139,7 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, registr
         wasmURL: abs(wasmURL),
         kernelURL: abs(kernelURL),
         initURL: abs(initURL),
+        jitURL: jitURL && abs(jitURL),
       };
       // With spawn, the tab adds the Module when it passes the message on.
       // Without, this is the tab: what follows waits for the start message.
