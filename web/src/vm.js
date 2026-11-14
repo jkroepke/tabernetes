@@ -45,6 +45,31 @@ export async function postStart(worker, m, transfer = []) {
 // (bridge.js), since a shared worker cannot start workers.
 export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, registry, spawn }) {
   const abs = (u) => new URL(u, location.href).href;
+  // The ID of the saved VM states (vmstate.js) of this kernel and init, as
+  // the worker of a pod computed it. Later pods look for a state with it
+  // first and need not fetch and hash the kernel.
+  let build = "";
+  const newWorker = () => (spawn ? spawn(abs(workerURL)) : new Worker(abs(workerURL)));
+  // A spare worker boots the VM of the next pod ahead of time (vmworker.js
+  // "warm"): it is made 2 s after a pod of this tab has started, and the
+  // next pod takes it. That saves the start of the worker and the restore
+  // of the VM state.
+  let spare = null;
+  const warmUp = () => {
+    const w = newWorker();
+    w.onmessage = ({ data: m }) => { if (m.type === "build") build = m.build; };
+    w.onerror = (e) => { e.preventDefault(); if (spare === w) spare = null; };
+    const m = { type: "warm", version, build, wasmURL: abs(wasmURL), kernelURL: abs(kernelURL), initURL: abs(initURL) };
+    if (spawn) w.postMessage(m);
+    else postStart(w, m);
+    spare = w;
+  };
+  // Not while the pod that just started needs the CPU most.
+  let timer = 0;
+  const warmSoon = () => {
+    if (spare || timer) return;
+    timer = setTimeout(() => { timer = 0; if (!spare) warmUp(); }, 2000);
+  };
   return {
     version, // of v86, for the container runtime of the node
     registry,
@@ -55,17 +80,19 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, registr
     // console(text), exit(code, message: why the entrypoint did not start),
     // error(message, pull, never: not present with the pull policy Never).
     start(opts, on) {
-      const worker = spawn ? spawn(abs(workerURL)) : new Worker(abs(workerURL));
+      const worker = spare || newWorker();
+      spare = null;
       const conns = new Map();
       let next = 1;
       worker.onmessage = ({ data: m }) => {
         switch (m.type) {
           case "pulling": on.pulling(); break;
           case "pulled": on.pulled(m); break;
-          case "started": on.started(m); break;
+          case "started": on.started(m); warmSoon(); break;
           case "console": on.console(m.data); break;
           case "exit": on.exit(m.code, m.message || ""); break;
           case "error": on.error(m.message, !!m.pull, !!m.never); break;
+          case "build": build = m.build; break;
           case "conn": {
             const c = conns.get(m.id);
             if (!c) break;
@@ -81,6 +108,7 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, registr
         ...opts,
         registry,
         version,
+        build,
         wasmURL: abs(wasmURL),
         kernelURL: abs(kernelURL),
         initURL: abs(initURL),
