@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"time"
 
@@ -152,6 +153,26 @@ func (s *store) snapshot() []byte {
 	s.mu.Unlock()
 	b, _ := st.encode(nil)
 	return b
+}
+
+// Without returns the snapshot without the given keys.
+func Without(snapshot []byte, keys ...string) ([]byte, error) {
+	s := emptyStore()
+	if err := s.restore(snapshot); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	st := s.snapState()
+	s.mu.Unlock()
+	kvs := st.kvs[:0]
+	for _, kv := range st.kvs {
+		if !slices.Contains(keys, string(kv.Key)) {
+			kvs = append(kvs, kv)
+		}
+	}
+	st.kvs = kvs
+	b, _ := st.encode(nil)
+	return b, nil
 }
 
 var errSnapshot = errors.New("etcdshim: broken snapshot")

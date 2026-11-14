@@ -15,6 +15,10 @@
 // saved values, and a custom section "tabernetes.snapshot" says how
 // web/src/wasm.js rebuilds the JavaScript side and resumes the program.
 //
+// Then the program goes on and boots the control plane, and the binary
+// gets the etcd data of that cluster as the custom section "tabernetes.seed"
+// (k8s/tabernetes/seed.go): the cluster that a first visit starts from.
+//
 // The JavaScript values Go holds must be found again by name in the page,
 // so the build fails if Go holds anything else (a js.FuncOf, an object it
 // created) after init.
@@ -24,7 +28,7 @@ import vm from "node:vm";
 import { pathToFileURL } from "node:url";
 
 const [wasmPath, wasmExecPath, fsPath] = process.argv.slice(2);
-const SECTION = "tabernetes.snapshot";
+const SECTION = "tabernetes.snapshot", SEED = "tabernetes.seed";
 // Must be the env of web/src/terminal.js and web/src/cluster.js: Go reads it
 // during init, and its strings point into the memory of the snapshot.
 const ENV = { HOME: "/root", USER: "root", PATH: "/usr/bin" };
@@ -216,6 +220,18 @@ for (const s of secs) {
 out.push(section(0, Buffer.concat([name(SECTION), Buffer.from(JSON.stringify(meta))])));
 const result = Buffer.concat(out);
 await WebAssembly.compile(result); // fails here, not in the browser
-fs.writeFileSync(wasmPath, result);
 console.log(`snapshot: init took ${Math.round(ms)} ms, ${(mem.length / 2 ** 20).toFixed(0)} MiB of memory in ${segments.length} segments, Go holds ${values.map((p) => p?.join(".")).join(", ")}`);
+
+// ---- the seed: the cluster of a first visit, see k8s/tabernetes/seed.go ----
+// The program goes on from the sleep in main and boots the control plane
+// here; Go hands over the etcd data after the addons, before the controllers.
+const t1 = performance.now();
+const seed = await new Promise((resolve, reject) => {
+  globalThis.tabernetesMakeSeed = (a) => resolve(Buffer.from(a));
+  go._exitPromise.then(() => reject(new Error("the program exited before it made the seed")));
+  setTimeout(() => reject(new Error("no seed after 120 s")), 120_000).unref();
+  go._resume();
+});
+fs.writeFileSync(wasmPath, Buffer.concat([result, section(0, Buffer.concat([name(SEED), seed]))]));
+console.log(`seed: the boot took ${Math.round(performance.now() - t1)} ms, ${(seed.length / 1024).toFixed(0)} KiB`);
 nodeProcess.exit(0); // the Go program would go on in the background

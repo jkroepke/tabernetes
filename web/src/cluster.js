@@ -101,6 +101,7 @@ async function boot(stream) {
     if (image?.build && image.build === go.snapshot?.build) {
       globalThis.tabernetesStatus(`resuming the control plane of your last visit (hibernated ${ago(image.at)})`);
       resumed = true;
+      delete globalThis.tabernetesSeed; // only a new cluster needs it
       running = resume(go, instance, image, fsys);
     } else running = runGo(go, instance);
     running.then(() => exited(""), (e) => exited(e?.message ?? String(e)));
