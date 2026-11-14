@@ -170,11 +170,16 @@ func (tp *tabPod) event(typ, reason, msg string) {
 // back-off as the kubelet.
 func (tp *tabPod) run() {
 	ctx := tp.ctx
-	tp.update()
 	if tp.phase == corev1.PodFailed {
+		tp.update()
 		tp.event(corev1.EventTypeWarning, tp.reason, tp.message)
 		return
 	}
+	// The status manager of the kubelet writes the status on its own while
+	// the pod starts. Here too: the VM need not wait for two requests to
+	// the API server. Every update writes the state of the moment, so a
+	// late one does not undo a newer one (push orders them).
+	go tp.update()
 	if len(tp.ignored) > 0 {
 		tp.event(corev1.EventTypeWarning, "Unsupported", "the tab node has no volumes, and of valueFrom only the fields of the pod; the container starts without: "+strings.Join(tp.ignored, ", "))
 	}
