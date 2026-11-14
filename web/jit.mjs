@@ -37,7 +37,10 @@ const THRESHOLD = 20_000;
 // 516 ms, of a return visit 609 / 564 / 485 ms, later pods ~580 / ~480 /
 // ~450 ms. But with all modules the image pull of a fresh visitor took 0.35 s
 // longer (V8 still optimised modules then), so the whole first pod took
-// 2449 / 2439 / 2682 ms. 100 modules cost the first pod nothing.
+// 2449 / 2439 / 2682 ms. 100 modules cost the first pod nothing. All
+// modules with a warm-up of only the first 100 or 50 were worse: V8 then
+// optimised the others during the first pod (start -> HTTP 578 -> 741 and
+// 848 ms for a fresh visitor).
 const MODULES = 100;
 const SCRIPT = "httpd -p 127.0.0.1:8080 -h /etc; for i in 1 2 3 4 5 6 7 8; do wget -q -O /tmp/p http://127.0.0.1:8080/passwd; ls -l /usr/bin /lib > /dev/null; cat /etc/* 2>/dev/null | gzip | wc -c > /dev/null; done; find / -xdev > /tmp/b; echo done";
 
