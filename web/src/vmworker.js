@@ -30,6 +30,12 @@ const INDEX_TYPES = ["application/vnd.oci.image.index.v1+json", "application/vnd
 const MANIFEST_TYPES = ["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"];
 // Layers that download at once, the default of containerd.
 const PULL_PARALLEL = 3;
+// A layer up to this size (compressed) is kept in memory while it streams
+// in and hashed by crypto.subtle at the end, which is native and runs off
+// the thread of the worker. Larger layers are hashed as they stream by, in
+// JavaScript (sha256.js). The JavaScript hash took ~400 ms of the ~1.3 s
+// pull of nginx (64 MB in 7 layers) on the only thread that also unpacks.
+const SUBTLE_HASH_MAX = 64 * 2 ** 20;
 
 // MiB, of the VM of a pod: its memory limit, or 256 MiB without one. The
 // files of the image are not in it, only what the container runs and writes
@@ -121,9 +127,13 @@ class Pull {
   }
 
   // layer streams the blob of a layer and hashes it on the way. verify()
-  // throws once the stream ended when the digest is wrong.
-  layer(digest) {
-    const hash = new SHA256();
+  // throws once the stream ended when the digest is wrong. size is the one
+  // of the descriptor in the manifest.
+  layer(digest, size) {
+    // in memory and crypto.subtle, or streamed through sha256.js
+    let buf = crypto.subtle && size > 0 && size <= SUBTLE_HASH_MAX ? new Uint8Array(size) : null;
+    let hash = buf ? null : new SHA256();
+    let at = 0;
     let got = "";
     const fetchLayer = async () => {
       const r = await fetch(`${this.base}/blobs/${digest}`).catch((e) => {
@@ -142,11 +152,20 @@ class Pull {
             throw new PullError(`failed to copy: read ${digest}: ${e.message}`);
           }
           if (chunk.done) {
-            got = "sha256:" + hash.hex();
+            got = "sha256:" + (buf ? hex(await crypto.subtle.digest("SHA-256", buf.subarray(0, at))) : hash.hex());
+            buf = null;
             c.close();
             return;
           }
-          hash.update(chunk.value);
+          if (buf && at + chunk.value.length > buf.length) {
+            // more than the descriptor says: the digest cannot match, but
+            // the error should be the one of a wrong digest
+            hash = new SHA256().update(buf.subarray(0, at));
+            buf = null;
+          }
+          if (buf) buf.set(chunk.value, at);
+          else hash.update(chunk.value);
+          at += chunk.value.length;
           this.fetched += chunk.value.length;
           c.enqueue(chunk.value);
         },
@@ -233,7 +252,7 @@ async function unpackImage(p, ref, imageID, m, onFetching) {
   // time the mirror needs to fetch a blob from Docker Hub. The order of the
   // layers matters only for the root file system, not for the download.
   const add = async (l) => {
-    const { fetch, verify } = p.layer(l.digest);
+    const { fetch, verify } = p.layer(l.digest, l.size);
     try {
       return await store.add(l.digest, fetch, verify, l.mediaType);
     } catch (e) {
