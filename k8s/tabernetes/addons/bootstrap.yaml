@@ -36,3 +36,12 @@ subjects:
 - apiGroup: rbac.authorization.k8s.io
   kind: Group
   name: system:nodes
+---
+# The service account controller creates it too, but on the first boot only
+# ~5 s after the prompt: until then kubectl run failed with 'serviceaccount
+# "default" not found'.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: default

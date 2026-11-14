@@ -277,6 +277,9 @@ func (n *tabNode) register(ctx context.Context) error {
 	if err := n.updateStatus(ctx); err != nil {
 		return err
 	}
+	if err := n.untaintNotReady(ctx); err != nil {
+		return err
+	}
 	// The node IPAM controller gives the node its pod CIDR right after the
 	// registration.
 	for i := 0; got.Spec.PodCIDR == ""; i++ {
@@ -290,6 +293,36 @@ func (n *tabNode) register(ctx context.Context) error {
 	}
 	_, n.podCIDR, err = net.ParseCIDR(got.Spec.PodCIDR)
 	return err
+}
+
+// untaintNotReady takes the taint node.kubernetes.io/not-ready off the
+// node. The admission plugin TaintNodesByCondition puts it on every new
+// node, and the node lifecycle controller takes it off once it sees the node
+// Ready. After the start of the cluster that controller comes up seconds
+// after the prompt (4.7 s on a first visit, 1.6 s after a reload, headless
+// Chromium): a pod created meanwhile failed to schedule ("untolerated
+// taint") and then waited for the back-off of the scheduler as well. The
+// tab node is Ready from its registration on (updateStatus), and that is all
+// the controller checks.
+func (n *tabNode) untaintNotReady(ctx context.Context) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		node, err := n.cs.CoreV1().Nodes().Get(ctx, n.name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		var taints []corev1.Taint
+		for _, t := range node.Spec.Taints {
+			if t.Key != corev1.TaintNodeNotReady {
+				taints = append(taints, t)
+			}
+		}
+		if len(taints) == len(node.Spec.Taints) {
+			return nil
+		}
+		node.Spec.Taints = taints
+		_, err = n.cs.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+		return err
+	})
 }
 
 func (n *tabNode) updateStatus(ctx context.Context) error {

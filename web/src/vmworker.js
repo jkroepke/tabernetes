@@ -30,6 +30,12 @@ const INDEX_TYPES = ["application/vnd.oci.image.index.v1+json", "application/vnd
 const MANIFEST_TYPES = ["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"];
 // Layers that download at once, the default of containerd.
 const PULL_PARALLEL = 3;
+// A layer up to this size (compressed) is kept in memory while it streams
+// in and hashed by crypto.subtle at the end, which is native and runs off
+// the thread of the worker. Larger layers are hashed as they stream by, in
+// JavaScript (sha256.js). The JavaScript hash took ~400 ms of the ~1.3 s
+// pull of nginx (64 MB in 7 layers) on the only thread that also unpacks.
+const SUBTLE_HASH_MAX = 64 * 2 ** 20;
 
 // MiB, of the VM of a pod: its memory limit, or 256 MiB without one. The
 // files of the image are not in it, only what the container runs and writes
@@ -121,9 +127,13 @@ class Pull {
   }
 
   // layer streams the blob of a layer and hashes it on the way. verify()
-  // throws once the stream ended when the digest is wrong.
-  layer(digest) {
-    const hash = new SHA256();
+  // throws once the stream ended when the digest is wrong. size is the one
+  // of the descriptor in the manifest.
+  layer(digest, size) {
+    // in memory and crypto.subtle, or streamed through sha256.js
+    let buf = crypto.subtle && size > 0 && size <= SUBTLE_HASH_MAX ? new Uint8Array(size) : null;
+    let hash = buf ? null : new SHA256();
+    let at = 0;
     let got = "";
     const fetchLayer = async () => {
       const r = await fetch(`${this.base}/blobs/${digest}`).catch((e) => {
@@ -142,11 +152,20 @@ class Pull {
             throw new PullError(`failed to copy: read ${digest}: ${e.message}`);
           }
           if (chunk.done) {
-            got = "sha256:" + hash.hex();
+            got = "sha256:" + (buf ? hex(await crypto.subtle.digest("SHA-256", buf.subarray(0, at))) : hash.hex());
+            buf = null;
             c.close();
             return;
           }
-          hash.update(chunk.value);
+          if (buf && at + chunk.value.length > buf.length) {
+            // more than the descriptor says: the digest cannot match, but
+            // the error should be the one of a wrong digest
+            hash = new SHA256().update(buf.subarray(0, at));
+            buf = null;
+          }
+          if (buf) buf.set(chunk.value, at);
+          else hash.update(chunk.value);
+          at += chunk.value.length;
           this.fetched += chunk.value.length;
           c.enqueue(chunk.value);
         },
@@ -185,9 +204,11 @@ async function pullImage(registry, image, policy, onFetching) {
     throw new PullError(`failed to resolve reference "${ref.name}": the tab node pulls from Docker Hub only (through the registry mirror of this page)`);
   }
   const p = new Pull(registry, ref);
+  // the image store and the last resolution of the reference, at once
+  const resolved = policy !== "Always" ? p.resolved() : null;
   store ??= await openStore();
   if (policy !== "Always") {
-    const hit = await p.resolved();
+    const hit = await resolved;
     const img = hit?.manifest?.layers && (await presentImage(p, ref, hit.imageID, hit.manifest));
     if (img) return img;
     if (policy === "Never") throw new NeverPullError(`Container image "${image}" is not present with pull policy of Never`);
@@ -231,7 +252,7 @@ async function unpackImage(p, ref, imageID, m, onFetching) {
   // time the mirror needs to fetch a blob from Docker Hub. The order of the
   // layers matters only for the root file system, not for the download.
   const add = async (l) => {
-    const { fetch, verify } = p.layer(l.digest);
+    const { fetch, verify } = p.layer(l.digest, l.size);
     try {
       return await store.add(l.digest, fetch, verify, l.mediaType);
     } catch (e) {
@@ -318,14 +339,24 @@ async function bootVM(m, memory) {
   const loaded = (v) => new Promise((r) => v.add_listener("emulator-loaded", r));
   let e = new V86(base);
   let ok = loaded(e);
-  const [kernel, init] = await Promise.all([fetchBytes(m.kernelURL), fetchBytes(m.initURL)]);
-  const build = await buildID(m.version || "", kernel, init).catch(() => "");
+  // The kernel and init are needed for a boot, and for the ID of the saved
+  // states, which vm.js keeps once a pod reported it: a pod that restores a
+  // state then fetches and hashes neither (4.7 MB).
+  let files;
+  const fetchFiles = () => (files ??= Promise.all([fetchBytes(m.kernelURL), fetchBytes(m.initURL)]));
+  const idOf = async () => {
+    const [kernel, init] = await fetchFiles();
+    const id = await buildID(m.version || "", kernel, init).catch(() => "");
+    if (id) post({ type: "build", build: id });
+    return id;
+  };
+  const build = m.build || (await idOf());
   const state = build && (await loadState(build, memory));
   if (state) {
     await ok;
     try {
       await e.restore_state(state);
-      return { emulator: e, init };
+      return { emulator: e };
     } catch (err) {
       console.warn("tabernetes: the saved state of the VM does not restore, booting:", err);
       dropState(build, memory).catch(() => {});
@@ -334,7 +365,10 @@ async function bootVM(m, memory) {
       ok = loaded(e);
     }
   }
-  // No state: the kernel starts in this VM, which has run nothing yet.
+  // No state: the kernel starts in this VM, which has run nothing yet. The
+  // ID that vm.js knew may be of another kernel by now (a new release).
+  const [kernel, init] = await fetchFiles();
+  const saveAs = m.build ? await idOf() : build;
   emulator = e;
   await ok;
   bootKernel(e.v86.cpu, { kernel, initrd: initramfs(init), cmdline: KERNEL_CMDLINE });
@@ -349,14 +383,14 @@ async function bootVM(m, memory) {
   e.add_listener("serial1-output-byte", control);
   e.run();
   await ready;
-  if (build && (await opfs())) {
+  if (saveAs && (await opfs())) {
     // init waits for the line, nothing else runs: save the VM for the next pods
     await e.stop();
     const saved = await e.save_state().catch(() => null);
     e.run();
-    if (saved) saveState(build, memory, saved).catch((err) => console.warn("tabernetes: save the state of the VM:", err));
+    if (saved) saveState(saveAs, memory, saved).catch((err) => console.warn("tabernetes: save the state of the VM:", err));
   }
-  return { emulator: e, init };
+  return { emulator: e };
 }
 
 const opfs = () => navigator.storage?.getDirectory?.().then(() => true, () => false) ?? Promise.resolve(false);
@@ -370,11 +404,41 @@ function control(b) {
   onControl(l);
 }
 
+const memoryOf = (m) => Math.min(MAX_MEMORY, Math.max(MIN_MEMORY, m.memory ? Math.ceil(m.memory / 2 ** 20) : DEFAULT_MEMORY)) * 2 ** 20;
+
+// A spare worker (vm.js) gets "warm" before there is a pod for it: it
+// restores (or boots) the VM with the default memory, which then waits for
+// the address and the root file system of the next pod, and opens the image
+// store.
+let warm = null; // {memory, vm}
+function warmUp(m) {
+  const memory = memoryOf(m);
+  warm = { memory, vm: bootVM(m, memory) };
+  warm.vm.catch(() => {});
+  openStore().then((s) => { store ??= s; }, () => {});
+}
+
+// address gives a VM that booted without a pod the address of the pod and
+// its gateway: the network adapter of v86 answers ARP and TCP with them.
+function address(e, m) {
+  const net = e.network_adapter;
+  const ip4 = (s) => new Uint8Array(s.split(".").map(Number));
+  if (net && m.ip) net.vm_ip = ip4(m.ip);
+  if (net && m.gateway) net.router_ip = ip4(m.gateway);
+}
+
 async function start(m) {
   const t0 = Date.now();
-  const memory = Math.min(MAX_MEMORY, Math.max(MIN_MEMORY, m.memory ? Math.ceil(m.memory / 2 ** 20) : DEFAULT_MEMORY)) * 2 ** 20;
-  // the VM boots while the image is pulled
-  const vm = bootVM(m, memory);
+  const memory = memoryOf(m);
+  // The VM of a spare worker, or one that boots while the image is pulled.
+  let vm;
+  if (warm?.memory === memory) {
+    vm = warm.vm.then((v) => (address(v.emulator, m), v), () => bootVM(m, memory));
+  } else {
+    warm?.vm.then((v) => v.emulator.destroy(), () => {});
+    vm = bootVM(m, memory);
+  }
+  warm = null;
   vm.catch(() => {});
   let img;
   try {
@@ -396,6 +460,9 @@ async function start(m) {
   }
   const c = m.container;
   const conf = { ...spec, hostname: m.hostname, ip: m.ip, gateway: m.gateway, stdin: !!c.stdin, stdinOnce: !!c.stdinOnce, tty: !!c.tty };
+  // The readers of the layers open while the tree is built: each takes
+  // a few file system calls (OPFS).
+  const opened = Promise.all(img.layers.map(async (l) => [l.id, await store.layer(l.id)]));
   // The root file system: the layers, and the config of the pod on top. The
   // mount points must be there for init.
   const tree = new Tree();
@@ -422,8 +489,7 @@ async function start(m) {
   for (const d of ["dev", "proc", "sys", "tmp"]) {
     if (!tree.files.has(d)) tree.set(d, { uid: 0, gid: 0, mtime: now, mode: modes.S_IFDIR | (d === "tmp" ? 0o1777 : 0o755) });
   }
-  const layers = new Map();
-  for (const l of img.layers) layers.set(l.id, await store.layer(l.id));
+  const layers = new Map(await opened);
   const fsJSON = tree.v86();
   img.layers = null;
 
@@ -478,6 +544,7 @@ function connect(id, port) {
 
 self.onmessage = ({ data: m }) => {
   switch (m.type) {
+    case "warm": warmUp(m); break;
     case "start": start(m).catch((e) => post({ type: "error", message: String(e?.message || e) })); break;
     case "connect": connect(m.id, m.port); break;
     case "write": conns.get(m.id)?.write(new Uint8Array(m.data)); break;

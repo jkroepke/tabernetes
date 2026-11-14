@@ -218,7 +218,7 @@ function relay(url, p, workers) {
   p.onmessage = ({ data }) => {
     if (data.end) { w.terminate(); workers.delete(w); p.close(); return; }
     const m = data.m;
-    order = order.then(() => (m?.type === "start" && m.wasmURL ? postStart(w, m, data.x || []) : w.postMessage(m, data.x || [])));
+    order = order.then(() => ((m?.type === "start" || m?.type === "warm") && m.wasmURL ? postStart(w, m, data.x || []) : w.postMessage(m, data.x || [])));
   };
 }
 
