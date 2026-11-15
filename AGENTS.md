@@ -423,6 +423,31 @@ that name.
   -> `started` +40-80 ms, more threads at once on 4 cores); a faster tar
   parser (not needed). A separate writer thread per layer could save
   ~150 ms more, but only on links over ~900 Mbit/s.
+- **Pod network** (2026-11-15): a pod has virtio-net with the fetch
+  adapter of v86 (`fake_network.js` ends TCP in JavaScript). `kubectl
+  port-forward`, `wget <pod IP>` and the kubelet (`exec`, port 60250) open
+  TCP connections into the VM (`dial` in `v86.go`, `connect` in
+  `vmworker.js`). Pods cannot reach other pods or Services: the fetch
+  adapter sends only HTTP on port 80 out, through `fetch()`. What cost:
+  the pod worker posted one message per TCP segment (1460 bytes) through
+  the tab to the shared worker, and `wget <pod IP>` went through the
+  port-forward of the apiserver (two TLS connections in Go, SPDY, a
+  WebSocket, a list of pods per connection): the shared worker was busy
+  ~90 % of a download (CPU profile: TLS 29 %, SPDY and WebSocket ~30 %),
+  the pod worker idle 79 %. Now a run of the emulator is one message, and a
+  connection to a pod of a tab node goes straight to its VM (`podnet.go`;
+  pods on joined nodes keep the port-forward). In v86 (0.5.x-fork of
+  2026-11-15): the SYN carries an MSS (Linux sent 536-byte segments), the
+  guest offloads checksums and TCP segmentation (TSO, 64 KiB per segment),
+  and the adapter sends a window instead of one segment per ACK. Headless
+  Chromium, nginx:alpine, 4 MiB file, fresh profile, 3 alternating rounds,
+  before / after the Go and JS part / with the new v86: `wget <pod IP>`
+  2.6-3.2 / 17-21 / 59-72 MB/s, a small file 96-99 / 4.6-6 / 4.7-6 ms;
+  through `kubectl port-forward` 2.7-3.3 / 18.5-26.5 / 30-35 MB/s (TLS of
+  kubectl and apiserver in Go is now the cost), a small file 5-8 ms; an
+  upload with `kubectl exec -i ... < file` 0.6 / 0.6 / 4.5-5.3 MB/s. The
+  first pod (`kubectl run` -> Ready) unchanged. Not measured: nodes over
+  WebRTC (`tunnel.go`).
 - **From `kubectl run` to the start message** (2026-11-14): measured with
   marks in the Go code (apiserver requests, scheduler, etcd writes, tab
   node), read from the shared worker over CDP. 3 s after the prompt it was

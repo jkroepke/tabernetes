@@ -700,11 +700,26 @@ function connect(id, port) {
   if (!net?.connect) { post({ type: "conn", id, event: "close" }); return; }
   const c = net.connect(port);
   conns.set(id, c);
+  // The network adapter hands over one TCP segment (up to 1460 bytes) at a
+  // time. Each message costs the tab, the shared worker and Go a wake-up,
+  // so the segments of one run of the emulator go out as one message.
+  let parts = [], size = 0;
+  const flush = () => {
+    if (!size) return;
+    const data = parts.length === 1 ? parts[0] : new Uint8Array(size);
+    if (parts.length > 1) { let o = 0; for (const p of parts) { data.set(p, o); o += p.length; } }
+    parts = []; size = 0;
+    post({ type: "conn", id, event: "data", data }, [data.buffer]);
+  };
   c.on("connect", () => post({ type: "conn", id, event: "connect" }));
-  c.on("data", (d) => post({ type: "conn", id, event: "data", data: d.slice() }));
+  c.on("data", (d) => {
+    if (!size) queueMicrotask(flush);
+    parts.push(d.slice());
+    size += d.length;
+  });
   // the pod closed its side, or reset the connection
-  c.on("shutdown", () => post({ type: "conn", id, event: "close" }));
-  c.on("close", () => { conns.delete(id); post({ type: "conn", id, event: "close" }); });
+  c.on("shutdown", () => { flush(); post({ type: "conn", id, event: "close" }); });
+  c.on("close", () => { flush(); conns.delete(id); post({ type: "conn", id, event: "close" }); });
 }
 
 self.onmessage = ({ data: m }) => {
