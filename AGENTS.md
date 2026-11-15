@@ -566,8 +566,11 @@ that name.
   kubeconfigs are not in it: every cluster makes its own. The ConfigMap
   `extension-apiserver-authentication` is left out (`etcdshim.Without`):
   kube-apiserver adds its CAs to the ones that are there, so the CA of the
-  build would stay trusted. The objects keep the time of the build as
-  their creation time (`kubectl get ns` shows the age of the release).
+  build would stay trusted. `loadSeed` sets the creation time and the
+  times of the managed fields of every object to the time of the boot
+  (`freshTimes`, ~10 ms for 220 objects): with the time of the build,
+  `kubectl get ds -A` showed the age of the binary in a new cluster, also
+  after `reboot`, and looked like a cluster that `forget` had not wiped.
   The seed must come from the same build (version and addons), else Go
   ignores it and boots as before. Measured in headless Chromium (nginx,
   `kubectl run` 3 s after the prompt, 2 pods, 8 alternating rounds,

@@ -244,3 +244,21 @@ func (s *store) restore(b []byte) error {
 	s.compactRev = rev
 	return nil
 }
+
+// Map returns the snapshot with every value replaced by fn(key, value).
+func Map(snapshot []byte, fn func(key string, value []byte) []byte) ([]byte, error) {
+	s := emptyStore()
+	if err := s.restore(snapshot); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	st := s.snapState()
+	s.mu.Unlock()
+	for i, kv := range st.kvs {
+		c := *kv
+		c.Value = fn(string(kv.Key), kv.Value)
+		st.kvs[i] = &c
+	}
+	b, _ := st.encode(nil)
+	return b, nil
+}
