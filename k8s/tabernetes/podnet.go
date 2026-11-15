@@ -73,6 +73,10 @@ func dialCluster(ctx context.Context, _ string, addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A pod on the node of a tab: its VM is in this process.
+	if wl := tabWorkloadByIP(host); wl != nil {
+		return wl.dial(int32(port))
+	}
 	cfg, cs, err := podNetClient()
 	if err != nil {
 		return nil, err
@@ -81,7 +85,69 @@ func dialCluster(ctx context.Context, _ string, addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial tcp %s: %w", addr, err)
 	}
+	if wl := tabWorkload(pod); wl != nil {
+		return wl.dial(int32(port))
+	}
 	return dialPod(cfg, pod, port)
+}
+
+// The pods of the tab nodes run in this process (the shared worker, or the
+// tab without one). A connection to one of them goes straight to its VM,
+// not through the port-forward of the apiserver: that path costs two TLS
+// connections, SPDY and a WebSocket in Go, and a list of pods per
+// connection. Pods on joined nodes still take it.
+
+// tabNodes returns the nodes of the open tabs.
+func tabNodes() []*tabNode {
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+	var out []*tabNode
+	for _, s := range sessions {
+		s.nodeMu.Lock()
+		if s.node != nil {
+			out = append(out, s.node)
+		}
+		s.nodeMu.Unlock()
+	}
+	return out
+}
+
+// tabWorkloadByIP returns the running workload of the tab pod with the pod
+// IP ip, or nil.
+func tabWorkloadByIP(ip string) workload {
+	for _, n := range tabNodes() {
+		n.mu.Lock()
+		var found *tabPod
+		for _, tp := range n.pods {
+			// a pod in the host network has the IP of the node
+			if tp.ip == ip && ip != n.ip {
+				found = tp
+				break
+			}
+		}
+		n.mu.Unlock()
+		if found != nil {
+			return found.running()
+		}
+	}
+	return nil
+}
+
+// tabWorkload returns the running workload of pod when it runs on the node of
+// a tab, or nil.
+func tabWorkload(pod *corev1.Pod) workload {
+	for _, n := range tabNodes() {
+		if n.name != pod.Spec.NodeName {
+			continue
+		}
+		n.mu.Lock()
+		tp := n.pods[pod.UID]
+		n.mu.Unlock()
+		if tp != nil {
+			return tp.running()
+		}
+	}
+	return nil
 }
 
 // findPod finds the pod behind ip: the pod itself, or a ready endpoint of the
