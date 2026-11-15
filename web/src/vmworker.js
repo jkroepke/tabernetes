@@ -580,7 +580,6 @@ function warmUp(m) {
 // its gateway: the network adapter of v86 answers ARP and TCP with them.
 function address(e, m) {
   const net = e.network_adapter;
-  const ip4 = (s) => new Uint8Array(s.split(".").map(Number));
   if (net && m.ip) net.vm_ip = ip4(m.ip);
   if (net && m.gateway) net.router_ip = ip4(m.gateway);
 }
@@ -645,7 +644,9 @@ async function start(m) {
     // 9p, which took 0.3 million instructions of every start.
     "etc/hosts": { mode: modes.S_IFREG | 0o644, data: enc.encode(`# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n${m.ip ? `${m.ip}\t${m.hostname || ""}\n` : ""}`) },
   };
-  if (m.gateway) extra["etc/resolv.conf"] = { mode: modes.S_IFREG | 0o644, data: enc.encode(`nameserver ${m.gateway}\n`) };
+  if (m.hosts) extra["etc/hosts"].data = enc.encode(m.hosts);
+  if (m.resolvConf) extra["etc/resolv.conf"] = { mode: modes.S_IFREG | 0o644, data: enc.encode(m.resolvConf) };
+  else if (m.gateway) extra["etc/resolv.conf"] = { mode: modes.S_IFREG | 0o644, data: enc.encode(`nameserver ${m.gateway}\n`) };
   for (const [path, e] of Object.entries(extra)) {
     const key = `mem:${mem.size}`;
     mem.set(key, e.data);
@@ -659,6 +660,7 @@ async function start(m) {
   img.layers = null;
 
   ({ emulator } = await vm);
+  clusterNetwork(emulator.network_adapter, m);
   // The console is stdout and stderr of the container. Batch the bytes.
   // A character of several bytes may be split between two batches.
   const utf8 = new TextDecoder();
@@ -695,10 +697,9 @@ async function start(m) {
   emulator.serial_send_bytes(1, new TextEncoder().encode(`go ${Date.now()} ${seed}\n`));
 }
 
-function connect(id, port) {
-  const net = emulator?.network_adapter;
-  if (!net?.connect) { post({ type: "conn", id, event: "close" }); return; }
-  const c = net.connect(port);
+// wire passes the events of a TCP connection of the network adapter to the
+// page: connect, data, eof (the pod sent a FIN) and close (it is gone).
+function wire(id, c) {
   conns.set(id, c);
   // The network adapter hands over one TCP segment (up to 1460 bytes) at a
   // time. Each message costs the tab, the shared worker and Go a wake-up,
@@ -717,9 +718,70 @@ function connect(id, port) {
     parts.push(d.slice());
     size += d.length;
   });
-  // the pod closed its side, or reset the connection
-  c.on("shutdown", () => { flush(); post({ type: "conn", id, event: "close" }); });
+  // the pod closed its side
+  c.on("shutdown", () => { flush(); post({ type: "conn", id, event: "eof" }); });
+  // the pod reset the connection
   c.on("close", () => { flush(); conns.delete(id); post({ type: "conn", id, event: "close" }); });
+}
+
+function connect(id, port, src) {
+  const net = emulator?.network_adapter;
+  if (!net?.connect) { post({ type: "conn", id, event: "close" }); return; }
+  wire(id, net.connect(port, src ? ip4(src) : undefined));
+}
+
+const ip4 = (s) => new Uint8Array(s.split(".").map(Number));
+
+// clusterNetwork hands what the pod sends into the cluster network to the
+// page (Go, clusternet.go): TCP connections to pod IPs and ClusterIPs, and
+// the DNS queries. The rest stays with the network adapter of v86 (HTTP
+// through fetch()).
+let outbound = 0; // ids of connections that the pod opens: negative
+const dnsWaits = new Map();
+let dnsNext = 0;
+function clusterNetwork(net, m) {
+  if (!net || !m.clusterCIDRs?.length) return;
+  const nets = m.clusterCIDRs.map((c) => {
+    const [ip, bits] = c.split("/");
+    const mask = bits === "0" ? 0 : (~0 << (32 - Number(bits))) >>> 0;
+    return [(ip4u(ip4(ip)) & mask) >>> 0, mask];
+  });
+  const inCluster = (a) => { const u = ip4u(a); return nets.some(([n, mask]) => ((u & mask) >>> 0) === n); };
+  // other pods of the node share its /24: the gateway answers ARP for them
+  net.arp_subnet = true;
+  net.claim_tcp = (c) => {
+    if (!inCluster(c.psrc)) return false;
+    const id = --outbound;
+    wire(id, c);
+    // c.sport: the port the pod connects to
+    post({ type: "dial", id, ip: c.psrc.join("."), port: c.sport });
+    return true;
+  };
+  // Go answers all names: the cluster domain, and which other names stand
+  // for fetch() (clusternet.go)
+  net.dns_resolver = (q) => {
+    if (qname(q) == null) return undefined;
+    return new Promise((resolve) => {
+      const id = ++dnsNext;
+      dnsWaits.set(id, resolve);
+      post({ type: "dns", id, query: q }, [q.buffer]);
+      setTimeout(() => { if (dnsWaits.delete(id)) resolve(null); }, 5000);
+    });
+  };
+}
+
+const ip4u = (a) => ((a[0] << 24) | (a[1] << 16) | (a[2] << 8) | a[3]) >>> 0;
+
+// qname reads the name of the first question of a DNS query, in lower case.
+function qname(q) {
+  let i = 12, name = [];
+  while (i < q.length && q[i]) {
+    const n = q[i];
+    if (n > 63 || i + 1 + n > q.length) return null;
+    name.push(String.fromCharCode(...q.subarray(i + 1, i + 1 + n)));
+    i += 1 + n;
+  }
+  return name.join(".").toLowerCase();
 }
 
 self.onmessage = ({ data: m }) => {
@@ -727,8 +789,18 @@ self.onmessage = ({ data: m }) => {
     case "warm": warmUp(m); break;
     case "layer": layerJob(m); break;
     case "start": start(m).catch((e) => post({ type: "error", message: String(e?.message || e) })); break;
-    case "connect": connect(m.id, m.port); break;
+    case "connect": connect(m.id, m.port, m.src); break;
+    case "accept": conns.get(m.id)?.accept(); break;
+    case "refuse": conns.get(m.id)?.reset(); conns.delete(m.id); break;
     case "write": conns.get(m.id)?.write(new Uint8Array(m.data)); break;
-    case "close": conns.get(m.id)?.close(); conns.delete(m.id); break;
+    // a FIN to the pod; it may still send
+    case "end": conns.get(m.id)?.close(); break;
+    case "close": {
+      const c = conns.get(m.id);
+      if (c && !c.in_active_close) c.close();
+      conns.delete(m.id);
+      break;
+    }
+    case "dns": { const r = dnsWaits.get(m.id); if (r) { dnsWaits.delete(m.id); r(m.answer ? new Uint8Array(m.answer) : null); } break; }
   }
 };

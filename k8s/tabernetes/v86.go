@@ -95,10 +95,14 @@ func (v *v86VM) start(ctx context.Context, log io.Writer, pull *imagePull) error
 	opts := map[string]any{
 		"image": c.Image,
 		// the API server defaults it: Always for :latest, else IfNotPresent
-		"pullPolicy":       string(c.ImagePullPolicy),
-		"hostname":         v.tp.name,
-		"ip":               v.tp.ip,
-		"gateway":          v.tp.n.gateway(),
+		"pullPolicy": string(c.ImagePullPolicy),
+		"hostname":   v.tp.hostname,
+		"ip":         v.tp.ip,
+		"gateway":    v.tp.n.gateway(),
+		"hosts":      v.tp.hostsFile(),
+		"resolvConf": v.tp.resolvConf(),
+		// what the network card hands to the cluster network (clusternet.go)
+		"clusterCIDRs":     []any{clusterCIDR, serviceCIDR},
 		"memory":           memory,
 		"ephemeralStorage": storage,
 		"container": map[string]any{
@@ -152,6 +156,14 @@ func (v *v86VM) start(ctx context.Context, log io.Writer, pull *imagePull) error
 			default:
 			}
 		}),
+		// the pod opens a connection into the cluster network
+		"dial": fn(func(a []js.Value) { go v.outbound(a[0].Int(), a[1].String(), a[2].Int()) }),
+		"dns": fn(func(a []js.Value) {
+			q := make([]byte, a[0].Length())
+			js.CopyBytesToGo(q, a[0])
+			reply := a[1]
+			go v.resolve(q, reply)
+		}),
 		"error": fn(func(a []js.Value) {
 			err := errors.New(a[0].String())
 			if len(a) > 2 && a[2].Truthy() {
@@ -195,106 +207,62 @@ func (v *v86VM) stop() {
 
 // dial opens a TCP connection to port of the pod, through the network card
 // of the VM.
-func (v *v86VM) dial(port int32) (net.Conn, error) {
+func (v *v86VM) dial(port int32) (net.Conn, error) { return v.dialFrom(port, "") }
+
+// dialFrom is dial with a source address: another pod, or "" for the
+// gateway of the pod.
+func (v *v86VM) dialFrom(port int32, src string) (net.Conn, error) {
 	if v.h.Type() != js.TypeObject {
 		return nil, errors.New("the container is not running")
 	}
-	local, remote := net.Pipe()
-	in := make(chan []byte, 1024)
-	connected := make(chan bool, 1)
-	var mu sync.Mutex
-	closed := false
-	end := func() {
-		mu.Lock()
-		defer mu.Unlock()
-		if !closed {
-			closed = true
-			close(in)
-		}
+	from := src
+	if from == "" {
+		from = v.tp.n.gateway()
 	}
-	var funcs []js.Func
-	fn := func(f func(a []js.Value)) js.Func {
-		jf := js.FuncOf(func(_ js.Value, a []js.Value) any { f(a); return nil })
-		funcs = append(funcs, jf)
-		return jf
-	}
-	onConnect := fn(func([]js.Value) {
-		select {
-		case connected <- true:
-		default:
-		}
-	})
-	onData := fn(func(a []js.Value) {
-		b := make([]byte, a[0].Length())
-		js.CopyBytesToGo(b, a[0])
-		mu.Lock()
-		defer mu.Unlock()
-		if closed {
-			return
-		}
-		select {
-		case in <- b:
-		default:
-			// the reader takes nothing: give up on the connection
-			closed = true
-			close(in)
-		}
-	})
-	onClose := fn(func([]js.Value) {
-		select {
-		case connected <- false:
-		default:
-		}
-		end()
-	})
-	h := v.h.Call("connect", int(port), onConnect, onData, onClose)
-	release := func() {
-		time.AfterFunc(time.Minute, func() {
-			for _, f := range funcs {
-				f.Release()
-			}
-		})
-	}
+	c := newVMConn(&net.TCPAddr{IP: net.ParseIP(from)}, &net.TCPAddr{IP: net.ParseIP(v.tp.ip), Port: int(port)})
+	onConnect, onData, onEnd, onClose := c.callbacks()
+	c.h = v.h.Call("connect", int(port), onConnect, onData, onEnd, onClose, src)
 	select {
-	case ok := <-connected:
+	case ok := <-c.connected:
 		if !ok {
-			h.Call("close")
-			release()
+			c.Close()
 			return nil, fmt.Errorf("dial tcp %s:%d: connect: connection refused", v.tp.ip, port)
 		}
 	case <-time.After(10 * time.Second):
-		h.Call("close")
-		release()
+		c.Close()
 		return nil, fmt.Errorf("dial tcp %s:%d: i/o timeout", v.tp.ip, port)
 	}
-	// pod -> caller
-	go func() {
-		for b := range in {
-			if _, err := local.Write(b); err != nil {
-				break
-			}
-		}
-		local.Close()
-	}()
-	// caller -> pod
-	go func() {
-		buf := make([]byte, 32<<10)
-		for {
-			n, err := local.Read(buf)
-			if n > 0 {
-				arr := js.Global().Get("Uint8Array").New(n)
-				js.CopyBytesToJS(arr, buf[:n])
-				h.Call("write", arr)
-			}
-			if err != nil {
-				h.Call("close")
-				end()
-				release()
-				return
-			}
-		}
-	}()
-	return remote, nil
+	return c, nil
+}
+
+// outbound takes a TCP connection that the pod opened to ip:port in the
+// cluster network (vmworker.js holds the SYN): it reaches the destination
+// first and then accepts it, else the pod gets a reset, as from a host
+// where nothing listens.
+func (v *v86VM) outbound(id int, ip string, port int) {
+	ctx, cancel := context.WithTimeout(v.tp.ctx, 10*time.Second)
+	defer cancel()
+	dst, err := dialFromPod(ctx, v.tp.ip, ip, port)
+	if err != nil {
+		v.h.Call("refuse", id)
+		return
+	}
+	c := newVMConn(&net.TCPAddr{IP: net.ParseIP(ip), Port: port}, &net.TCPAddr{IP: net.ParseIP(v.tp.ip)})
+	_, onData, onEnd, onClose := c.callbacks()
+	c.h = v.h.Call("accept", id, onData, onEnd, onClose)
+	pipeTCP(c, dst)
+}
+
+// resolve answers a DNS query of the pod (clusternet.go).
+func (v *v86VM) resolve(query []byte, reply js.Value) {
+	answer := clusterDNS(v.tp.namespace, query)
+	if answer == nil {
+		reply.Invoke(js.Null())
+	} else {
+		arr := js.Global().Get("Uint8Array").New(len(answer))
+		js.CopyBytesToJS(arr, answer)
+		reply.Invoke(arr)
+	}
 }
 
 func (v *v86VM) String() string { return "v86 " + strconv.Quote(v.id) }

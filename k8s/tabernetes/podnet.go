@@ -303,6 +303,9 @@ func (c *podConn) Read(b []byte) (int, error) {
 
 func (c *podConn) Write(b []byte) (int, error) { return c.data.Write(b) }
 
+// CloseWrite ends the data stream for writing (a FIN); the pod may still send.
+func (c *podConn) CloseWrite() error { return c.data.Close() }
+
 func (c *podConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.data.Close()

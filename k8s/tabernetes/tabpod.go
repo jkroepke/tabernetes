@@ -74,7 +74,9 @@ type tabPod struct {
 	restartPolicy   corev1.RestartPolicy
 	ref             *corev1.ObjectReference
 	ip              string
-	ignored         []string // what the pod asks for and the tab node does not have
+	hostname        string
+	spec            *corev1.PodSpec // for DNS and /etc/hosts (clusternet.go)
+	ignored         []string        // what the pod asks for and the tab node does not have
 	logs            *logBuffer
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -99,6 +101,8 @@ func (n *tabNode) newPod(pod *corev1.Pod) *tabPod {
 		restartPolicy: pod.Spec.RestartPolicy,
 		ref:           &corev1.ObjectReference{Kind: "Pod", APIVersion: "v1", Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID},
 		ip:            n.allocateIP(),
+		hostname:      pod.Name,
+		spec:          pod.Spec.DeepCopy(),
 		logs:          newLogBuffer(),
 		ctx:           ctx,
 		cancel:        cancel,
@@ -107,6 +111,9 @@ func (n *tabNode) newPod(pod *corev1.Pod) *tabPod {
 	}
 	if pod.Spec.HostNetwork {
 		tp.ip = n.ip
+	}
+	if pod.Spec.Hostname != "" {
+		tp.hostname = pod.Spec.Hostname
 	}
 	if len(pod.Spec.Containers) > 0 {
 		tp.container = pod.Spec.Containers[0]
