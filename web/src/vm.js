@@ -145,7 +145,9 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
     // args, env as "NAME=value", workingDir), hostname, ip, gateway, memory
     // (bytes, 0 for automatic). on: pulling(), pulled(info), started(info),
     // console(text), exit(code, message: why the entrypoint did not start),
-    // error(message, pull, never: not present with the pull policy Never).
+    // error(message, pull, never: not present with the pull policy Never),
+    // dial(id, ip, port: the pod opens a connection into the cluster
+    // network; answer with accept or refuse), dns(query, reply(answer)).
     start(opts, on) {
       const worker = spare || newWorker();
       spare = null;
@@ -165,8 +167,12 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
             if (!c) break;
             if (m.event === "connect") c.onConnect();
             else if (m.event === "data") c.onData(m.data);
+            else if (m.event === "eof") c.onEnd();
             else { conns.delete(m.id); c.onClose(); }
+            break;
           }
+          case "dial": on.dial?.(m.id, m.ip, m.port); break;
+          case "dns": on.dns?.(m.query, (answer) => send({ type: "dns", id: m.id, answer })); break;
         }
       };
       worker.onerror = (e) => { e.preventDefault(); on.error(e.message || "the VM worker failed", false); };
@@ -186,22 +192,33 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
       // Without, this is the tab: what follows waits for the start message.
       let order = spawn ? Promise.resolve(worker.postMessage(start)) : postStart(worker, start);
       const send = (m, transfer = []) => { order = order.then(() => worker.postMessage(m, transfer)); };
-      return {
-        // connect opens a TCP connection to port of the pod.
-        connect(port, onConnect, onData, onClose) {
-          const id = next++;
-          conns.set(id, { onConnect, onData, onClose });
-          send({ type: "connect", id, port });
-          return {
-            write(data) {
-              const b = data.slice();
-              send({ type: "write", id, data: b }, [b.buffer]);
-            },
-            close() {
-              if (conns.delete(id)) send({ type: "close", id });
-            },
-          };
+      // A TCP connection: write(data), end() sends a FIN, close() ends it.
+      const conn = (id) => ({
+        write(data) {
+          const b = data.slice();
+          send({ type: "write", id, data: b }, [b.buffer]);
         },
+        end() { if (conns.has(id)) send({ type: "end", id }); },
+        close() { if (conns.delete(id)) send({ type: "close", id }); },
+      });
+      return {
+        // connect opens a TCP connection to port of the pod, from the
+        // address src (another pod) or the gateway. onEnd: the pod sent a
+        // FIN, onClose: the connection is gone.
+        connect(port, onConnect, onData, onEnd, onClose, src) {
+          const id = next++;
+          conns.set(id, { onConnect, onData, onEnd, onClose });
+          send({ type: "connect", id, port, src: src || "" });
+          return conn(id);
+        },
+        // accept completes a connection that the pod opened (on.dial).
+        accept(id, onData, onEnd, onClose) {
+          conns.set(id, { onConnect() {}, onData, onEnd, onClose });
+          send({ type: "accept", id });
+          return conn(id);
+        },
+        // refuse resets it, as a host where nothing listens.
+        refuse(id) { send({ type: "refuse", id }); },
         stop() {
           worker.terminate();
           for (const c of conns.values()) c.onClose();

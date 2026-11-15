@@ -427,8 +427,9 @@ that name.
   adapter of v86 (`fake_network.js` ends TCP in JavaScript). `kubectl
   port-forward`, `wget <pod IP>` and the kubelet (`exec`, port 60250) open
   TCP connections into the VM (`dial` in `v86.go`, `connect` in
-  `vmworker.js`). Pods cannot reach other pods or Services: the fetch
-  adapter sends only HTTP on port 80 out, through `fetch()`. What cost:
+  `vmworker.js`). Pods reach pods, Services and the cluster DNS through Go
+  (next point); anything else goes out only as HTTP on port 80, through
+  `fetch()`. What cost:
   the pod worker posted one message per TCP segment (1460 bytes) through
   the tab to the shared worker, and `wget <pod IP>` went through the
   port-forward of the apiserver (two TLS connections in Go, SPDY, a
@@ -448,6 +449,35 @@ that name.
   upload with `kubectl exec -i ... < file` 0.6 / 0.6 / 4.5-5.3 MB/s. The
   first pod (`kubectl run` -> Ready) unchanged. Not measured: nodes over
   WebRTC (`tunnel.go`).
+- **Pod to pod, Services, cluster DNS** (`clusternet.go`, 2026-11-15): Go
+  plays kube-proxy and CoreDNS for the tab pods. v86 got hooks for it
+  (`claim_tcp`, `dns_resolver`, `arp_subnet`, `connect(port, src_ip)`, see
+  the AGENTS.md of the fork): the worker of the pod holds the SYN of a
+  connection to a pod IP or a ClusterIP (`clusterCIDRs` of the start
+  message) and posts `dial`; Go picks a ready endpoint at random, dials it
+  (another VM with the client pod IP as source, else the port-forward of
+  the apiserver; the endpoint `10.0.0.1` of the Service kubernetes is the
+  apiserver in the worker), and only then accepts the SYN, so a closed port
+  gives "connection refused" as it should. Both directions close on their
+  own (`vmConn.CloseWrite`, FIN), else `nc` with a request on stdin lost
+  the answer. A pod that reaches itself through its Service comes from the
+  gateway (Linux drops packets from its own address, kube-proxy
+  masquerades hairpin traffic). DNS: every query of a pod goes to Go, from
+  informers of Services and EndpointSlices that start on the first use (a
+  cluster without pod traffic does not pay). There is no upstream server:
+  names outside the cluster get `192.168.87.1`, which the fetch adapter
+  takes for HTTP by the Host header, as v86 answered before; names that
+  are meant relative to the search domains (`db-0.db`, `web.default`, a
+  single label) get NXDOMAIN like from a real upstream, else busybox
+  nslookup showed `192.168.87.1` for them. The answer must come from the
+  address that was asked (`10.96.0.10`): glibc and musl drop others.
+  Busybox `nslookup kubernetes.default` fails as in every cluster (busybox
+  does not use the search list for names with a dot); `wget` and other
+  programs do. Headless Chromium, nginx:alpine and busybox, 4 MiB through a
+  Service: same tab and across two tabs 0.20 s (~20 MB/s), a small request
+  ~11-15 ms including the start of wget. Not there: UDP between pods,
+  NodePorts, NetworkPolicies, `sessionAffinity`, pods on joined nodes
+  reaching tab pods.
 - **From `kubectl run` to the start message** (2026-11-14): measured with
   marks in the Go code (apiserver requests, scheduler, etcd writes, tab
   node), read from the shared worker over CDP. 3 s after the prompt it was

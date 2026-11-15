@@ -203,6 +203,22 @@ browser tab (single wasm binary)                     docker run tabernetes
   `-t` (`vm/init/init.c`, `k8s/tabernetes/v86exec.go`). With `stdin` and
   `tty` in the pod (`kubectl run -it`), the entrypoint gets a pty, too, and
   `kubectl attach` connects to it.
+  Pods reach each other, Services and the cluster DNS like in a cluster
+  with kube-proxy and CoreDNS (`k8s/tabernetes/clusternet.go`). The network
+  adapter of v86 ends TCP in JavaScript, so there is no network between the
+  VMs: the worker of the pod hands each connection to a pod IP or a
+  ClusterIP to Go, which picks a ready endpoint of the Service at random and
+  opens a connection into that VM, in any tab (or through the port-forward
+  of the apiserver for a pod on a joined node). The pod on the other side
+  sees the IP of the client pod. Go also answers the DNS queries of the
+  pods: Services (`web`, `web.default.svc.cluster.local`), the pods behind
+  a headless Service and StatefulSet replicas (`db-0.db`), SRV records of
+  named ports, ExternalName, `1-2-3-4.default.pod.cluster.local` and reverse
+  lookups. `/etc/resolv.conf` and `/etc/hosts` are what the kubelet writes
+  (`dnsPolicy`, `dnsConfig`, `hostname`, `subdomain`, `hostAliases`). Only
+  TCP and DNS: UDP between pods, NodePorts, NetworkPolicies and
+  `sessionAffinity` are not there. Other names resolve to an address that
+  goes out through `fetch()`, HTTP on port 80 only.
   The VM boots while the image is pulled. init starts in an initramfs and
   waits there for the pod; the first VM of each memory size saves its state
   at that point (`web/src/vmstate.js`, OPFS), and later pods restore it
