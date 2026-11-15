@@ -397,7 +397,8 @@ that name.
   sends it "gone" through the relay first (`sayAllGone` in `relay.js`;
   `unjoin` sends it too): the agent stops the kubelet, containerd and the
   pods and waits for `docker rm` (an exit would make docker restart it),
-  and a mark in its volume keeps it stopped after a restart. Without a SharedWorker, poweroff and reboot reload the page.
+  and a mark in its volume keeps it stopped after a restart. Without a
+  SharedWorker, poweroff and reboot reload the page.
 - **Image pulls** download and unpack up to 3 layers at once, like
   containerd's `max_concurrent_downloads`, each in a layer worker: a worker
   of the worker of the pod (`layerWorker` in `vmworker.js`, the same
