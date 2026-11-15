@@ -119,10 +119,20 @@ func main() {
 		log.Fatalf("this token is for %q, not %q", map[bool]string{true: "kubectl", false: "join"}[tok.Kind == "kubectl"], args[0])
 	}
 	if tok.Kind == "kubectl" {
+		if isGone(tok.Topic) {
+			log.Printf("the cluster of %s is gone. Remove this container: docker rm -f tabernetes-%s", tok.Name, tok.Name)
+			idleGone()
+		}
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer cancel()
 		runKubectl(ctx, cancel, tok, *stun, *advertise, *listen)
 		return
+	}
+
+	if tok.paired() && isGone(tok.Topic) {
+		// docker restarted the container of a node whose cluster is gone.
+		log.Printf("the cluster of %s is gone. Remove this container: docker rm -f tabernetes-%s", tok.Name, tok.Name)
+		idleGone()
 	}
 
 	if inUserNS {
@@ -130,7 +140,11 @@ func main() {
 			log.Fatal(err)
 		}
 	} else if !*noKubelet && !hasCapSysAdmin() {
-		os.Exit(runInUserNS(tok.Port))
+		code := runInUserNS(tok.Port)
+		if code == goneExit {
+			idleGone()
+		}
+		os.Exit(code)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -258,6 +272,7 @@ func runKubectl(ctx context.Context, cancel context.CancelFunc, tok offerToken, 
 		log.Fatal(err)
 	}
 	go m.serve(ctx, l)
+	r.gone = func() { clusterGone(tok) }
 	fmt.Print(kubeconfig(tok))
 	log.Printf("%s forwards %s to the kube-apiserver in the browser, offers come through %s", tok.Name, listen, tok.Relay)
 	r.serve(ctx, m.answerRelay(ctx))
@@ -306,9 +321,75 @@ func runPaired(ctx context.Context, m *mesh, tok offerToken, kubelet bool) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	startNode(ctx, m, tok, kubelet)
+	// The kubelet and containerd end with nodeCtx (supervise), before
+	// idleGone ends the pods.
+	nodeCtx, stopNode := context.WithCancel(ctx)
+	defer stopNode()
+	r.gone = func() {
+		stopNode()
+		clusterGone(tok)
+	}
+	startNode(nodeCtx, m, tok, kubelet)
 	log.Printf("%s (%s) waits for the browser, offers come through %s", tok.Name, tok.IP, tok.Relay)
 	r.serve(ctx, m.answerRelay(ctx))
+}
+
+// A paired node lives without a tab, so it does not end when the
+// connections close. poweroff, reboot and unjoin in the browser send
+// "gone" through the relay instead: the pairing and the CA of the node are
+// gone with the cluster, no tab will dial it again.
+
+// goneExit is the exit code of the agent in the user namespace
+// (runInUserNS) when the cluster is gone.
+const goneExit = 3
+
+// goneFile is in the volume of the image, so it survives a restart of the
+// container (docker run --restart unless-stopped).
+const goneFile = "/var/lib/containerd/tabernetes-gone"
+
+func isGone(topic string) bool {
+	b, err := os.ReadFile(goneFile)
+	return err == nil && strings.TrimSpace(string(b)) == topic
+}
+
+var goneOnce sync.Once
+
+// clusterGone stops the node: its kubelet, containerd and pods end.
+func clusterGone(tok offerToken) {
+	goneOnce.Do(func() {
+		if err := os.WriteFile(goneFile, []byte(tok.Topic+"\n"), 0o644); err != nil {
+			log.Printf("remembering that the cluster is gone: %v", err)
+		}
+		log.Printf("the cluster of %s is gone (poweroff, reboot or unjoin in the browser), the node stops. Remove this container: docker rm -f tabernetes-%s", tok.Name, tok.Name)
+		if inUserNS {
+			os.Exit(goneExit) // the agent outside ends the rest (idleGone)
+		}
+		idleGone()
+	})
+}
+
+// idleGone ends every other process of the container and waits for docker
+// stop or docker rm. An exit would only make docker start the container
+// again (--restart unless-stopped). Outside of a container (not PID 1) it
+// exits: the kubelet and containerd end with it (supervise).
+func idleGone() {
+	if os.Getpid() != 1 {
+		os.Exit(0)
+	}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	syscall.Kill(-1, syscall.SIGKILL) // all processes but PID 1
+	go func() {
+		// PID 1 reaps the orphans.
+		for {
+			var ws syscall.WaitStatus
+			if _, err := syscall.Wait4(-1, &ws, 0, nil); err == syscall.ECHILD {
+				time.Sleep(time.Second)
+			}
+		}
+	}()
+	<-sig
+	os.Exit(0)
 }
 
 // mesh is the set of WebRTC peer connections to the browser: one to every

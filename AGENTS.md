@@ -393,7 +393,11 @@ that name.
   in place (`restart` in `index.js`), not by a reload: the blog page sits
   behind a start button. The other tabs stay down until Enter. The tabs end
   the workers of their pods and close their WebRTC connections, so Docker
-  nodes end too. Without a SharedWorker, poweroff and reboot reload the page.
+  nodes end too. A paired node does not end without a tab, so the worker
+  sends it "gone" through the relay first (`sayAllGone` in `relay.js`;
+  `unjoin` sends it too): the agent stops the kubelet, containerd and the
+  pods and waits for `docker rm` (an exit would make docker restart it),
+  and a mark in its volume keeps it stopped after a restart. Without a SharedWorker, poweroff and reboot reload the page.
 - **Image pulls** download and unpack up to 3 layers at once, like
   containerd's `max_concurrent_downloads`, each in a layer worker: a worker
   of the worker of the pod (`layerWorker` in `vmworker.js`, the same

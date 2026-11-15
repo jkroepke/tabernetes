@@ -3,7 +3,7 @@
 // "join --keep" pairs the node instead: it stays in the cluster, and the tabs
 // reach it again after a reload through a relay (relay.js). "unjoin" ends
 // the pairing.
-import { DEFAULT_RELAY, exchange } from "./relay.js";
+import { DEFAULT_RELAY, exchange, sayGone } from "./relay.js";
 
 const B = (s) => `\x1b[1m${s}\x1b[0m`;
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
@@ -479,7 +479,10 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
       }
       const name = args[0];
       if (!name) { term.writeln(`usage: unjoin <node>`); return; }
+      let p;
       try {
+        const list = cluster ? await cluster.rpc("pairedNodes") : globalThis.tabernetes.pairedNodes();
+        p = list.find((x) => x.name === name);
         if (cluster) await cluster.rpc("unjoin", name);
         else await globalThis.tabernetes.unjoin(name);
       } catch (e) {
@@ -487,11 +490,14 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
         return;
       }
       unkeep(name);
+      // The agent stops the node (or the kubectl) and waits for docker rm.
+      const told = p && await sayGone(p).then(() => true, (e) => { console.warn(`tabernetes: telling ${name} that it is gone:`, e); return false; });
+      const rm = B(`docker rm -f tabernetes-${name}`);
       if (name.startsWith("kubectl-")) {
-        term.writeln(`The token of ${name} is void. Remove its container: ${B(`docker rm -f tabernetes-${name}`)}`);
+        term.writeln(`The token of ${name} is void. ${told ? "Its container stopped" : "Its container still runs"}, remove it: ${rm}`);
         return;
       }
-      term.writeln(`${name} is gone from the cluster. Its container still waits for the browser: ${B(`docker rm -f tabernetes-${name}`)}`);
+      term.writeln(`${name} is gone from the cluster. ${told ? "Its container stopped the node" : "Its container still waits for the browser"}, remove it: ${rm}`);
     },
 
     async accept(args, { term }) {

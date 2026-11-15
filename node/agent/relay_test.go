@@ -134,3 +134,39 @@ func TestRelay(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+func TestRelayGone(t *testing.T) {
+	f := &fakeNtfy{subs: map[string][]chan string{}, msgs: map[string][]string{}}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	b := make([]byte, 32)
+	rand.Read(b)
+	key := base64.RawURLEncoding.EncodeToString(b)
+	node, _ := newRelay(srv.URL, "tabernetes-node", key)
+	tab, _ := newRelay(srv.URL, "tabernetes-tab", key)
+	gone := make(chan struct{}, 4)
+	node.gone = func() { gone <- struct{}{} }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	send := func(m relayMsg) {
+		msg, _ := tab.seal(m)
+		if err := tab.publish(ctx, "tabernetes-node", msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A replay of an old one does not stop the node.
+	send(relayMsg{Gone: true, Time: time.Now().Add(-3 * time.Minute).UnixMilli()})
+	go node.serve(ctx, func(string) (string, error) { t.Error("gone answered as an offer"); return "", nil })
+	select {
+	case <-gone:
+		t.Fatal("an old gone stopped the node")
+	case <-time.After(300 * time.Millisecond):
+	}
+	send(relayMsg{Gone: true, Time: time.Now().UnixMilli()})
+	select {
+	case <-gone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no gone")
+	}
+}

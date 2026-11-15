@@ -11,6 +11,7 @@ import { capture, pack, resume, trackFuncs, unpack } from "./hibernate.js";
 import { clusterState, dropHibernated, forget, loadHome, saveHibernated, saveHome, takeHibernated } from "./state.js";
 import { instantiate, runGo } from "./wasm.js";
 import { serveTab } from "./bridge.js";
+import { sayAllGone } from "./relay.js";
 
 const tabs = new Map(); // tab id -> MessagePort
 // The docker nodes from join: every tab connects to each of them over WebRTC
@@ -182,15 +183,18 @@ let stopping = null;
 function poweroff(id, reboot) {
   stopping ??= (async () => {
     hibernation++; // a hibernation that runs now is void
+    const wasReady = state === "ready";
     state = "stopping";
     rejectReady(new Error("the control plane is going down"));
     const by = tabs.get(id)?.nodes[0] ?? "";
     broadcast({ type: "shutdown", reboot, by });
+    // The paired docker nodes stop too: the new cluster will not know them.
+    const told = wasReady ? sayAllGone() : Promise.resolve();
     // No more saves from here. The tabs end their pods on the broadcast;
     // their Web Locks go a moment later, and with them the layers they
     // read. A layer still in use gets a mark, the next page load deletes it.
     forgotten = true;
-    await new Promise((r) => setTimeout(r, 500));
+    await Promise.all([told, new Promise((r) => setTimeout(r, 500))]);
     await Promise.race([forget(), new Promise((r) => setTimeout(r, 5000))]).catch(() => {});
     // next: the name of the next shared worker (tabs.js)
     const next = crypto.randomUUID().slice(0, 8);
