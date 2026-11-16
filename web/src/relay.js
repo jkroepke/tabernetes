@@ -70,3 +70,27 @@ export async function exchange(p, sdp, timeout = 20000) {
     es.close();
   }
 }
+
+// sayGone tells the paired node p that its cluster is gone (poweroff,
+// reboot, unjoin): the agent stops the node and its pods and waits for
+// docker rm (node/agent/main.go). The tabs no longer dial it, and its
+// pairing and CA are gone, so it would wait for the browser forever.
+export async function sayGone(p, timeout = 4000) {
+  const relay = p.relay.replace(/\/+$/, "");
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeout);
+  try {
+    const r = await fetch(`${relay}/${p.topic}`, { method: "POST", body: await seal(p.key, { gone: true, t: Date.now() }), signal: ctl.signal });
+    if (!r.ok) throw new Error(`relay ${relay}: ${r.status} ${r.statusText}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// sayAllGone tells every paired node of the cluster that it is gone. The
+// control plane must still run (pairedNodes); errors only go to the console.
+export async function sayAllGone() {
+  let list = [];
+  try { list = globalThis.tabernetes?.pairedNodes?.() ?? []; } catch { /* not booted */ }
+  await Promise.all(list.map((p) => sayGone(p).catch((e) => console.warn(`tabernetes: telling ${p.name} that the cluster is gone:`, e))));
+}

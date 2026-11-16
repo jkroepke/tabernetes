@@ -9,6 +9,7 @@ import { clusterState, loadHome, saveHome, forget, sweepLayers, keepStorage } fr
 import { zstdFrames, instantiate, runGo } from "./wasm.js";
 import { vmAPI, prefetchJIT, prepareWorker } from "./vm.js";
 import { gpuAPI } from "./gpu.js";
+import { sayAllGone } from "./relay.js";
 
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
 
@@ -231,6 +232,7 @@ export async function startTerminal(el, opts) {
     }
     // The control plane runs in this tab: a reload ends it.
     broadcast(term, globalThis.tabernetesNode, reboot);
+    await sayAllGone();
     await forget().catch(() => {});
     if (!reboot) {
       try { sessionStorage.setItem(POWEROFF, "1"); } catch { /* no storage: it boots again */ }

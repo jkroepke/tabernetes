@@ -393,7 +393,12 @@ that name.
   in place (`restart` in `index.js`), not by a reload: the blog page sits
   behind a start button. The other tabs stay down until Enter. The tabs end
   the workers of their pods and close their WebRTC connections, so Docker
-  nodes end too. Without a SharedWorker, poweroff and reboot reload the page.
+  nodes end too. A paired node does not end without a tab, so the worker
+  sends it "gone" through the relay first (`sayAllGone` in `relay.js`;
+  `unjoin` sends it too): the agent stops the kubelet, containerd and the
+  pods and waits for `docker rm` (an exit would make Docker restart it),
+  and a mark in its volume keeps it stopped after a restart. Without a
+  SharedWorker, poweroff and reboot reload the page.
 - **Image pulls** download and unpack up to 3 layers at once, like
   containerd's `max_concurrent_downloads`, each in a layer worker: a worker
   of the worker of the pod (`layerWorker` in `vmworker.js`, the same
@@ -566,8 +571,11 @@ that name.
   kubeconfigs are not in it: every cluster makes its own. The ConfigMap
   `extension-apiserver-authentication` is left out (`etcdshim.Without`):
   kube-apiserver adds its CAs to the ones that are there, so the CA of the
-  build would stay trusted. The objects keep the time of the build as
-  their creation time (`kubectl get ns` shows the age of the release).
+  build would stay trusted. `loadSeed` sets the creation time and the
+  times of the managed fields of every object to the time of the boot
+  (`freshTimes`, ~10 ms for 220 objects): with the time of the build,
+  `kubectl get ds -A` showed the age of the binary in a new cluster, also
+  after `reboot`, and looked like a cluster that `forget` had not wiped.
   The seed must come from the same build (version and addons), else Go
   ignores it and boots as before. Measured in headless Chromium (nginx,
   `kubectl run` 3 s after the prompt, 2 pods, 8 alternating rounds,

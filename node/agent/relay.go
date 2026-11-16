@@ -29,11 +29,14 @@ import (
 // side.
 
 // relayMsg is what a tab sends: its offer, the topic for the answer, and
-// when it sent it (milliseconds since the epoch).
+// when it sent it (milliseconds since the epoch). Gone instead of an offer
+// says that the cluster of the pairing is gone: poweroff, reboot or unjoin
+// in the browser.
 type relayMsg struct {
 	SDP   string `json:"sdp"`
 	Reply string `json:"reply,omitempty"`
 	Time  int64  `json:"t,omitempty"`
+	Gone  bool   `json:"gone,omitempty"`
 }
 
 // offerMaxAge: an older offer is a replay, or the tab gave up on it.
@@ -47,6 +50,8 @@ type relay struct {
 	aead  cipher.AEAD
 	http  *http.Client
 	seen  map[string]bool // the reply topics of the offers answered
+	// gone is called when a tab says that the cluster is gone.
+	gone func()
 }
 
 func newRelay(url, topic, key string) (*relay, error) {
@@ -176,6 +181,14 @@ func (r *relay) subscribe(ctx context.Context, answer func(sdp string) (string, 
 			continue
 		}
 		age := time.Since(time.UnixMilli(m.Time))
+		if m.Gone {
+			// An old one is a replay; the agent remembers a fresh one
+			// (markGone), so it needs no second.
+			if r.gone != nil && age < offerMaxAge && age > -offerMaxAge {
+				r.gone()
+			}
+			continue
+		}
 		if m.SDP == "" || !topicRE.MatchString(m.Reply) || age > offerMaxAge || age < -offerMaxAge || r.seen[m.Reply] {
 			continue
 		}
