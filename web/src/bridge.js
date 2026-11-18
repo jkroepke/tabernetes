@@ -37,8 +37,28 @@ export async function serveTab(port, cfg) {
   if (cfg?.gpu) host.gpu = gpuAPI(cfg.gpu, { spawn, adapter: () => call("gpuAdapter") });
   const session = await globalThis.tabernetes.openTab(host);
 
-  const ret = (seq, v, transfer = []) => port.postMessage({ t: "ret", seq, v }, transfer);
-  const fail = (seq, e) => port.postMessage({ t: "ret", seq, e: String(e?.message ?? e) });
+  // out sends the output of the shell (bytes, or true/false for the tty
+  // mode, tty.go) to the tab. Go writes line by line, so it collects the
+  // bytes until Go gives the event loop back (a microtask), or 64 KiB:
+  // "seq 1 1000000" was one message per line, and the tab needed ~0.5 ms
+  // for each.
+  let pending = [], size = 0;
+  const flush = () => {
+    if (!size) return;
+    const b = new Uint8Array(size);
+    let at = 0;
+    for (const c of pending) { b.set(c, at); at += c.length; }
+    pending = []; size = 0;
+    port.postMessage({ t: "out", s: b }, [b.buffer]);
+  };
+  const out = (s) => {
+    if (!(s instanceof Uint8Array)) { flush(); port.postMessage({ t: "out", s }); return; }
+    if (!size) queueMicrotask(flush);
+    pending.push(s); size += s.length;
+    if (size >= 64 << 10) flush();
+  };
+  const ret = (seq, v, transfer = []) => { flush(); port.postMessage({ t: "ret", seq, v }, transfer); };
+  const fail = (seq, e) => { flush(); port.postMessage({ t: "ret", seq, e: String(e?.message ?? e) }); };
   port.onmessage = async ({ data: d }) => {
     switch (d.t) {
       case "call": {
@@ -57,13 +77,15 @@ export async function serveTab(port, cfg) {
           builtins[name] = (args, ctx) => new Promise((resolve, reject) => {
             const id = ++next;
             builtinCalls.set(id, { resolve, reject, write: ctx.write });
+            flush(); // the output before the builtin comes first
             port.postMessage({ t: "bi", id, name, args: [...args], stdin: ctx.stdin });
           });
         }
-        session.shell(d.src, (s) => port.postMessage({ t: "out", s }), builtins).then((v) => ret(d.seq, v), (e) => fail(d.seq, e));
+        session.shell(d.src, out, builtins).then((v) => ret(d.seq, v), (e) => fail(d.seq, e));
         break;
       }
       case "biw": builtinCalls.get(d.id)?.write(d.s); break;
+      case "ack": session.ack(d.n); break;
       case "bir": {
         const c = builtinCalls.get(d.id);
         builtinCalls.delete(d.id);
@@ -171,6 +193,8 @@ export function tabSession(port, { status }) {
     complete: method("complete"),
     cwd: method("cwd"),
     cancel: method("cancel"),
+    // ack(n): the terminal has shown n bytes of output (flow control)
+    ack(n) { port.postMessage({ t: "ack", n }); },
     // stop ends the workers of the pods of this tab: the control plane is
     // gone (poweroff, reboot, a crash), and with it their kubelet.
     stop() {

@@ -682,7 +682,11 @@ func seq(_ context.Context, hc interp.HandlerContext, args []string, _ interp.Ex
 		return fail(hc, 1, "seq: step must not be 0")
 	}
 	for i := first; (step > 0 && i <= last) || (step < 0 && i >= last); i += step {
-		fmt.Fprintln(hc.Stdout, i)
+		// A failed write ends seq, like SIGPIPE: Ctrl-C, or "| head" that
+		// read enough.
+		if _, err := fmt.Fprintln(hc.Stdout, i); err != nil {
+			return interp.ExitStatus(1)
+		}
 	}
 	return nil
 }
