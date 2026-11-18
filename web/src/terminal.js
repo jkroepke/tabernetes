@@ -12,6 +12,7 @@ import { zstdFrames, instantiate, runGo } from "./wasm.js";
 import { vmAPI, prefetchJIT, prepareWorker } from "./vm.js";
 import { gpuAPI } from "./gpu.js";
 import { sayAllGone } from "./relay.js";
+import * as tourSteps from "./tour.js";
 
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
 // The terminal tells Go every ACK bytes that it has shown the output.
@@ -140,7 +141,7 @@ export async function startTerminal(el, opts) {
   };
   globalThis.tabernetesSession = session;
   term.writeln("");
-  term.writeln(`Try ${"\x1b[1m"}k version${"\x1b[0m"}, ${"\x1b[1m"}join${"\x1b[0m"}, ${"\x1b[1m"}doom${"\x1b[0m"}, ${"\x1b[1m"}llm${"\x1b[0m"} or ${"\x1b[1m"}help${"\x1b[0m"}.`);
+  term.writeln(`New here? Type ${"\x1b[1m"}tour${"\x1b[0m"} for a walk through the cluster. Or try ${"\x1b[1m"}k version${"\x1b[0m"}, ${"\x1b[1m"}join${"\x1b[0m"}, ${"\x1b[1m"}doom${"\x1b[0m"}, ${"\x1b[1m"}llm${"\x1b[0m"} or ${"\x1b[1m"}help${"\x1b[0m"}.`);
 
   // ---- shell ----
   // output shows what the shell writes (jsWriter, tty.go): bytes, which
@@ -168,6 +169,7 @@ export async function startTerminal(el, opts) {
   const history = [];
   let hpos = 0, line = "", cursor = 0, busy = false, pending = "";
   let search = null; // { query, at, failed, saved: [line, cursor] }
+  let tour = null; // { step } while the tour (tour.js) runs
 
   const builtins = {
     async help(args, { write }) {
@@ -207,7 +209,8 @@ export async function startTerminal(el, opts) {
         "  poweroff, shutdown       stop the control plane of all tabs and forget the cluster",
         "  reboot, shutdown -r      the same, then this tab boots a new cluster",
         "  clear                    clear the screen",
-        ...terminal.filter((n) => !["join", "accept", "unjoin", "proxy", "vnc", "logs", "history", "forget", "poweroff", "shutdown", "reboot", "clear"].includes(n)).map((n) => `  ${n}`),
+        "  tour                     a walk through what the cluster can do",
+        ...terminal.filter((n) => !["tour", "join", "accept", "unjoin", "proxy", "vnc", "logs", "history", "forget", "poweroff", "shutdown", "reboot", "clear"].includes(n)).map((n) => `  ${n}`),
         "",
         "Tools (small versions, the common flags)",
         ...list(tools),
@@ -222,6 +225,9 @@ export async function startTerminal(el, opts) {
       ].join("\n"));
     },
     clear() { term.clear(); },
+    // tour starts after this command line (tour.js): its steps run as
+    // command lines of their own, not inside this one.
+    tour() { tour = { step: 0, start: true }; },
     // history lists the command lines of this tab like bash, history n the
     // last n, history -c forgets them.
     history(args, { write }) {
@@ -378,7 +384,34 @@ export async function startTerminal(el, opts) {
       if (term.buffer.active.cursorX > 0) term.write("\r\n");
     }
     row = 0;
+    if (tour && (await tourNext())) return submit();
     redraw();
+  }
+
+  // tourNext shows the next step of the tour and puts its command on the
+  // prompt. After the last one it offers join, and returns true when the
+  // line (join) is to run at once.
+  async function tourNext() {
+    if (tour.start) tour.start = false;
+    else tour.step++;
+    const i = tour.step;
+    if (i < tourSteps.steps.length) {
+      for (const l of tourSteps.intro(i)) term.writeln(l);
+      line = tourSteps.steps[i].cmd;
+      cursor = line.length;
+      return false;
+    }
+    tour = null;
+    for (const l of tourSteps.outro()) term.writeln(l);
+    let answer = "";
+    try { answer = await ask(tourSteps.joinQuestion); } catch { /* Ctrl-C: no */ }
+    if (/^y(es)?$/i.test(answer.trim())) {
+      line = "join";
+      cursor = line.length;
+      return true;
+    }
+    term.writeln("\x1b[2mRun join any time later, or tour again.\x1b[0m");
+    return false;
   }
 
   redraw();
@@ -534,7 +567,11 @@ export async function startTerminal(el, opts) {
       }
       switch (c) {
         case "\x7f": case "\b": if (cursor > 0) edit(line.slice(0, cursor - 1) + line.slice(cursor), cursor - 1); break;
-        case "\x03": cursor = line.length; redraw(); newline("^C"); line = ""; cursor = 0; pending = ""; redraw(); break;
+        case "\x03":
+          cursor = line.length; redraw(); newline("^C"); line = ""; cursor = 0; pending = "";
+          if (tour) { tour = null; term.writeln("\x1b[2mThe tour ended. Type tour to start it again.\x1b[0m"); }
+          redraw();
+          break;
         case "\x0c": term.clear(); row = 0; redraw(); break;
         case "\x15": edit(line.slice(cursor), 0); break; // Ctrl-U
         case "\x0b": edit(line.slice(0, cursor), cursor); break; // Ctrl-K
