@@ -29,7 +29,8 @@ func TestServeLogsFinishes(t *testing.T) {
 			if tc.alreadyEnded {
 				logs.finish()
 			}
-			tp := &tabPod{name: "pod", namespace: "default", container: corev1.Container{Name: "main"}, ctx: ctx, logs: logs}
+			tp := &tabPod{name: "pod", namespace: "default", ctx: ctx}
+			tp.ctrs = []*tabCtr{{tp: tp, spec: corev1.Container{Name: "main"}, kind: ctrRegular, logs: logs}}
 			n := &tabNode{pods: map[types.UID]*tabPod{"pod": tp}}
 			r := httptest.NewRequest("GET", "/containerLogs/default/pod/main?follow=true", nil).WithContext(ctx)
 			r.SetPathValue("ns", "default")

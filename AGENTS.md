@@ -89,6 +89,30 @@ that name.
   SharedWorker the tab runs the control plane and one session itself.
 - **The kubelet of a tab is like a Virtual Kubelet**: a node for the control
   plane, but no container runtime. Limit of 8 pods per tab (kept on purpose).
+- **The VM is the pod sandbox** (2026-11-18): one VM per pod, and init
+  (`vm/init/init.c`) starts and stops its containers on command of the
+  kubelet side (`start <n>`, `kill <n> <sig>`, `add <file>` on ttyS1; it
+  answers `started <n>`, `error <n> <msg>`, `exit <n> <code>`, `log <n>
+  <base64>`, `fail <msg>`). `k8s/tabernetes/v86.go` (`drive`) runs init
+  containers in order (a sidecar, restartPolicy Always, goes on once it
+  started or its startup probe passed), then the containers, with a
+  back-off per container; `probes.go` runs the probes. A pod with one
+  container keeps its image at `/` and starts as before (no fork for
+  mounts, same first-pod time); with more containers each image is under
+  `/.tabernetes/c/<n>` and init forks a child that mounts and `chroot`s
+  (mounts and user and PATH lookups happen inside the chroot, because images
+  have absolute symlinks). Volumes are files of the 9p tree under
+  `/.tabernetes/v/<name>` in the layout of the kubelet's AtomicWriter
+  (`..<stamp>`, `..data`, one link per key); init binds them in. The
+  console (ttyS0) is the log of the first container, the others go base64
+  over ttyS1, so kernel messages stay in the first log. ConfigMaps,
+  Secrets and the token are read once while the images pull (`resolveConfig`,
+  the worker waits for the `config` message); a change does not reach a
+  running pod. kubectl debug adds the image to the running fs9p
+  (`add` in `vmworker.js`; v86 keeps the names `Search`, `CreateDirectory`,
+  `LoadRecursive` and `CreateBinaryFile` in its Closure build). Not there:
+  `--target` process namespaces (all containers share one PID namespace
+  anyway), `subPathExpr`, volume updates, PVCs, hostPath.
 - **Real images in a tab run in v86** (32-bit x86 JIT to Wasm, Joe's fork
   [jkroepke/v86](https://github.com/jkroepke/v86), see below),
   one worker per pod, `linux/386` image variants. Chosen over TinyEMU (no JIT,

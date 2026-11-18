@@ -114,7 +114,7 @@ func tabNodes() []*tabNode {
 
 // tabWorkloadByIP returns the running workload of the tab pod with the pod
 // IP ip, or nil.
-func tabWorkloadByIP(ip string) workload {
+func tabWorkloadByIP(ip string) dialer {
 	for _, n := range tabNodes() {
 		n.mu.Lock()
 		var found *tabPod
@@ -135,7 +135,7 @@ func tabWorkloadByIP(ip string) workload {
 
 // tabWorkload returns the running workload of pod when it runs on the node of
 // a tab, or nil.
-func tabWorkload(pod *corev1.Pod) workload {
+func tabWorkload(pod *corev1.Pod) dialer {
 	for _, n := range tabNodes() {
 		if n.name != pod.Spec.NodeName {
 			continue

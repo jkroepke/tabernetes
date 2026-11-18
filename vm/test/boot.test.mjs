@@ -123,7 +123,10 @@ function hello(text) {
 // program as the image, the config of init on top.
 function rootfs(text) {
   const now = Math.floor(Date.now() / 1000);
-  const conf = { args: ["/hello"], env: ["PATH=/bin"], cwd: "/", user: "", hostname: "boot-test", ip: IP, gateway: GATEWAY, stdin: false, stdinOnce: false, tty: false };
+  const conf = {
+    hostname: "boot-test", ip: IP, gateway: GATEWAY, start: ["0"], tmpfs: [],
+    containers: [{ name: "hello", root: "/", args: ["/hello"], env: ["PATH=/bin"], cwd: "/", user: "", console: true, stdin: false, stdinOnce: false, tty: false, mounts: [] }],
+  };
   const mem = new Map([
     ["mem:0", hello(text)],
     ["mem:1", new TextEncoder().encode(JSON.stringify(conf))],
@@ -134,6 +137,38 @@ function rootfs(text) {
   for (const d of ["dev", "proc", "sys", "tmp", "etc"]) tree.set(d, { uid: 0, gid: 0, mtime: now, mode: modes.S_IFDIR | 0o755 });
   return { json: tree.v86(), storage: new LayerStorage(new Map(), mem) };
 }
+
+// nestedRootfs is a pod with two containers, each in its own root under
+// .tabernetes/c, and a volume that both mount, like vmworker.js builds it.
+function nestedRootfs(texts) {
+  const now = Math.floor(Date.now() / 1000);
+  const tree = new Tree();
+  const mem = new Map();
+  const file = (path, data, mode) => {
+    const key = `mem:${mem.size}`;
+    mem.set(key, data);
+    tree.set(path, { uid: 0, gid: 0, mtime: now, mode: modes.S_IFREG | mode, size: data.length, key });
+  };
+  const dir = (path, mode = 0o755) => tree.set(path, { uid: 0, gid: 0, mtime: now, mode: modes.S_IFDIR | mode });
+  const containers = texts.map((text, i) => {
+    const root = `.tabernetes/c/${i}`;
+    for (const d of ["dev", "proc", "sys", "tmp", "etc", "data"]) dir(`${root}/${d}`);
+    file(`${root}/hello`, hello(text), 0o755);
+    return {
+      name: `c${i}`, root: "/" + root, args: ["/hello"], env: ["PATH=/bin"], cwd: "/", user: "", console: i === 0,
+      stdin: false, stdinOnce: false, tty: false, mounts: [{ src: "/.tabernetes/v/data", dst: "/data", ro: i === 1 }],
+    };
+  });
+  dir(".tabernetes/v/data", 0o777);
+  file(".tabernetes/v/data/greeting", new TextEncoder().encode("hi\n"), 0o644);
+  for (const d of ["dev", "proc", "sys", "tmp"]) dir(d);
+  const conf = { hostname: "boot-test", ip: IP, gateway: GATEWAY, start: ["0"], tmpfs: [{ path: "/.tabernetes/v/mem", options: "size=1048576" }], containers };
+  dir(".tabernetes/v/mem", 0o777);
+  file(".tabernetes/config.json", new TextEncoder().encode(JSON.stringify(conf)), 0o644);
+  return { json: tree.v86(), storage: new LayerStorage(new Map(), mem) };
+}
+
+const done = (control, i) => control.some((l) => l.startsWith(`exit ${i} `));
 
 // startPod gives the waiting init its root file system and the "go" line,
 // and waits for the program to end.
@@ -146,12 +181,38 @@ async function startPod(e, control, t) {
   const t0 = Date.now();
   e.run();
   e.serial_send_bytes(1, new TextEncoder().encode(`go ${Date.now()} ${"ab".repeat(32)}\n`));
-  await until("started", () => control.includes("started") || control.some((l) => l.startsWith("exit ")));
+  await until("started", () => control.includes("started 0") || done(control, 0) || control.some((l) => l.startsWith("fail ")));
   t.diagnostic(`started after ${Date.now() - t0} ms`);
-  await until("exit", () => control.some((l) => l.startsWith("exit ")));
-  assert.deepEqual(control.filter((l) => l !== "ready"), ["started", "exit 3"], `init: ${control.join(" | ")}`);
+  await until("exit", () => done(control, 0) || control.some((l) => l.startsWith("fail ")));
+  assert.deepEqual(control.filter((l) => l !== "ready"), ["started 0", "exit 0 3"], `init: ${control.join(" | ")}`);
   await until("console", () => console.includes(text), 5000).catch(() => {});
   assert.ok(console.includes(text), `console: ${console.join(" | ")}`);
+}
+
+// startNested starts a pod of two containers: the first at once, the second
+// on command after the first ended, as the kubelet does with an init
+// container. The second one logs on the control port.
+async function startNested(e, control, t) {
+  const console = lines(e, 0);
+  const fsys = nestedRootfs(["first\n", "second\n"]);
+  e.fs9p.storage = fsys.storage;
+  e.fs9p.load_from_json(fsys.json);
+  e.run();
+  const send = (l) => e.serial_send_bytes(1, new TextEncoder().encode(l + "\n"));
+  send(`go ${Date.now()} ${"ab".repeat(32)}`);
+  const failed = () => control.some((l) => l.startsWith("fail "));
+  await until("exit 0", () => done(control, 0) || failed());
+  assert.deepEqual(control.filter((l) => l !== "ready"), ["started 0", "exit 0 3"], `init: ${control.join(" | ")}`);
+  const t0 = Date.now();
+  send("start 1");
+  await until("exit 1", () => done(control, 1) || failed());
+  t.diagnostic(`second container ran in ${Date.now() - t0} ms`);
+  const got = control.filter((l) => l !== "ready").slice(2);
+  assert.ok(got.includes("started 1") && got.includes("exit 1 3"), `init: ${control.join(" | ")}`);
+  const logs = got.filter((l) => l.startsWith("log 1 ")).map((l) => Buffer.from(l.slice(6), "base64").toString()).join("");
+  assert.equal(logs, "second\n");
+  await until("console", () => console.includes("first"), 5000).catch(() => {});
+  assert.ok(console.includes("first") && !console.includes("second"), `console: ${console.join(" | ")}`);
 }
 
 test("the kernel boots, init starts a pod, the saved VM restores", { skip, timeout: 300_000 }, async (t) => {
@@ -183,6 +244,18 @@ test("the kernel boots, init starts a pod, the saved VM restores", { skip, timeo
     await startPod(e, control, t);
   });
   await e.destroy();
+
+  await t.test("a pod of two containers with a volume starts on the restored VM", async (t) => {
+    const r = new V86(options({}));
+    await new Promise((res) => r.add_listener("emulator-loaded", res));
+    await r.restore_state(state);
+    const control = lines(r, 1);
+    try {
+      await startNested(r, control, t);
+    } finally {
+      await r.destroy();
+    }
+  });
 
   await t.test("a pod starts on the restored VM", async (t) => {
     const r = new V86(options({}));

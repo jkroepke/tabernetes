@@ -24,7 +24,7 @@ import (
 // The cluster network of the pods on the tab nodes. A pod VM has no
 // network of its own: the network adapter of v86 ends TCP in JavaScript.
 // vmworker.js hands the connections that a pod opens to a pod IP or a
-// ClusterIP to Go (v86VM.outbound), and its DNS queries (v86VM.resolve).
+// ClusterIP to Go (v86Pod.outbound), and its DNS queries (v86Pod.resolve).
 // Go plays kube-proxy and CoreDNS for them:
 //
 //   - a ClusterIP goes to a ready endpoint of the Service, at random, as
@@ -218,7 +218,7 @@ func dialEndpoint(ctx context.Context, src string, e endpoint, port int) (net.Co
 		src = ""
 	}
 	if wl := tabWorkloadByIP(e.ip); wl != nil {
-		if v, ok := wl.(*v86VM); ok {
+		if v, ok := wl.(*v86Pod); ok {
 			return v.dialFrom(int32(port), src)
 		}
 		return wl.dial(int32(port))

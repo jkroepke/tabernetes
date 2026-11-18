@@ -7,23 +7,38 @@
 // (stage0): the page may save the VM at that point and restore it for later
 // pods (web/src/vmworker.js). The page then sends "go <unix time in ms>
 // <random bytes in hex>" on ttyS1. A restored VM has the clock and the random
-// numbers of the saved one, so init sets both first. Then it mounts the
-// layers of the image over 9p, with the container as
-// /.tabernetes/config.json on top, sets up eth0 and makes the 9p file system
-// the root.
+// numbers of the saved one, so init sets both first. Then it mounts the root
+// file system of the pod over 9p, with the pod as /.tabernetes/config.json,
+// sets up eth0 and makes the 9p file system the root.
 //
-// It does what containerd and runc do for a container: mount /proc, /sys and
-// /dev, set the hostname, then start the entrypoint with the environment,
-// working directory and user of the container. The page puts /etc/hosts and
-// /etc/resolv.conf into the file system, as the kubelet does. The console
-// (ttyS0) is stdout and stderr of the container; the second serial port
-// (ttyS1) tells the page "started", "exit <code>" and, if the entrypoint did
-// not start, "error <message>" before that.
+// The VM is the sandbox of the pod, and init is what containerd and runc are
+// for its containers. A pod with one container has the image as its root; a
+// pod with more (init containers, sidecars, kubectl debug) has the image of
+// each in /.tabernetes/c/<n>, and its processes run there (chroot), with
+// /proc, /sys and the /dev of the pod. They share the network, the IPC and
+// the processes of the pod, as with shareProcessNamespace. The volumes of the
+// pod are in /.tabernetes/v/<name>, and init binds them into the containers.
+// The page puts /etc/hosts and /etc/resolv.conf into each root, as the
+// kubelet does.
+//
+// The page starts and stops the containers with lines on ttyS1:
+//   start <n>          start container n (again, after it exited)
+//   kill <n> <signal>  signal the processes of container n
+//   add <path>         add a container from a JSON file (kubectl debug)
+// init answers on ttyS1:
+//   started <n>        the entrypoint of container n runs
+//   error <n> <msg>    it did not start (before "exit <n> 128")
+//   exit <n> <code>    it ended
+//   log <n> <base64>   output of a container that is not on the console
+//   fail <msg>         the pod cannot run
+// The console (ttyS0) is stdout and stderr of the container with "console"
+// (the first one), and the messages of the kernel.
 //
 // kubectl exec and attach come in over the network: the kubelet connects to
 // port 60250 and sends one line of JSON (k8s/tabernetes/v86exec.go). After
 // that, both sides send frames: one byte type, four bytes big-endian length,
 // the payload.
+
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -102,7 +117,7 @@ static void report(const char *fmt, ...) {
 static void *xmalloc(size_t n) {
   void *p = malloc(n ? n : 1);
   if (!p) {
-    report("error out of memory");
+    report("fail out of memory");
     for (;;) pause();
   }
   return p;
@@ -111,7 +126,7 @@ static void *xmalloc(size_t n) {
 static void *xrealloc(void *p, size_t n) {
   p = realloc(p, n ? n : 1);
   if (!p) {
-    report("error out of memory");
+    report("fail out of memory");
     for (;;) pause();
   }
   return p;
@@ -359,30 +374,6 @@ static int js_object(json_t *j, void (*field)(json_t *, const char *, void *), v
   return 0;
 }
 
-// ---- the container ----
-
-// config is the container, written by the page (web/src/vmworker.js).
-typedef struct {
-  strv_t args, env;
-  char *cwd, *user, *hostname, *ip, *gateway;
-  int stdin_, stdin_once, tty;
-} config_t;
-
-static void config_field(json_t *j, const char *k, void *arg) {
-  config_t *c = arg;
-  if (!strcmp(k, "args")) js_strings(j, &c->args);
-  else if (!strcmp(k, "env")) js_strings(j, &c->env);
-  else if (!strcmp(k, "cwd")) c->cwd = js_string(j);
-  else if (!strcmp(k, "user")) c->user = js_string(j);
-  else if (!strcmp(k, "hostname")) c->hostname = js_string(j);
-  else if (!strcmp(k, "ip")) c->ip = js_string(j);
-  else if (!strcmp(k, "gateway")) c->gateway = js_string(j);
-  else if (!strcmp(k, "stdin")) c->stdin_ = js_bool(j);
-  else if (!strcmp(k, "stdinOnce")) c->stdin_once = js_bool(j);
-  else if (!strcmp(k, "tty")) c->tty = js_bool(j);
-  else js_skip(j);
-}
-
 static char *read_file(const char *path, size_t *len) {
   int fd = open(path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) return NULL;
@@ -408,17 +399,6 @@ static int fail(const char *fmt, ...) {
   vsnprintf(err_msg, sizeof(err_msg), fmt, ap);
   va_end(ap);
   return -1;
-}
-
-static int load_config(const char *path, config_t *c) {
-  size_t n;
-  char *s = read_file(path, &n);
-  if (!s) return fail("open %s: %s", path, errtext(errno));
-  json_t j = {s, s + n, 0};
-  int rc = js_object(&j, config_field, c);
-  free(s);
-  if (rc < 0) return fail("config.json: invalid JSON");
-  return 0;
 }
 
 static const char *env_get(strv_t *env, const char *key) {
@@ -530,10 +510,6 @@ static int lookup_user(const char *spec, cred_t *cred) {
   return 0;
 }
 
-static strv_t ctr_env;
-static char *ctr_dir = "/";
-static cred_t ctr_cred;
-
 // ---- processes ----
 
 typedef struct proc {
@@ -587,16 +563,183 @@ static void nonblock(int fd) {
   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 }
 
-// proc_start starts argv in the container: as its user, in its working
-// directory, in a session of its own, with a tty or with pipes.
-static int proc_start(proc_t *p, const char *path, char **argv, int tty, int with_stdin, int rows, int cols) {
+// ---- the pod and its containers ----
+
+// A volume of the pod in a container: the page puts the files of the
+// volume into /.tabernetes/v/<name> of the root file system of the pod, and
+// init binds them to the mount path of the container (src is that directory,
+// or a subPath in it).
+typedef struct {
+  char *src, *dst;
+  int ro;
+} mount_t;
+
+// A container of the pod. The page writes them into config.json, or one in
+// a file of its own for one that comes later (kubectl debug).
+typedef struct {
+  char *name;
+  char *root; // its root file system: "/" (a pod with one container) or /.tabernetes/c/<n>
+  strv_t args, env;
+  char *cwd, *user;
+  int stdin_, stdin_once, tty;
+  int console; // its output is the console (ttyS0), else "log" lines on ttyS1
+  mount_t *mounts;
+  int nmounts;
+  // while it runs
+  int prepared; // its mounts are there
+  proc_t proc;
+  int started, exited, code, stdin_closed, reported;
+  int64_t exit_at;
+} ctr_t;
+
+static ctr_t **ctrs;
+static int nctrs;
+
+typedef struct {
+  char *path, *options;
+} tmpfs_t;
+
+// the pod, from config.json
+typedef struct {
+  char *hostname, *ip, *gateway;
+  strv_t start; // the containers that start at once, by index
+  tmpfs_t *tmpfs; // emptyDir volumes in memory
+  int ntmpfs;
+} pod_t;
+
+static pod_t pod;
+
+static void mount_field(json_t *j, const char *k, void *arg) {
+  mount_t *m = arg;
+  if (!strcmp(k, "src")) m->src = js_string(j);
+  else if (!strcmp(k, "dst")) m->dst = js_string(j);
+  else if (!strcmp(k, "ro")) m->ro = js_bool(j);
+  else js_skip(j);
+}
+
+// js_array calls item for every element of an array; null is an empty one.
+static void js_array(json_t *j, void (*item)(json_t *, void *), void *arg) {
+  js_ws(j);
+  if (j->end - j->p >= 4 && !memcmp(j->p, "null", 4)) {
+    j->p += 4;
+    return;
+  }
+  if (!js_eat(j, '[')) {
+    j->err = 1;
+    return;
+  }
+  if (js_eat(j, ']')) return;
+  do item(j, arg);
+  while (!j->err && js_eat(j, ','));
+  if (!js_eat(j, ']')) j->err = 1;
+}
+
+static void mount_item(json_t *j, void *arg) {
+  ctr_t *c = arg;
+  c->mounts = xrealloc(c->mounts, (c->nmounts + 1) * sizeof(mount_t));
+  mount_t *m = &c->mounts[c->nmounts++];
+  memset(m, 0, sizeof(*m));
+  if (js_object(j, mount_field, m) < 0 || !m->src || !m->dst) j->err = 1;
+}
+
+static void ctr_field(json_t *j, const char *k, void *arg) {
+  ctr_t *c = arg;
+  if (!strcmp(k, "name")) c->name = js_string(j);
+  else if (!strcmp(k, "root")) c->root = js_string(j);
+  else if (!strcmp(k, "args")) js_strings(j, &c->args);
+  else if (!strcmp(k, "env")) js_strings(j, &c->env);
+  else if (!strcmp(k, "cwd")) c->cwd = js_string(j);
+  else if (!strcmp(k, "user")) c->user = js_string(j);
+  else if (!strcmp(k, "stdin")) c->stdin_ = js_bool(j);
+  else if (!strcmp(k, "stdinOnce")) c->stdin_once = js_bool(j);
+  else if (!strcmp(k, "tty")) c->tty = js_bool(j);
+  else if (!strcmp(k, "console")) c->console = js_bool(j);
+  else if (!strcmp(k, "mounts")) js_array(j, mount_item, c);
+  else js_skip(j);
+}
+
+static ctr_t *ctr_new(void) {
+  ctr_t *c = xmalloc(sizeof(*c));
+  memset(c, 0, sizeof(*c));
+  c->proc.stdin_fd = c->proc.pty = c->proc.out[0] = c->proc.out[1] = -1;
+  return c;
+}
+
+static void ctr_add(ctr_t *c) {
+  if (!c->root || !*c->root) c->root = "/";
+  ctrs = xrealloc(ctrs, (nctrs + 1) * sizeof(*ctrs));
+  ctrs[nctrs++] = c;
+}
+
+static void ctr_item(json_t *j, void *arg) {
+  (void)arg;
+  ctr_t *c = ctr_new();
+  if (js_object(j, ctr_field, c) < 0) j->err = 1;
+  else ctr_add(c);
+}
+
+static void tmpfs_field(json_t *j, const char *k, void *arg) {
+  tmpfs_t *t = arg;
+  if (!strcmp(k, "path")) t->path = js_string(j);
+  else if (!strcmp(k, "options")) t->options = js_string(j);
+  else js_skip(j);
+}
+
+static void tmpfs_item(json_t *j, void *arg) {
+  pod_t *p = arg;
+  p->tmpfs = xrealloc(p->tmpfs, (p->ntmpfs + 1) * sizeof(tmpfs_t));
+  tmpfs_t *t = &p->tmpfs[p->ntmpfs++];
+  memset(t, 0, sizeof(*t));
+  if (js_object(j, tmpfs_field, t) < 0 || !t->path) j->err = 1;
+}
+
+static void pod_field(json_t *j, const char *k, void *arg) {
+  pod_t *p = arg;
+  if (!strcmp(k, "hostname")) p->hostname = js_string(j);
+  else if (!strcmp(k, "ip")) p->ip = js_string(j);
+  else if (!strcmp(k, "gateway")) p->gateway = js_string(j);
+  else if (!strcmp(k, "containers")) js_array(j, ctr_item, NULL);
+  else if (!strcmp(k, "start")) js_strings(j, &p->start);
+  else if (!strcmp(k, "tmpfs")) js_array(j, tmpfs_item, p);
+  else js_skip(j);
+}
+
+static int load_config(const char *path) {
+  size_t n;
+  char *s = read_file(path, &n);
+  if (!s) return fail("open %s: %s", path, errtext(errno));
+  json_t j = {s, s + n, 0};
+  int rc = js_object(&j, pod_field, &pod);
+  free(s);
+  if (rc < 0) return fail("config.json: invalid JSON");
+  return 0;
+}
+
+// load_container adds the container in the file path (kubectl debug).
+static int load_container(const char *path) {
+  size_t n;
+  char *s = read_file(path, &n);
+  if (!s) return fail("open %s: %s", path, errtext(errno));
+  json_t j = {s, s + n, 0};
+  ctr_t *c = ctr_new();
+  int rc = js_object(&j, ctr_field, c);
+  free(s);
+  if (rc < 0) return fail("%s: invalid JSON", path);
+  ctr_add(c);
+  return 0;
+}
+
+static int is_root(const ctr_t *c) { return !strcmp(c->root, "/"); }
+
+// proc_start starts argv in the container c: in its root, as its user, in its
+// working directory, in a session of its own, with a tty or with pipes. The
+// child looks up the user and the program itself, in the root of the
+// container: absolute symlinks of the image point into it there.
+static int proc_start(proc_t *p, ctr_t *c, char **argv, int tty, int with_stdin, int rows, int cols) {
   memset(p, 0, sizeof(*p));
   p->stdin_fd = p->pty = p->out[0] = p->out[1] = -1;
   int child[3] = {-1, -1, -1};
   int extra[3] = {-1, -1, -1}; // the ends of the child, closed after the start
-  strv_t env = {0};
-  for (int i = 0; i < ctr_env.n; i++) strv_add(&env, ctr_env.v[i]);
-  if (tty && !env_get(&env, "TERM")) strv_add(&env, "TERM=xterm"); // as containerd does
   if (tty) {
     int m = -1, s = -1;
     if (open_pty(rows, cols, &m, &s) < 0) goto fail;
@@ -640,6 +783,7 @@ static int proc_start(proc_t *p, const char *path, char **argv, int tty, int wit
     // in the tests on the host, init is not PID 1: its children must not
     // outlive it
     if (test_config) prctl(PR_SET_PDEATHSIG, SIGKILL);
+    err_msg[0] = 0;
     int e = 0;
     // move the ends of the child out of the way of 0-2 first
     int fd[3];
@@ -647,31 +791,49 @@ static int proc_start(proc_t *p, const char *path, char **argv, int tty, int wit
     for (int i = 0; i < 3; i++)
       if (dup2(fd[i], i) < 0) e = errno;
     if (!e && tty && ioctl(0, TIOCSCTTY, 1) < 0) e = errno;
-    if (!e && ctr_cred.set && (setgid(ctr_cred.gid) < 0 || setuid(ctr_cred.uid) < 0)) e = errno;
-    if (!e && chdir(ctr_dir) < 0) e = errno;
-    if (!e) {
-      execve(path, argv, env.v);
-      e = errno;
+    if (!e && !is_root(c) && (chroot(c->root) < 0 || chdir("/") < 0)) e = errno;
+    cred_t cred = {0};
+    strv_t env = {0};
+    char *path = NULL;
+    if (!e && lookup_user(c->user, &cred) == 0) {
+      for (int i = 0; i < c->env.n; i++) strv_add(&env, c->env.v[i]);
+      env_default(&env, "PATH", DEFAULT_PATH);
+      if (pod.hostname && *pod.hostname) env_default(&env, "HOSTNAME", pod.hostname);
+      env_default(&env, "HOME", cred.home);
+      if (tty) env_default(&env, "TERM", "xterm"); // as containerd does
+      path = look_path(argv[0], env_get(&env, "PATH"));
     }
-    (void)!write(errp[1], &e, sizeof(e));
+    if (path) {
+      const char *dir = c->cwd && *c->cwd ? c->cwd : "/";
+      if (cred.set && (setgid(cred.gid) < 0 || setuid(cred.uid) < 0)) {
+        fail("%s", errtext(errno));
+      } else if (chdir(dir) < 0) {
+        fail("chdir to cwd (\"%s\") set in config.json failed: %s", dir, errtext(errno));
+      } else {
+        execve(path, argv, env.v);
+        fail("exec: \"%s\": %s", argv[0], errtext(errno));
+      }
+    } else if (e) {
+      fail("%s", errtext(e));
+    }
+    (void)!write(errp[1], err_msg, strlen(err_msg) + 1);
     _exit(127);
   }
   close(errp[1]);
-  int e = 0;
   ssize_t n;
-  while ((n = read(errp[0], &e, sizeof(e))) < 0 && errno == EINTR) {}
+  while ((n = read(errp[0], err_msg, sizeof(err_msg) - 1)) < 0 && errno == EINTR) {}
   close(errp[0]);
   for (int i = 0; i < 3; i++)
     if (extra[i] >= 0) close(extra[i]);
-  free(env.v);
-  if (n == sizeof(e)) {
+  if (n > 0) {
+    err_msg[n] = 0;
     // the child is gone: the reaper ignores the pid
     if (p->pty >= 0) close(p->pty);
     else {
       if (p->stdin_fd >= 0) close(p->stdin_fd);
       for (int i = 0; i < p->nout; i++) close(p->out[i]);
     }
-    return fail("exec: \"%s\": %s", argv[0], errtext(e));
+    return -1;
   }
   p->pid = pid;
   if (p->stdin_fd >= 0) nonblock(p->stdin_fd);
@@ -688,8 +850,106 @@ fail:
     for (int i = 0; i < 2; i++)
       if (p->out[i] >= 0) close(p->out[i]);
   }
-  free(env.v);
   return -1;
+}
+
+// mkdir_p makes dir and its parents.
+static void mkdir_p(const char *dir) {
+  char p[4096];
+  snprintf(p, sizeof(p), "%s", dir);
+  for (char *s = p + 1; *s; s++) {
+    if (*s != '/') continue;
+    *s = 0;
+    mkdir(p, 0755);
+    *s = '/';
+  }
+  mkdir(p, 0755);
+}
+
+// prepare_child mounts what the container c sees, in a child of init that
+// went into the root of the container: a mount path may cross a symlink of
+// the image. The mounts are in the namespace of init and stay after the
+// child. A container in a root of its own gets its root as a mount (df and
+// /proc/mounts show "overlay" on /, as with containerd), /proc, /sys and the
+// /dev of the pod (shared: pods share IPC).
+static int prepare_child(ctr_t *c) {
+  int dev = -1, *src = xmalloc((c->nmounts + 1) * sizeof(int));
+  for (int i = 0; i < c->nmounts; i++) {
+    src[i] = open(c->mounts[i].src, O_PATH | O_CLOEXEC);
+    if (src[i] < 0) return fail("open %s: %s", c->mounts[i].src, errtext(errno));
+  }
+  char via[64];
+  if (!is_root(c)) {
+    dev = open("/dev", O_PATH | O_CLOEXEC);
+    if (dev < 0) return fail("open /dev: %s", errtext(errno));
+    if (mount(c->root, c->root, NULL, MS_BIND, NULL) < 0) return fail("bind %s: %s", c->root, errtext(errno));
+    if (chroot(c->root) < 0 || chdir("/") < 0) return fail("chroot %s: %s", c->root, errtext(errno));
+    mkdir("/proc", 0555);
+    mkdir("/sys", 0555);
+    mkdir("/dev", 0755);
+    if (mount("proc", "/proc", "proc", 0, NULL) < 0) return fail("mount /proc: %s", errtext(errno));
+    if (mount("sysfs", "/sys", "sysfs", 0, NULL) < 0) return fail("mount /sys: %s", errtext(errno));
+    snprintf(via, sizeof(via), "/proc/self/fd/%d", dev);
+    if (mount(via, "/dev", NULL, MS_BIND | MS_REC, NULL) < 0) return fail("mount /dev: %s", errtext(errno));
+  }
+  for (int i = 0; i < c->nmounts; i++) {
+    mount_t *m = &c->mounts[i];
+    struct stat st;
+    if (fstat(src[i], &st) < 0) return fail("stat %s: %s", m->src, errtext(errno));
+    struct stat dst;
+    if (stat(m->dst, &dst) < 0) {
+      if (S_ISDIR(st.st_mode)) mkdir_p(m->dst);
+      else {
+        char parent[4096];
+        snprintf(parent, sizeof(parent), "%s", m->dst);
+        char *slash = strrchr(parent, '/');
+        if (slash && slash != parent) {
+          *slash = 0;
+          mkdir_p(parent);
+        }
+        int f = open(m->dst, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+        if (f >= 0) close(f);
+      }
+    }
+    snprintf(via, sizeof(via), "/proc/self/fd/%d", src[i]);
+    if (mount(via, m->dst, NULL, MS_BIND | MS_REC, NULL) < 0) return fail("mount %s: %s", m->dst, errtext(errno));
+    if (m->ro && mount(NULL, m->dst, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) return fail("mount %s read-only: %s", m->dst, errtext(errno));
+  }
+  return 0;
+}
+
+// ctr_prepare mounts the volumes and the system file systems of c, once.
+static int ctr_prepare(ctr_t *c) {
+  if (c->prepared) return 0;
+  if (test_config || (is_root(c) && !c->nmounts)) {
+    c->prepared = 1;
+    return 0;
+  }
+  int errp[2];
+  if (pipe2(errp, O_CLOEXEC) < 0) return fail("%s", errtext(errno));
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(errp[0]);
+    close(errp[1]);
+    return fail("%s", errtext(errno));
+  }
+  if (pid == 0) {
+    err_msg[0] = 0;
+    if (prepare_child(c) < 0) (void)!write(errp[1], err_msg, strlen(err_msg) + 1);
+    _exit(0);
+  }
+  close(errp[1]);
+  ssize_t n;
+  while ((n = read(errp[0], err_msg, sizeof(err_msg) - 1)) < 0 && errno == EINTR) {}
+  close(errp[0]);
+  // the reaper of the loop would take it otherwise
+  while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+  if (n > 0) {
+    err_msg[n] = 0;
+    return -1;
+  }
+  c->prepared = 1;
+  return 0;
 }
 
 // proc_end_input tells the process that stdin ended. A tty has no end of its
@@ -739,13 +999,10 @@ typedef struct session {
   int gone;       // the peer went away
   int dropped;    // an attach that was too slow
   int ended;      // endStdin ran
+  ctr_t *ctr;     // the container
 } session_t;
 
 static session_t *sessions;
-static proc_t main_proc;
-static int main_started, main_exited, main_code;
-static int main_stdin_once, main_stdin_closed;
-static int64_t main_exit_at;
 static int console = -1;
 
 static void frame(session_t *s, int type, const void *b, uint32_t n) {
@@ -768,7 +1025,7 @@ static void frame_error(session_t *s, const char *msg) {
 static int stdin_target(session_t *s) {
   if (!s->stdin_on) return -1;
   if (s->kind == S_EXEC) return s->proc.stdin_fd;
-  return main_proc.stdin_fd;
+  return s->ctr->proc.stdin_fd;
 }
 
 // end_stdin: an exec closes the stdin of its command; an attach with
@@ -780,9 +1037,10 @@ static void end_stdin(session_t *s) {
   }
   if (s->ended || !s->stdin_on) return;
   s->ended = 1;
-  if (main_stdin_once && !main_stdin_closed) {
-    main_stdin_closed = 1;
-    proc_end_input(&main_proc);
+  ctr_t *c = s->ctr;
+  if (c->stdin_once && !c->stdin_closed && c->started && !c->exited) {
+    c->stdin_closed = 1;
+    proc_end_input(&c->proc);
   }
 }
 
@@ -828,7 +1086,7 @@ static void session_frame(session_t *s, int type, const char *b, uint32_t n) {
     break;
   case IN_RESIZE:
     if (n == 4) {
-      int pty = s->kind == S_EXEC ? s->proc.pty : main_proc.pty;
+      int pty = s->kind == S_EXEC ? s->proc.pty : s->ctr->proc.pty;
       set_size(pty, (unsigned char)b[0] << 8 | (unsigned char)b[1], (unsigned char)b[2] << 8 | (unsigned char)b[3]);
     }
     break;
@@ -837,7 +1095,7 @@ static void session_frame(session_t *s, int type, const char *b, uint32_t n) {
 
 typedef struct {
   strv_t cmd;
-  int tty, stdin_, attach, rows, cols;
+  int tty, stdin_, attach, rows, cols, container;
 } request_t;
 
 static void request_field(json_t *j, const char *k, void *arg) {
@@ -848,6 +1106,7 @@ static void request_field(json_t *j, const char *k, void *arg) {
   else if (!strcmp(k, "attach")) r->attach = js_bool(j);
   else if (!strcmp(k, "rows")) r->rows = js_number(j);
   else if (!strcmp(k, "cols")) r->cols = js_number(j);
+  else if (!strcmp(k, "container")) r->container = js_number(j);
   else js_skip(j);
 }
 
@@ -858,28 +1117,33 @@ static void session_request(session_t *s, const char *line, size_t n) {
     frame_error(s, "invalid request");
     goto out;
   }
+  s->kind = r.attach ? S_ATTACH : S_EXEC;
+  if (r.container < 0 || r.container >= nctrs) {
+    frame_error(s, "container not found");
+    goto out;
+  }
+  ctr_t *c = s->ctr = ctrs[r.container];
   if (r.attach) {
-    s->kind = S_ATTACH;
-    if (!main_started || main_exited) {
+    if (!c->started || c->exited) {
       frame_error(s, "container not running");
       goto out;
     }
-    s->stdin_on = r.stdin_ && main_proc.stdin_fd >= 0;
-    if (main_proc.pty >= 0 && r.rows > 0) set_size(main_proc.pty, r.rows, r.cols);
+    s->stdin_on = r.stdin_ && c->proc.stdin_fd >= 0;
+    if (c->proc.pty >= 0 && r.rows > 0) set_size(c->proc.pty, r.rows, r.cols);
     goto out;
   }
-  s->kind = S_EXEC;
   if (!r.cmd.n) {
     frame_error(s, "exec: no command specified");
     goto out;
   }
-  char *path = look_path(r.cmd.v[0], env_get(&ctr_env, "PATH"));
-  if (!path || proc_start(&s->proc, path, r.cmd.v, r.tty, r.stdin_, r.rows, r.cols) < 0) {
-    frame_error(s, err_msg);
-    free(path);
+  if (!c->prepared) {
+    frame_error(s, "container not running");
     goto out;
   }
-  free(path);
+  if (proc_start(&s->proc, c, r.cmd.v, r.tty, r.stdin_, r.rows, r.cols) < 0) {
+    frame_error(s, err_msg);
+    goto out;
+  }
   s->has_proc = 1;
   s->stdin_on = r.stdin_;
 out:
@@ -952,14 +1216,46 @@ static ssize_t read_output(proc_t *p, int i, char *b, size_t n) {
   return r;
 }
 
-static void main_output(int i) {
+static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// log_lines sends the output of container i as "log <i> <base64>" lines on
+// ttyS1: the console (ttyS0) is the log of one container only.
+static void log_lines(int idx, const unsigned char *b, size_t n) {
+  static char line[4096];
+  while (n > 0) {
+    size_t k = n < 2048 ? n : 2048, o = 0;
+    for (size_t i = 0; i < k; i += 3) {
+      uint32_t v = b[i] << 16 | (i + 1 < k ? b[i + 1] << 8 : 0) | (i + 2 < k ? b[i + 2] : 0);
+      line[o++] = b64[v >> 18 & 63];
+      line[o++] = b64[v >> 12 & 63];
+      line[o++] = i + 1 < k ? b64[v >> 6 & 63] : '=';
+      line[o++] = i + 2 < k ? b64[v & 63] : '=';
+    }
+    line[o] = 0;
+    report("log %d %s", idx, line);
+    b += k;
+    n -= k;
+  }
+}
+
+static int ctr_index(ctr_t *c) {
+  for (int i = 0; i < nctrs; i++)
+    if (ctrs[i] == c) return i;
+  return -1;
+}
+
+static void ctr_output(ctr_t *c, int i) {
   static char b[32 << 10];
-  ssize_t n = read_output(&main_proc, i, b, sizeof(b));
+  ssize_t n = read_output(&c->proc, i, b, sizeof(b));
   if (n <= 0) return;
-  if (console >= 0) write_all(console, b, n);
+  if (c->console) {
+    if (console >= 0) write_all(console, b, n);
+  } else {
+    log_lines(ctr_index(c), (unsigned char *)b, n);
+  }
   for (session_t *s = sessions; s; s = s->next) {
-    if (s->kind != S_ATTACH || s->closing || s->gone) continue;
-    frame(s, main_proc.out_type[i], b, n);
+    if (s->kind != S_ATTACH || s->ctr != c || s->closing || s->gone) continue;
+    frame(s, c->proc.out_type[i], b, n);
     if (s->out.len > ATTACH_MAX_BUFFER) {
       // too slow: drop it rather than hold up the container
       s->dropped = 1;
@@ -979,7 +1275,8 @@ static void reap(void) {
   pid_t pid;
   while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
     proc_t *p = NULL;
-    if (main_started && pid == main_proc.pid) p = &main_proc;
+    for (int i = 0; i < nctrs && !p; i++)
+      if (ctrs[i]->started && !ctrs[i]->exited && pid == ctrs[i]->proc.pid) p = &ctrs[i]->proc;
     for (session_t *s = sessions; s && !p; s = s->next)
       if (s->has_proc && s->proc.pid == pid) p = &s->proc;
     if (!p || p->done) continue;
@@ -1058,36 +1355,90 @@ static int session_step(session_t *s, int64_t now) {
   return 1;
 }
 
-static void main_step(int64_t now) {
-  if (!main_started || main_exited || !main_proc.done) return;
-  if (proc_outputs_open(&main_proc) && now < main_proc.drain_until) return;
-  proc_close(&main_proc);
-  main_exited = 1;
-  main_code = main_proc.code;
-  main_exit_at = now;
+static void ctr_step(ctr_t *c, int64_t now) {
+  if (!c->started || c->exited || !c->proc.done) return;
+  if (proc_outputs_open(&c->proc) && now < c->proc.drain_until) return;
+  proc_close(&c->proc);
+  c->exited = 1;
+  c->code = c->proc.code;
+  c->exit_at = now;
   for (session_t *s = sessions; s; s = s->next) {
-    if (s->kind != S_ATTACH || s->gone) continue;
-    if (!s->dropped) frame_code(s, main_code);
+    if (s->kind != S_ATTACH || s->ctr != c || s->gone) continue;
+    if (!s->dropped) frame_code(s, c->code);
     s->closing = 1;
   }
 }
 
-static int attaches_left(void) {
+static int attaches_left(ctr_t *c) {
   for (session_t *s = sessions; s; s = s->next)
-    if (s->kind == S_ATTACH) return 1;
+    if (s->kind == S_ATTACH && s->ctr == c) return 1;
   return 0;
 }
 
-// loop runs until the main process exited and the attaches saw it, or
-// forever with exit_done set (exec still works, as with runc).
-static void loop(int *reported) {
+// ctr_start starts container i, again after it exited (a restart). A
+// container that does not start reports its error and exit code 128, as the
+// kubelet reports a StartError.
+static void ctr_start(int i) {
+  if (i < 0 || i >= nctrs) return;
+  ctr_t *c = ctrs[i];
+  if (c->started && !c->exited) return;
+  c->started = c->exited = c->reported = c->stdin_closed = 0;
+  int rows = c->tty ? 24 : 0, cols = c->tty ? 80 : 0;
+  if (!c->args.n) fail("no command specified");
+  if (!c->args.n || ctr_prepare(c) < 0 || proc_start(&c->proc, c, c->args.v, c->tty, c->stdin_, rows, cols) < 0) {
+    report("error %d %s", i, err_msg);
+    report("exit %d 128", i);
+    return;
+  }
+  c->started = 1;
+  report("started %d", i);
+}
+
+// command runs a line of the page on ttyS1: "start <i>", "kill <i>
+// <signal>", "add <path>" (kubectl debug: a container in a file).
+static void command(char *line) {
+  int i, sig;
+  char path[512];
+  if (sscanf(line, "start %d", &i) == 1) {
+    ctr_start(i);
+  } else if (sscanf(line, "kill %d %d", &i, &sig) == 2) {
+    if (i >= 0 && i < nctrs && ctrs[i]->started && !ctrs[i]->exited && !ctrs[i]->proc.done) kill(-ctrs[i]->proc.pid, sig);
+  } else if (sscanf(line, "add %511s", path) == 1) {
+    if (load_container(path) < 0) report("fail %s", err_msg);
+  }
+}
+
+static int control_in = -1; // where the commands come from
+static buf_t control_buf;
+
+static void control_read(void) {
+  char b[1024];
+  ssize_t n = read(control_in, b, sizeof(b));
+  if (n <= 0) {
+    if (n == 0 || (errno != EAGAIN && errno != EINTR)) control_in = -1;
+    return;
+  }
+  buf_add(&control_buf, b, n);
+  for (;;) {
+    char *nl = memchr(control_buf.b, '\n', control_buf.len);
+    if (!nl) break;
+    *nl = 0;
+    size_t len = nl - control_buf.b;
+    if (len && control_buf.b[len - 1] == '\r') control_buf.b[len - 1] = 0;
+    command(control_buf.b);
+    buf_drop(&control_buf, len + 1);
+  }
+}
+
+// loop runs the containers and the sessions until the page ends the VM.
+static void loop(void) {
   struct pollfd *fds = NULL;
   void **who = NULL; // what each pollfd is for
   int *what = NULL;
   int cap = 0;
   for (;;) {
     int64_t now = now_ms();
-    main_step(now);
+    for (int i = 0; i < nctrs; i++) ctr_step(ctrs[i], now);
     for (session_t **pp = &sessions; *pp;) {
       session_t *s = *pp;
       if (!session_step(s, now)) {
@@ -1097,10 +1448,13 @@ static void loop(int *reported) {
         pp = &s->next;
       }
     }
-    if (main_exited && !*reported && (!attaches_left() || now - main_exit_at >= 500)) {
-      // let kubectl attach see the end before the page stops the VM
-      report("exit %d", main_code);
-      *reported = 1;
+    for (int i = 0; i < nctrs; i++) {
+      ctr_t *c = ctrs[i];
+      if (c->exited && !c->reported && (!attaches_left(c) || now - c->exit_at >= 500)) {
+        // let kubectl attach see the end before the page stops the VM
+        report("exit %d %d", i, c->code);
+        c->reported = 1;
+      }
     }
     int n = 0;
     int64_t deadline = -1;
@@ -1119,14 +1473,18 @@ static void loop(int *reported) {
   } while (0)
     ADD(sigfd, POLLIN, NULL, 0);
     if (listener >= 0) ADD(listener, POLLIN, NULL, 1);
-    if (main_started && !main_exited) {
-      for (int i = 0; i < main_proc.nout; i++)
-        if (main_proc.out[i] >= 0) ADD(main_proc.out[i], POLLIN, NULL, 2 + i);
-      if (main_proc.done) deadline = main_proc.drain_until;
-    }
-    if (main_exited && !*reported) {
-      int64_t d = main_exit_at + 500;
-      if (deadline < 0 || d < deadline) deadline = d;
+    if (control_in >= 0) ADD(control_in, POLLIN, NULL, 4);
+    for (int k = 0; k < nctrs; k++) {
+      ctr_t *c = ctrs[k];
+      if (c->started && !c->exited) {
+        for (int i = 0; i < c->proc.nout; i++)
+          if (c->proc.out[i] >= 0) ADD(c->proc.out[i], POLLIN, c, 2 + i);
+        if (c->proc.done && (deadline < 0 || c->proc.drain_until < deadline)) deadline = c->proc.drain_until;
+      }
+      if (c->exited && !c->reported) {
+        int64_t d = c->exit_at + 500;
+        if (deadline < 0 || d < deadline) deadline = d;
+      }
     }
     for (session_t *s = sessions; s; s = s->next) {
       ADD(s->fd, (s->closing ? 0 : POLLIN) | (s->out.len ? POLLOUT : 0), s, 10);
@@ -1157,7 +1515,12 @@ static void loop(int *reported) {
       }
       case 1: accept_sessions(); break;
       case 2:
-      case 3: main_output(what[i] - 2); break;
+      case 3: {
+        ctr_t *c = who[i];
+        if (c->started && !c->exited && c->proc.out[what[i] - 2] == fds[i].fd) ctr_output(c, what[i] - 2);
+        break;
+      }
+      case 4: control_read(); break;
       case 10:
         if (fds[i].revents & POLLOUT) session_write(s);
         if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) session_read(s);
@@ -1318,9 +1681,7 @@ static int mount_dev_proc_sys(void) {
   return 0;
 }
 
-// The config of the pod, read by stage 0 from the root of the pod.
-static config_t staged_config;
-static int staged; // stage 0 set up /dev, /proc, /sys and the config
+static int staged; // stage 0 set up /dev, /proc, /sys and read the config
 
 // from <linux/random.h>, which a musl tool chain may not have
 #define RNDADDENTROPY 0x40085203
@@ -1465,8 +1826,8 @@ static int stage0(void) {
   // and writes such files without the page cache, one 9p request per read
   // call. With the page cache, a file is read once and with readahead.
   if (mount(ROOT_TAG, NEW_ROOT, "9p", 0, "trans=virtio,version=9p2000.L,cache=loose,ignoreqv,msize=262144") < 0) return fail("mount 9p: %s", errtext(errno));
-  if (load_config(NEW_ROOT "/.tabernetes/config.json", &staged_config) < 0) return -1;
-  if (setup_network(staged_config.ip, staged_config.gateway) < 0) return -1;
+  if (load_config(NEW_ROOT "/.tabernetes/config.json") < 0) return -1;
+  if (setup_network(pod.ip, pod.gateway) < 0) return -1;
   // /dev (with /dev/pts and /dev/shm), /proc and /sys move into the root of
   // the pod
   static const char *const moves[] = {"/dev", "/proc", "/sys"};
@@ -1485,35 +1846,33 @@ static int stage0(void) {
   return 0;
 }
 
-// ---- the container ----
+// ---- the pod ----
 
-static int setup_container(config_t *c) {
-  if (test_config) {
-    if (load_config(test_config, c) < 0) return -1;
-    if (!c->args.n) return fail("no command specified");
-    return 0;
-  }
+static int setup_pod(void) {
+  if (test_config) return load_config(test_config);
   if (!staged && mount_dev_proc_sys() < 0) return -1;
-  if (control < 0) control = open("/dev/ttyS1", O_WRONLY | O_CLOEXEC);
   console = open("/dev/console", O_WRONLY | O_CLOEXEC);
   if (console < 0) return fail("open /dev/console: %s", errtext(errno));
   dup2(console, 1);
   dup2(console, 2);
+  if (!staged && load_config("/.tabernetes/config.json") < 0) return -1;
 
-  if (staged) *c = staged_config;
-  else if (load_config("/.tabernetes/config.json", c) < 0) return -1;
-  if (!c->args.n) return fail("no command specified");
-
-  // what the kubelet does for every container; /etc/hosts and
-  // /etc/resolv.conf come from the page (web/src/vmworker.js)
-  if (c->hostname && *c->hostname) (void)!sethostname(c->hostname, strlen(c->hostname));
-  if (c->gateway && *c->gateway) {
+  // what the kubelet does for every pod; /etc/hosts and /etc/resolv.conf
+  // come from the page (web/src/vmworker.js)
+  if (pod.hostname && *pod.hostname) (void)!sethostname(pod.hostname, strlen(pod.hostname));
+  if (pod.gateway && *pod.gateway) {
     // The network of the page learns the MAC of eth0 from the first packet:
     // send one, so that port-forward finds the pod.
     int u = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     struct sockaddr_in to = {.sin_family = AF_INET, .sin_port = htons(9)};
-    if (u >= 0 && inet_aton(c->gateway, &to.sin_addr)) sendto(u, "", 1, 0, (struct sockaddr *)&to, sizeof(to));
+    if (u >= 0 && inet_aton(pod.gateway, &to.sin_addr)) sendto(u, "", 1, 0, (struct sockaddr *)&to, sizeof(to));
     if (u >= 0) close(u);
+  }
+  // emptyDir volumes with medium Memory
+  for (int i = 0; i < pod.ntmpfs; i++) {
+    mkdir_p(pod.tmpfs[i].path);
+    if (mount("tmpfs", pod.tmpfs[i].path, "tmpfs", MS_NOSUID | MS_NODEV, pod.tmpfs[i].options) < 0)
+      return fail("mount tmpfs %s: %s", pod.tmpfs[i].path, errtext(errno));
   }
   return 0;
 }
@@ -1533,28 +1892,6 @@ static int start_exec_server(void) {
   return 0;
 }
 
-// run sets up the container and starts its entrypoint. It returns the exit
-// code to report if the entrypoint did not start, with err_msg set.
-static int run(void) {
-  config_t c = {0};
-  if (setup_container(&c) < 0) return 0;
-  for (int i = 0; i < c.env.n; i++) strv_add(&ctr_env, c.env.v[i]);
-  env_default(&ctr_env, "PATH", DEFAULT_PATH);
-  if (c.hostname && *c.hostname) env_default(&ctr_env, "HOSTNAME", c.hostname);
-  if (lookup_user(c.user, &ctr_cred) < 0) return 0;
-  env_default(&ctr_env, "HOME", ctr_cred.home);
-  char *path = look_path(c.args.v[0], env_get(&ctr_env, "PATH"));
-  if (!path) return 128;
-  if (c.cwd && *c.cwd) ctr_dir = c.cwd;
-  int rows = c.tty ? 24 : 0, cols = c.tty ? 80 : 0;
-  if (proc_start(&main_proc, path, c.args.v, c.tty, c.stdin_, rows, cols) < 0) return 128;
-  main_started = 1;
-  main_stdin_once = c.stdin_once;
-  start_exec_server();
-  report("started");
-  return -1;
-}
-
 int main(int argc, char **argv) {
   (void)argc;
   // SIGCHLD comes through a signalfd, the others are not for PID 1
@@ -1565,32 +1902,35 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   sigfd = signalfd(-1, &set, SFD_NONBLOCK | SFD_CLOEXEC);
 
-  int code = -1;
   int ok = 0;
   test_config = getenv("TABERNETES_INIT_TEST");
   if (test_config) {
     const char *port = getenv("TABERNETES_INIT_PORT");
     if (port) exec_port = atoi(port);
     control = dup(1);
+    control_in = 0; // the tests send the commands on stdin
     ok = 1;
   } else if (argv[0] && !strcmp(argv[0], "warm")) return warm_child();
   else if (getpid() == 1 && !strcmp(argv[0], "/init")) ok = stage0() == 0;
   else {
-    control = open("/dev/ttyS1", O_WRONLY | O_CLOEXEC);
+    control = open("/dev/ttyS1", O_RDWR | O_CLOEXEC);
     ok = 1;
   }
-  if (ok) code = run();
-  int reported = 0;
-  if (code >= 0 || !ok) {
-    // The kubelet reports a container that did not start as StartError with
-    // exit code 128, and the error in the events, not in the log.
-    if (control >= 0) report("error %s", err_msg);
+  if (control_in < 0) control_in = control;
+  if (control_in >= 0) nonblock(control_in);
+  if (ok) ok = setup_pod() == 0;
+  if (!ok) {
+    // The pod cannot run: the page tells it as an error of every container.
+    if (control >= 0) report("fail %s", err_msg);
     else dprintf(2, "tabernetes init: %s\n", err_msg);
-    report("exit %d", code > 0 ? code : 128);
-    reported = 1;
+  } else {
+    // The server goes up first: kubectl exec may come as soon as one
+    // container started.
+    start_exec_server();
+    for (int i = 0; i < pod.start.n; i++) ctr_start(atoi(pod.start.v[i]));
   }
   // The page ends the VM. PID 1 must not exit (the kernel panics), and the
   // kernel cannot power off without ACPI: it would say so in the log.
-  loop(&reported);
+  loop();
   return 0;
 }

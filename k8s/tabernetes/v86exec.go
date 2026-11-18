@@ -18,7 +18,7 @@ import (
 )
 
 // kubectl exec and attach for a pod in v86. Init of the VM listens on
-// vmExecPort (vm/init/exec.go), and the kubelet connects to it through the
+// vmExecPort (vm/init/init.c), and the kubelet connects to it through the
 // network card of the VM, as port-forward does. The kubelet sends one line of
 // JSON, then both sides send frames: one byte type, four bytes big-endian
 // length, the payload.
@@ -41,17 +41,13 @@ const (
 	vmStdinAck = 5 // the previous stdin frame was consumed
 )
 
-// streamer is a workload with a terminal and an attachable main process.
-type streamer interface {
-	// stream runs cmd in the workload, or attaches to its main process.
-	stream(ctx context.Context, attach bool, cmd []string, in io.Reader, out, errOut io.Writer, tty bool, resize <-chan remotecommand.TerminalSize) error
+// exec runs cmd in the container c (probes).
+func (v *v86Pod) exec(ctx context.Context, c *tabCtr, cmd []string, in io.Reader, out, errOut io.Writer) error {
+	return v.stream(ctx, c, false, cmd, in, out, errOut, false, nil)
 }
 
-func (v *v86VM) exec(ctx context.Context, cmd []string, in io.Reader, out, errOut io.Writer) error {
-	return v.stream(ctx, false, cmd, in, out, errOut, false, nil)
-}
-
-func (v *v86VM) stream(ctx context.Context, attach bool, cmd []string, in io.Reader, out, errOut io.Writer, tty bool, resize <-chan remotecommand.TerminalSize) error {
+// stream runs cmd in the container c, or attaches to its main process.
+func (v *v86Pod) stream(ctx context.Context, c *tabCtr, attach bool, cmd []string, in io.Reader, out, errOut io.Writer, tty bool, resize <-chan remotecommand.TerminalSize) error {
 	conn, err := v.dial(vmExecPort)
 	if err != nil {
 		return fmt.Errorf("failed to connect to the container: %w", err)
@@ -64,7 +60,7 @@ func (v *v86VM) stream(ctx context.Context, attach bool, cmd []string, in io.Rea
 		conn.Close()
 	}()
 
-	req := map[string]any{"cmd": cmd, "tty": tty, "stdin": in != nil, "attach": attach}
+	req := map[string]any{"cmd": cmd, "tty": tty, "stdin": in != nil, "attach": attach, "container": c.index}
 	if tty && resize != nil {
 		// kubectl sends the size of its terminal right away
 		select {
