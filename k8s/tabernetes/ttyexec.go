@@ -38,7 +38,12 @@ func init() {
 			// the command line was canceled before kubectl got here
 			return func() {}
 		}
-		return in.t.enterLine()
+		in.t.ttyMode(true)
+		leave := in.t.enterLine()
+		return func() {
+			in.t.ttyMode(false)
+			leave()
+		}
 	}
 }
 
@@ -101,8 +106,11 @@ func (r *termReader) Read(b []byte) (int, error) {
 // ttyOut is stdout on the terminal.
 type ttyOut struct{ t *terminal }
 
-func (ttyOut) Fd() uintptr                   { return term.TerminalFd }
-func (o ttyOut) Write(b []byte) (int, error) { return o.t.Write(b) }
+func (ttyOut) Fd() uintptr { return term.TerminalFd }
+func (o ttyOut) Write(b []byte) (int, error) {
+	o.t.waitOutput(nil) // flow control: Ctrl-C goes to the container
+	return o.t.Write(b)
+}
 
 // wantsTTY tells whether kubectl is asked for a tty (-t), before "--".
 func wantsTTY(args []string) bool {

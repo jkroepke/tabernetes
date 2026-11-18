@@ -354,6 +354,20 @@ that name.
 - **Terminal**: the shell is mvdan.cc/sh with Go built-ins (coreutils, `wget`,
   `vi`, `kubectl edit` in raw mode). busybox-wasm and vigo were tried and
   rejected.
+- **Terminal output** (2026-11-18, ideas from ttyd): Go sends bytes
+  (`jsWriter`), not strings: `string(b)` through syscall/js turned a UTF-8
+  character split over two writes into U+FFFD, and xterm.js keeps the
+  half itself. Flow control like ttyd: the tab acks every 64 KiB that
+  xterm.js has shown (`ack`), and the writers of commands wait while more
+  than 512 KiB are on the way (`waitOutput` in `tty.go`). With that and
+  `seq` stopping at a failed write, Ctrl-C on `seq 1 100000000` gives the
+  prompt back after 0.5 s (headless Chromium) instead of >120 s. The shared worker sends the
+  output of one Go run as one message (`out` in `bridge.js`), not one per
+  line. While `kubectl exec -t` owns the terminal, `convertEol` is off:
+  the tty in the container adds the `\r` itself, and a lone `\n` of top
+  or less means one line down. The WebGL renderer loads at the prompt
+  (DOM without WebGL 2 or after a context loss); +36 KB gzip of
+  `tabernetes.js` with the web links addon.
 - **Go heap snapshot** (`k8s/snapshot.mjs`, run by `k8s/build.sh`): Node.js
   runs the binary until `main` sleeps (`tabernetesSnapshot`), and the memory
   and Wasm globals become the data and globals of the shipped binary.

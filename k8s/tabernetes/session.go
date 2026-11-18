@@ -140,6 +140,7 @@ func (s *session) close() {
 	sessionsMu.Lock()
 	delete(sessions, s.name)
 	sessionsMu.Unlock()
+	s.term.close()
 	s.sh.stop()
 	s.jobs.stopAll()
 	s.nodeMu.Lock()
@@ -196,6 +197,9 @@ func (s *session) api() js.Value {
 		s.term.input(a[0].String())
 		return true
 	})
+	// ack(n): xterm.js has shown the first n bytes of the output (flow
+	// control, tty.go)
+	set("ack", func(a []js.Value) any { s.term.ack(int64(a[0].Float())); return nil })
 	// resize(cols, rows) tells programs the terminal size
 	set("resize", func(a []js.Value) any { s.term.resize(a[0].Int(), a[1].Int()); return nil })
 	// complete(line, builtins: string[]): Promise<{word, items, noSpace}>, tab completion

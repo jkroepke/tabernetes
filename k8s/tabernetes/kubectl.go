@@ -31,14 +31,29 @@ func init() {
 	cmdutil.BehaviorOnFatal(func(msg string, c int) { panic(exitPanic{c, msg}) })
 }
 
-// jsWriter forwards writes to a JS callback.
-type jsWriter struct{ fn js.Value }
+// jsWriter forwards writes to a JS callback, as a Uint8Array. Bytes, not a
+// string: a write may end in the middle of a UTF-8 character (a stream of
+// kubectl logs or exec), and syscall/js would turn each half into U+FFFD.
+// xterm.js keeps the half until the next write. t counts the bytes for the
+// flow control of the terminal (tty.go), if it is set.
+type jsWriter struct {
+	fn js.Value
+	t  *terminal
+}
 
 func (w jsWriter) Write(b []byte) (int, error) {
 	if w.fn.Type() != js.TypeFunction {
 		return os.Stderr.Write(b)
 	}
-	w.fn.Invoke(string(b))
+	if len(b) == 0 {
+		return 0, nil
+	}
+	a := js.Global().Get("Uint8Array").New(len(b))
+	js.CopyBytesToJS(a, b)
+	if w.t != nil {
+		w.t.sent.Add(int64(len(b)))
+	}
+	w.fn.Invoke(a)
 	return len(b), nil
 }
 
@@ -52,6 +67,14 @@ type ctxWriter struct {
 func (w ctxWriter) Write(b []byte) (int, error) {
 	if w.ctx.Err() != nil {
 		return 0, errCanceled
+	}
+	// A command that writes faster than the browser shows it waits here
+	// (flow control, tty.go), and Ctrl-C ends the wait.
+	if s := sessionFrom(w.ctx); s != nil {
+		s.term.waitOutput(w.ctx.Done())
+		if w.ctx.Err() != nil {
+			return 0, errCanceled
+		}
 	}
 	return w.w.Write(b)
 }

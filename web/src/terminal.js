@@ -4,6 +4,8 @@
 // file only does the line editing and the builtins that need the browser.
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { installFS } from "./fs.js";
 import { clusterState, loadHome, saveHome, forget, sweepLayers, keepStorage } from "./state.js";
 import { zstdFrames, instantiate, runGo } from "./wasm.js";
@@ -12,6 +14,18 @@ import { gpuAPI } from "./gpu.js";
 import { sayAllGone } from "./relay.js";
 
 const DIM = (s) => `\x1b[2m${s}\x1b[0m`;
+// The terminal tells Go every ACK bytes that it has shown the output.
+const ACK = 64 << 10;
+
+// useWebGL switches the terminal to the WebGL renderer. Without WebGL 2, or
+// when the browser takes the GPU context away, the DOM renderer stays.
+function useWebGL(term) {
+  try {
+    const webgl = new WebglAddon();
+    webgl.onContextLoss(() => webgl.dispose());
+    term.loadAddon(webgl);
+  } catch { /* the DOM renderer draws */ }
+}
 
 export async function startTerminal(el, opts) {
   const term = new Terminal({
@@ -23,6 +37,8 @@ export async function startTerminal(el, opts) {
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
+  // URLs in the output (join, proxy, kubectl) open in a new tab on a click.
+  term.loadAddon(new WebLinksAddon());
   term.open(el);
   fit.fit();
   // Windows and Linux copy and paste with Ctrl, which xterm.js sends to the
@@ -96,6 +112,8 @@ export async function startTerminal(el, opts) {
     return { term };
   }
   const { session } = joined;
+  // bytes of output from Go so far, and up to where xterm.js was asked to ack
+  let shown = 0, acked = 0;
   globalThis.tabernetesNode = joined.name;
   // The JIT modules of the kernel of the pods (jit.js) load, compile and get
   // optimised now, not in the first pod. Not earlier: while the control
@@ -103,15 +121,46 @@ export async function startTerminal(el, opts) {
   if (opts.pods?.vm?.jitURL) prefetchJIT(opts.pods.vm.jitURL);
   // The worker of the first pod, with its VM and warm code of the emulator.
   if (opts.pods?.vm) setTimeout(() => prepareWorker(opts.pods.vm), 0);
+  // The WebGL renderer draws a lot of output faster than the DOM renderer.
+  // It starts at the prompt, so the boot does not wait for it.
+  setTimeout(() => useWebGL(term), 0);
   keepStorage();
   // tabernetes.shell for tests and the DevTools console, as before.
   globalThis.tabernetes ??= {};
-  globalThis.tabernetes.shell = (src, write, fns) => session.shell(src, write, fns);
+  // The output of the shell comes as bytes (Uint8Array) and true/false for
+  // the tty mode (output below); this one gives strings, as before.
+  globalThis.tabernetes.shell = (src, write, fns) => {
+    const text = new TextDecoder();
+    return session.shell(src, (chunk) => {
+      if (typeof chunk === "boolean") return;
+      shown += chunk.length;
+      session.ack(shown);
+      write?.(text.decode(chunk, { stream: true }));
+    }, fns);
+  };
   globalThis.tabernetesSession = session;
   term.writeln("");
   term.writeln(`Try ${"\x1b[1m"}k version${"\x1b[0m"}, ${"\x1b[1m"}join${"\x1b[0m"}, ${"\x1b[1m"}doom${"\x1b[0m"}, ${"\x1b[1m"}llm${"\x1b[0m"} or ${"\x1b[1m"}help${"\x1b[0m"}.`);
 
   // ---- shell ----
+  // output shows what the shell writes (jsWriter, tty.go): bytes, which
+  // xterm.js decodes itself, so a UTF-8 character split over two chunks
+  // stays whole; or true/false when a program with a tty (kubectl exec -t)
+  // takes the terminal or gives it back: its tty turns "\n" into "\r\n"
+  // itself, and a lone "\n" moves one line down (convertEol must be off).
+  // The change waits for the output before it. Flow control like ttyd: every
+  // ACK bytes, xterm.js tells Go when it has shown them, and Go holds the
+  // writers of commands while more than 512 KiB are on the way.
+  const output = (chunk) => {
+    if (typeof chunk === "boolean") {
+      term.write("", () => { term.options.convertEol = !chunk; });
+      return;
+    }
+    shown += chunk.length;
+    if (shown - acked < ACK) { term.write(chunk); return; }
+    const n = (acked = shown);
+    term.write(chunk, () => session.ack(n));
+  };
   session.resize(term.cols, term.rows);
   term.onResize(({ cols, rows }) => session.resize(cols, rows));
   // The working directory for the prompt, after every command line.
@@ -281,7 +330,7 @@ export async function startTerminal(el, opts) {
   }]));
 
   // exec runs a command line in the shell and resolves to its exit status.
-  const exec = (src) => Promise.resolve(session.shell(src, (s) => term.write(s), shellBuiltins))
+  const exec = (src) => Promise.resolve(session.shell(src, output, shellBuiltins))
     .finally(async () => { cwd = await session.cwd(); });
 
   const prompt = () => {

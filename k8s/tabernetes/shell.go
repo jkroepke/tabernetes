@@ -77,7 +77,7 @@ func incomplete(src string) bool {
 
 // run executes src and returns the exit status of the last command.
 func (s *shell) run(src string, out js.Value, builtins js.Value) int {
-	w := jsWriter{out}
+	w := jsWriter{out, s.sess.term}
 	f, err := syntax.NewParser().Parse(strings.NewReader(src), "")
 	if err != nil {
 		fmt.Fprintf(w, "tabernetes: %v\n", err)
@@ -257,9 +257,16 @@ func (s *shell) callJS(ctx context.Context, hc interp.HandlerContext, name strin
 	for i, a := range args {
 		jsArgs[i] = a
 	}
+	// The builtin writes from JavaScript, so the write must not wait for the
+	// flow control of the terminal (ctxWriter): the tab could not answer
+	// while Go blocks the event loop.
+	out := hc.Stdout
+	if w, ok := out.(ctxWriter); ok {
+		out = w.w
+	}
 	write := js.FuncOf(func(this js.Value, a []js.Value) any {
-		if len(a) > 0 {
-			io.WriteString(hc.Stdout, a[0].String())
+		if len(a) > 0 && ctx.Err() == nil {
+			io.WriteString(out, a[0].String())
 		}
 		return nil
 	})

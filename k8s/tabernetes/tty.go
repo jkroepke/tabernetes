@@ -4,6 +4,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"syscall/js"
 )
 
 // terminal is the terminal of a tab for full screen programs (vi, kubectl
@@ -18,9 +19,84 @@ type terminal struct {
 	raw  atomic.Bool
 	cols atomic.Int32
 	rows atomic.Int32
+
+	// Flow control, like ttyd: sent counts the bytes of output to the tab
+	// (jsWriter), acked the bytes that xterm.js has shown (the tab says so
+	// every outputAck bytes). The writers of commands wait while more than
+	// outputWindow bytes are on the way, so "yes" or a fast "kubectl logs
+	// -f" does not pile up in the tab, and Ctrl-C reaches them at once.
+	sent, acked atomic.Int64
+	flowMu      sync.Mutex
+	flowWake    chan struct{} // closed on the next ack
+	closed      atomic.Bool
 }
 
+// outputWindow is the output that may be on the way to the tab. xterm.js
+// shows it in ~50 ms; the tab acks every 64 KiB (terminal.js).
+const outputWindow = 512 << 10
+
 func newTerminal() *terminal { return &terminal{keys: make(chan string, 256)} }
+
+// waitOutput waits until the tab has caught up with the output, or done
+// is closed, or the tab is gone.
+func (t *terminal) waitOutput(done <-chan struct{}) {
+	for {
+		t.flowMu.Lock()
+		if t.sent.Load()-t.acked.Load() <= outputWindow || t.closed.Load() {
+			t.flowMu.Unlock()
+			return
+		}
+		if t.flowWake == nil {
+			t.flowWake = make(chan struct{})
+		}
+		wake := t.flowWake
+		t.flowMu.Unlock()
+		select {
+		case <-wake:
+		case <-done:
+			return
+		}
+	}
+}
+
+// ack is the count of bytes that the tab has shown.
+func (t *terminal) ack(n int64) {
+	t.flowMu.Lock()
+	if n > t.acked.Load() {
+		t.acked.Store(n)
+	}
+	t.wake()
+	t.flowMu.Unlock()
+}
+
+// close ends all waits for good: the tab is gone.
+func (t *terminal) close() {
+	t.flowMu.Lock()
+	t.closed.Store(true)
+	t.wake()
+	t.flowMu.Unlock()
+}
+
+func (t *terminal) wake() {
+	if t.flowWake != nil {
+		close(t.flowWake)
+		t.flowWake = nil
+	}
+}
+
+// ttyMode tells the terminal of the tab that a program with a tty owns it
+// (kubectl exec -t). The tty in the container already turns "\n" into
+// "\r\n" where the program wants it; in raw mode a lone "\n" (top, less,
+// nano) means one line down in the same column, so xterm.js must not add
+// the "\r" then (convertEol). The output of the shell needs it.
+func (t *terminal) ttyMode(on bool) {
+	t.mu.Lock()
+	w, ok := t.out.(jsWriter)
+	t.mu.Unlock()
+	if ok && w.fn.Type() == js.TypeFunction {
+		w.fn.Invoke(on)
+	}
+}
 
 // resizeKey is sent to a raw mode program when the terminal changes size.
 const resizeKey = "\x00resize"
