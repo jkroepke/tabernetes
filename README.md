@@ -213,7 +213,7 @@ browser tab (single wasm binary)                     docker run tabernetes
   `Error`, `CrashLoopBackOff`). The kubelet side (`k8s/tabernetes/v86.go`)
   runs the init containers in order, then the containers, and the probes
   (`k8s/tabernetes/probes.go`: startup, liveness, readiness with exec,
-  httpGet, tcpSocket and grpc).
+  httpGet, tcpSocket and gRPC).
   `kubectl port-forward` reaches the pod through the virtio network card of
   the VM. So does the kubelet for `kubectl exec` and `attach`: init listens
   on port 60250 and starts the command in the container, with a pty for
