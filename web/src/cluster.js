@@ -309,9 +309,16 @@ const methods = {
     peers.get(name).add(id);
     for (const [other, port] of tabs) if (other !== id) port.postMessage({ type: "mesh", name });
   },
-  // meshDown: the connection of the tab to the node failed.
+  // meshDown: the connection of the tab to the node failed. A failed
+  // connection does not come back, and the agent of a docker node ends
+  // without a connected tab, as when the last tab closes (leave): without
+  // another tab, the node goes. Before, it stayed NotReady for good. A
+  // paired node stays (dropNode in tabs.go); its tabs dial it again.
   meshDown(id, name) {
-    peers.get(name)?.delete(id);
+    const ids = peers.get(name);
+    if (!ids?.delete(id) || ids.size) return;
+    peers.delete(name);
+    globalThis.tabernetes?.dropNode(name);
   },
   // prepareKubectl is join --kubectl: a paired kubectl outside the browser.
   async prepareKubectl(id, relay) {
