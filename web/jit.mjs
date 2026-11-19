@@ -102,7 +102,7 @@ await new Promise((r) => e.add_listener("emulator-loaded", r));
 let ready, exited, console_ = "";
 const control = new Promise((r) => { ready = r; });
 const done = new Promise((r) => { exited = r; });
-lines(e, 1, (l) => { if (l === "ready") ready(); if (l.startsWith("exit ")) exited(l); });
+lines(e, 1, (l) => { if (l === "ready") ready(); if (l.startsWith("exit ") || l.startsWith("fail ")) exited(l); });
 lines(e, 0, (l) => { console_ += l + "\n"; });
 bootKernel(e.v86.cpu, {
   kernel: new Uint8Array(fs.readFileSync(`${vmDir}/vmlinux`)),
@@ -122,7 +122,10 @@ const buf = new Uint8Array(fs.readFileSync(rootTar));
 const tree = new Tree();
 tree.addLayer("L", tarEntries(buf));
 tree.layer = 1;
-const conf = { args: ["/bin/sh", "-c", SCRIPT], env: ["PATH=/usr/sbin:/usr/bin:/sbin:/bin"], cwd: "/", user: "", hostname: "jit", ip: IP, gateway: GATEWAY, stdin: false, stdinOnce: false, tty: false };
+const conf = {
+  hostname: "jit", ip: IP, gateway: GATEWAY, start: ["0"], tmpfs: [],
+  containers: [{ name: "jit", root: "/", args: ["/bin/sh", "-c", SCRIPT], env: ["PATH=/usr/sbin:/usr/bin:/sbin:/bin"], cwd: "/", user: "", console: true, stdin: false, stdinOnce: false, tty: false, mounts: [] }],
+};
 const mem = new Map([["mem:0", new TextEncoder().encode(JSON.stringify(conf))]]);
 tree.set(".tabernetes/config.json", { uid: 0, gid: 0, mtime: 0, mode: modes.S_IFREG | 0o644, size: mem.get("mem:0").length, key: "mem:0" });
 for (const d of ["dev", "proc", "sys", "tmp"]) if (!tree.files.has(d)) tree.set(d, { uid: 0, gid: 0, mtime: 0, mode: modes.S_IFDIR | 0o1777 });
@@ -133,7 +136,7 @@ e.jit_record_start();
 e.v86.cpu.set_jit_config(4, THRESHOLD);
 e.serial_send_bytes(1, new TextEncoder().encode(`go ${Date.now()} ${"ab".repeat(32)}\n`));
 const status = await done;
-if (status !== "exit 0" || !console_.includes("done")) {
+if (status !== "exit 0 0" || !console_.includes("done")) {
   console.error(console_);
   throw new Error(`the start for the JIT failed: ${status}`);
 }

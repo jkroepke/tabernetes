@@ -436,6 +436,9 @@ func (n *tabNode) sync(pod *corev1.Pod) {
 		tp = n.newPod(pod)
 		n.pods[pod.UID] = tp
 		go tp.run()
+	} else if tp != nil && len(pod.Spec.EphemeralContainers) > 0 {
+		// kubectl debug adds ephemeral containers to a running pod
+		go tp.debug(pod)
 	}
 	n.mu.Unlock()
 	if pod.DeletionTimestamp != nil {
@@ -447,7 +450,7 @@ func (n *tabNode) sync(pod *corev1.Pod) {
 // containers are gone.
 func (n *tabNode) terminate(pod *corev1.Pod, tp *tabPod) {
 	if tp != nil {
-		tp.stop("Killing", "Stopping container "+tp.container.Name)
+		tp.stop("Killing", "Stopping container ")
 	}
 	err := n.cs.CoreV1().Pods(pod.Namespace).Delete(context.Background(), pod.Name, metav1.DeleteOptions{
 		GracePeriodSeconds: ptr.To(int64(0)),

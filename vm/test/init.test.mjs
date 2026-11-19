@@ -27,14 +27,18 @@ after(() => linux && fs.rmSync(dir, { recursive: true, force: true }));
 
 let ports = 40000 + (process.pid % 10000);
 
-// start runs init with the container config c and waits for "started".
+const ENV = ["PATH=/usr/local/bin:/usr/bin:/bin"];
+
+// start runs init with the container config c (or a pod with containers)
+// and waits for its first line.
 async function start(c) {
   const port = ports++;
   const conf = path.join(dir, `config-${port}.json`);
-  fs.writeFileSync(conf, JSON.stringify({ env: ["PATH=/usr/local/bin:/usr/bin:/bin"], ...c }));
+  const pod = c.containers ? c : { containers: [{ env: ENV, console: true, ...c }], start: ["0"] };
+  fs.writeFileSync(conf, JSON.stringify(pod));
   const p = spawn(path.join(dir, "init"), [], {
     env: { TABERNETES_INIT_TEST: conf, TABERNETES_INIT_PORT: String(port) },
-    stdio: ["ignore", "pipe", "inherit"],
+    stdio: ["pipe", "pipe", "inherit"],
   });
   const lines = [];
   let rest = "";
@@ -44,7 +48,8 @@ async function start(c) {
     rest = l.pop();
     lines.push(...l.map((s) => s.replace(/\r$/, "")));
   });
-  const vm = { p, port, lines, stop: () => p.kill("SIGKILL") };
+  // send writes a command line of the page (start, kill, add)
+  const vm = { p, port, lines, stop: () => p.kill("SIGKILL"), send: (l) => p.stdin.write(l + "\n") };
   await until(() => lines.length > 0);
   return vm;
 }
@@ -125,7 +130,7 @@ const alive = (pid) => {
 test("exec", { skip: !linux }, async (t) => {
   const vm = await start({ args: ["sleep", "1000"] });
   t.after(vm.stop);
-  assert.deepEqual(vm.lines, ["started"]);
+  assert.deepEqual(vm.lines, ["started 0"]);
 
   await t.test("output and exit code", async () => {
     let s = await run(vm, { cmd: ["echo", "hi"] });
@@ -231,7 +236,7 @@ test("attach", { skip: !linux }, async (t) => {
     await b.wait((s) => s.out.includes("got:two"));
     // the main process lives on after a disconnect
     await sleep(100);
-    assert.deepEqual(vm.lines, ["started"]);
+    assert.deepEqual(vm.lines, ["started 0"]);
     b.c.destroy();
   });
 
@@ -244,7 +249,7 @@ test("attach", { skip: !linux }, async (t) => {
     a.send(1);
     await a.done();
     assert.deepEqual([a.out, a.exit], ["got:hello\nbye\n", 4]);
-    await until(() => vm.lines.includes("exit 4"));
+    await until(() => vm.lines.includes("exit 0 4"));
   });
 });
 
@@ -252,12 +257,71 @@ test("start errors", { skip: !linux }, async (t) => {
   const vm = await start({ args: ["does-not-exist"] });
   t.after(vm.stop);
   await until(() => vm.lines.length >= 2);
-  assert.deepEqual(vm.lines, ['error exec: "does-not-exist": executable file not found in $PATH', "exit 128"]);
+  assert.deepEqual(vm.lines, ['error 0 exec: "does-not-exist": executable file not found in $PATH', "exit 0 128"]);
 });
 
 test("exit code of the main process", { skip: !linux }, async (t) => {
   const vm = await start({ args: ["sh", "-c", "exit 7"] });
   t.after(vm.stop);
   await until(() => vm.lines.length >= 2);
-  assert.deepEqual(vm.lines, ["started", "exit 7"]);
+  assert.deepEqual(vm.lines, ["started 0", "exit 0 7"]);
+});
+
+test("several containers", { skip: !linux }, async (t) => {
+  const log = (vm, i) => vm.lines.filter((l) => l.startsWith(`log ${i} `)).map((l) => Buffer.from(l.split(" ")[2], "base64").toString()).join("");
+  const vm = await start({
+    containers: [
+      { name: "init", env: ENV, args: ["sh", "-c", "echo init done"] },
+      { name: "main", env: ENV, console: true, args: ["sleep", "1000"] },
+      { name: "side", env: [...ENV, "WHO=side"], args: ["sh", "-c", "echo $WHO; exec sleep 1000"] },
+    ],
+    start: ["0"],
+  });
+  t.after(vm.stop);
+
+  await t.test("an init container runs first, its output comes as log lines", async () => {
+    await until(() => vm.lines.includes("exit 0 0"));
+    assert.equal(log(vm, 0), "init done\n");
+    assert.deepEqual(vm.lines.filter((l) => !l.startsWith("log ")), ["started 0", "exit 0 0"]);
+  });
+
+  await t.test("the page starts the others", async () => {
+    vm.send("start 1");
+    vm.send("start 2");
+    await until(() => vm.lines.includes("started 1") && vm.lines.includes("started 2"));
+    await until(() => log(vm, 2) === "side\n");
+  });
+
+  await t.test("exec and attach pick the container", async () => {
+    const s = await run(vm, { cmd: ["sh", "-c", "echo $WHO"], container: 2 });
+    assert.deepEqual([s.out, s.exit], ["side\n", 0]);
+    const e = await run(vm, { cmd: ["true"], container: 7 });
+    assert.equal(e.error, "container not found");
+  });
+
+  await t.test("kill ends a container, start restarts it", async () => {
+    vm.send("kill 2 15");
+    await until(() => vm.lines.includes("exit 2 143"));
+    vm.send("start 2");
+    await until(() => vm.lines.filter((l) => l === "started 2").length === 2);
+    assert.ok(!vm.lines.some((l) => l.startsWith("exit 1 ")), "the other container runs on");
+  });
+
+  await t.test("add takes a container from a file (kubectl debug)", async () => {
+    const f = path.join(dir, `debug-${vm.port}.json`);
+    fs.writeFileSync(f, JSON.stringify({ name: "debugger", env: ENV, args: ["sh", "-c", "echo debug; exit 3"] }));
+    vm.send(`add ${f}`);
+    vm.send("start 3");
+    await until(() => vm.lines.includes("exit 3 3"));
+    assert.equal(log(vm, 3), "debug\n");
+  });
+
+  await t.test("a container that does not start", async () => {
+    vm.send("start 9");
+    fs.writeFileSync(path.join(dir, `bad-${vm.port}.json`), JSON.stringify({ name: "bad", env: ENV, args: ["no-such-program"] }));
+    vm.send(`add ${path.join(dir, `bad-${vm.port}.json`)}`);
+    vm.send("start 4");
+    await until(() => vm.lines.includes("exit 4 128"));
+    assert.ok(vm.lines.includes('error 4 exec: "no-such-program": executable file not found in $PATH'));
+  });
 });

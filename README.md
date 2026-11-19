@@ -11,6 +11,12 @@ Tabernetes started as a part of [my blog](https://github.com/jkroepke/blog)
 builds it and publishes every version as a GitHub release; the blog downloads
 a pinned release when it builds.
 
+New to it? Type `tour` in the terminal: it walks through the cluster step by
+step (nodes, a Deployment from Docker Hub, a Service with cluster DNS,
+`kubectl exec` and `logs`, self-healing). Each step puts a plain `kubectl`
+command on the prompt, and Enter runs it. At the end it offers to join a
+real node with Docker.
+
 ## How it works
 
 ```text
@@ -188,15 +194,26 @@ browser tab (single wasm binary)                     docker run tabernetes
   in `vm/Dockerfile` (`mise run vm`, needs Docker). There is no BIOS: like
   Firecracker, the worker puts the unpacked kernel (`vmlinux`), the
   initramfs and the boot parameters into the memory of the VM and starts the
-  kernel in protected mode (`web/src/kernelboot.js`). PID 1
-  (`vm/init/init.c`, a static C program with musl) does what runc does: it
-  mounts `/proc`, `/sys` and `/dev`, writes `/etc/hosts` and
-  `/etc/resolv.conf`, sets the hostname and starts the entrypoint with the
-  environment, working directory and user of the image and the pod. The first
-  serial port is the log of the container; the second one tells the kubelet
-  `started`, `exit <code>`, or why the entrypoint did not start (`StartError`,
-  exit code 128). The exit code goes through the restart policy (`Completed`,
-  `Error`, `CrashLoopBackOff`).
+  kernel in protected mode (`web/src/kernelboot.js`). The VM is the sandbox
+  of the pod. PID 1 (`vm/init/init.c`, a static C program with musl) does
+  what containerd and runc do: it mounts `/proc`, `/sys` and `/dev`, sets the
+  hostname, and starts and stops the containers when the kubelet asks
+  (`start <n>`, `kill <n> <signal>`). Each container gets the environment,
+  working directory and user of its image and the pod. A pod with one
+  container has its image as `/`; with more (init containers, sidecars,
+  `kubectl debug`), each image is a root of its own under
+  `/.tabernetes/c/<n>`, and init starts the processes there with `chroot`.
+  The volumes (ConfigMap, Secret, downward API, projected with the token of
+  the service account, emptyDir) are files in `/.tabernetes/v/<name>`, laid
+  out like the kubelet writes them, and init binds them into the containers.
+  The first serial port is the log of the first container; the second one
+  tells the kubelet `started <n>`, `exit <n> <code>`, the log lines of the
+  other containers, or why a container did not start (`StartError`, exit
+  code 128). The exit code goes through the restart policy (`Completed`,
+  `Error`, `CrashLoopBackOff`). The kubelet side (`k8s/tabernetes/v86.go`)
+  runs the init containers in order, then the containers, and the probes
+  (`k8s/tabernetes/probes.go`: startup, liveness, readiness with exec,
+  httpGet, tcpSocket and gRPC).
   `kubectl port-forward` reaches the pod through the virtio network card of
   the VM. So does the kubelet for `kubectl exec` and `attach`: init listens
   on port 60250 and starts the command in the container, with a pty for
@@ -473,12 +490,13 @@ still works, too. Real isolation from the host needs rootless Docker or Podman.
   (except the nodes of `join --keep`),
   and not what a pod wrote. Another tab sees a new file in `~` after its next
   reload.
-- The kubelet of a tab is not the real one. It runs pods with one container
-  and no init containers, at most 8 per tab. It has no volumes and no probes,
-  and of the resources only the memory limit counts: it is the memory of the
-  VM. Of `valueFrom` it knows the fields of the pod, not ConfigMaps and
-  Secrets. A pod that asks for a volume or such a variable gets an
-  `Unsupported` warning event and starts without it.
+- The kubelet of a tab is not the real one. It runs at most 8 pods per tab.
+  Of the resources only the limits count: the memory and ephemeral storage
+  of the VM. Its volumes are ConfigMap, Secret, downwardAPI, projected and
+  emptyDir; their files are read once when the pod starts, so a change of a
+  ConfigMap does not reach a running pod. A pod that asks for another volume
+  gets an `Unsupported` warning event and starts without it. `kubectl logs
+  --previous` keeps the last run of each container.
 - `kubectl exec`, `logs` and `port-forward` go through the WebRTC tunnel to
   the kubelet. The apiserver cannot reach pod or service IPs, so service
   proxy URLs do not work.

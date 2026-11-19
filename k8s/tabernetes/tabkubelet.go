@@ -57,39 +57,47 @@ func (n *tabNode) serveKubelet() (func(), error) {
 	}, nil
 }
 
-// pod finds the pod of a request, also by UID if the request names one.
-func (n *tabNode) pod(w http.ResponseWriter, r *http.Request) *tabPod {
+// pod finds the pod of a request, also by UID if the request names one, and
+// the container it names (the first one if it names none).
+func (n *tabNode) pod(w http.ResponseWriter, r *http.Request) (*tabPod, *tabCtr) {
 	tp := n.podByName(r.PathValue("ns"), r.PathValue("pod"))
 	if tp == nil || (r.PathValue("uid") != "" && r.PathValue("uid") != string(tp.uid)) {
 		http.Error(w, "pod does not exist", http.StatusNotFound)
-		return nil
+		return nil, nil
 	}
-	if c := r.PathValue("container"); c != "" && c != tp.container.Name {
-		http.Error(w, fmt.Sprintf("container %s is not valid for pod %s", c, tp.name), http.StatusNotFound)
-		return nil
+	name := r.PathValue("container")
+	tp.mu.Lock()
+	c := tp.container(name)
+	tp.mu.Unlock()
+	if c == nil {
+		http.Error(w, fmt.Sprintf("container %s is not valid for pod %s", name, tp.name), http.StatusNotFound)
+		return nil, nil
 	}
-	return tp
+	return tp, c
 }
 
 func (n *tabNode) serveLogs(w http.ResponseWriter, r *http.Request) {
-	tp := n.pod(w, r)
+	tp, c := n.pod(w, r)
 	if tp == nil {
 		return
 	}
 	q := r.URL.Query()
-	if q.Get("previous") == "true" {
-		http.Error(w, "previous terminated container "+tp.container.Name+" not found: the tab keeps the log of one run", http.StatusBadRequest)
-		return
-	}
 	follow, timestamps := q.Get("follow") == "true", q.Get("timestamps") == "true"
 	tp.mu.Lock()
-	logs := tp.logs
-	waiting := tp.status.State.Waiting
+	logs := c.logs
+	waiting := c.status.State.Waiting
+	if q.Get("previous") == "true" {
+		logs, waiting = c.prev, nil
+	}
 	tp.mu.Unlock()
+	if logs == nil {
+		http.Error(w, fmt.Sprintf("previous terminated container %q in pod %q not found", c.spec.Name, tp.name), http.StatusBadRequest)
+		return
+	}
 	lines, next, more := logs.since(0)
 	if waiting != nil && next == 0 {
 		// as the kubelet says it while the image is pulled
-		http.Error(w, fmt.Sprintf("container %q in pod %q is waiting to start: %s", tp.container.Name, tp.name, waiting.Reason), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("container %q in pod %q is waiting to start: %s", c.spec.Name, tp.name, waiting.Reason), http.StatusBadRequest)
 		return
 	}
 	if s := q.Get("tailLines"); s != "" {
@@ -145,10 +153,10 @@ func (n *tabNode) serveLogs(w http.ResponseWriter, r *http.Request) {
 // executor runs kubectl exec in the workload of a pod.
 type executor struct{ tp *tabPod }
 
-func (e executor) ExecInContainer(ctx context.Context, _, _, _ string, cmd []string, in io.Reader, out, errOut io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize, _ time.Duration) error {
-	w := e.tp.running()
-	if w == nil {
-		return errors.New("container not found (" + e.tp.container.Name + " is not running)")
+func (e executor) ExecInContainer(ctx context.Context, _, _, name string, cmd []string, in io.Reader, out, errOut io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize, _ time.Duration) error {
+	w, c, err := e.target(name)
+	if err != nil {
+		return err
 	}
 	if out == nil {
 		out = nopCloser{io.Discard}
@@ -158,8 +166,12 @@ func (e executor) ExecInContainer(ctx context.Context, _, _, _ string, cmd []str
 	}
 	ctx, cancel := e.podContext(ctx)
 	defer cancel()
-	if s, ok := w.(streamer); ok {
-		return s.stream(ctx, false, cmd, in, out, errOut, tty, resize)
+	if v, ok := w.(*v86Pod); ok {
+		return v.stream(ctx, c, false, cmd, in, out, errOut, tty, resize)
+	}
+	wl, ok := w.(workload)
+	if !ok {
+		return errors.New("container not found (" + name + " is not running)")
 	}
 	if in == nil {
 		in = eofReader{}
@@ -170,7 +182,19 @@ func (e executor) ExecInContainer(ctx context.Context, _, _, _ string, cmd []str
 		o := &crlfWriter{w: out}
 		in, out, errOut = lineDiscipline(in, o), nopCloser{o}, nopCloser{o}
 	}
-	return w.exec(ctx, cmd, in, out, errOut)
+	return wl.exec(ctx, cmd, in, out, errOut)
+}
+
+// target is what runs the pod and the container name, if it runs.
+func (e executor) target(name string) (dialer, *tabCtr, error) {
+	tp := e.tp
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	c := tp.container(name)
+	if c == nil || tp.w == nil || c.status.State.Running == nil {
+		return nil, nil, errors.New("container not found (" + name + " is not running)")
+	}
+	return tp.w, c, nil
 }
 
 // crlfWriter turns \n into \r\n, as a tty does on output (onlcr).
@@ -265,12 +289,12 @@ func (e executor) podContext(ctx context.Context) (context.Context, context.Canc
 
 // AttachContainer connects kubectl attach to the main process of a container
 // image (v86). The other workloads have none.
-func (e executor) AttachContainer(ctx context.Context, _, _, _ string, in io.Reader, out, errOut io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize) error {
-	w := e.tp.running()
-	if w == nil {
-		return errors.New("container not found (" + e.tp.container.Name + " is not running)")
+func (e executor) AttachContainer(ctx context.Context, _, _, name string, in io.Reader, out, errOut io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize) error {
+	w, c, err := e.target(name)
+	if err != nil {
+		return err
 	}
-	s, ok := w.(streamer)
+	s, ok := w.(*v86Pod)
 	if !ok {
 		return errors.New("this workload has no process to attach to: use kubectl exec or kubectl logs")
 	}
@@ -282,7 +306,7 @@ func (e executor) AttachContainer(ctx context.Context, _, _, _ string, in io.Rea
 	}
 	ctx, cancel := e.podContext(ctx)
 	defer cancel()
-	return s.stream(ctx, true, nil, in, out, errOut, tty, resize)
+	return s.stream(ctx, c, true, nil, in, out, errOut, tty, resize)
 }
 
 type eofReader struct{}
@@ -294,7 +318,7 @@ type nopCloser struct{ io.Writer }
 func (nopCloser) Close() error { return nil }
 
 func (n *tabNode) serveExec(w http.ResponseWriter, r *http.Request) {
-	tp := n.pod(w, r)
+	tp, c := n.pod(w, r)
 	if tp == nil {
 		return
 	}
@@ -303,12 +327,12 @@ func (n *tabNode) serveExec(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	remotecommand.ServeExec(w, r, executor{tp}, tp.name, string(tp.uid), tp.container.Name, r.URL.Query()["command"], opts,
+	remotecommand.ServeExec(w, r, executor{tp}, tp.name, string(tp.uid), c.spec.Name, r.URL.Query()["command"], opts,
 		streamIdleTimeout, streamCreationTimeout, remotecommand.SupportedStreamingProtocols)
 }
 
 func (n *tabNode) serveAttach(w http.ResponseWriter, r *http.Request) {
-	tp := n.pod(w, r)
+	tp, c := n.pod(w, r)
 	if tp == nil {
 		return
 	}
@@ -317,7 +341,7 @@ func (n *tabNode) serveAttach(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	remotecommand.ServeAttach(w, r, executor{tp}, tp.name, string(tp.uid), tp.container.Name, opts,
+	remotecommand.ServeAttach(w, r, executor{tp}, tp.name, string(tp.uid), c.spec.Name, opts,
 		streamIdleTimeout, streamCreationTimeout, remotecommand.SupportedStreamingProtocols)
 }
 
@@ -346,7 +370,7 @@ func (f forwarder) PortForward(ctx context.Context, _, _ string, port int32, str
 }
 
 func (n *tabNode) servePortForward(w http.ResponseWriter, r *http.Request) {
-	tp := n.pod(w, r)
+	tp, _ := n.pod(w, r)
 	if tp == nil {
 		return
 	}

@@ -155,12 +155,15 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
       let next = 1;
       worker.onmessage = ({ data: m }) => {
         switch (m.type) {
-          case "pulling": on.pulling(); break;
-          case "pulled": on.pulled(m); break;
-          case "started": on.started(m); warmSoon(); break;
+          // i: the container, by its index in opts.containers (or in add)
+          case "pulling": on.pulling(m.i); break;
+          case "pulled": on.pulled(m.i, m); break;
+          case "started": on.started(m.i, m); warmSoon(); break;
           case "console": on.console(m.data); break;
-          case "exit": on.exit(m.code, m.message || ""); break;
-          case "error": on.error(m.message, !!m.pull, !!m.never); break;
+          case "log": on.log(m.i, m.data); break;
+          case "exit": on.exit(m.i, m.code, m.message || ""); break;
+          // without i: the pod (the VM) failed
+          case "error": on.error(m.message, !!m.pull, !!m.never, m.i ?? -1); break;
           case "build": build = m.build; break;
           case "conn": {
             const c = conns.get(m.id);
@@ -219,6 +222,12 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
         },
         // refuse resets it, as a host where nothing listens.
         refuse(id) { send({ type: "refuse", id }); },
+        // config gives the env and the volumes, when the start had none
+        config(c) { send({ type: "config", config: c }); },
+        // command sends a line to init: start <i>, kill <i> <signal>
+        command(line) { send({ type: "command", line }); },
+        // add starts a container in the running pod (kubectl debug)
+        add(c) { send({ type: "add", container: c }); },
         stop() {
           worker.terminate();
           for (const c of conns.values()) c.onClose();

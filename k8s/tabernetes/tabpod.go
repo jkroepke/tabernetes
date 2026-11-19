@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"os"
@@ -19,15 +20,26 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-// workload is what runs in place of a container on the tab node.
+// A pod on the tab node. A container image runs in v86 (v86.go): the VM is
+// the sandbox of the pod, and its init starts the containers on command, as
+// the kubelet asks containerd: the init containers one after the other (a
+// sidecar, an init container with restartPolicy Always, keeps running), then
+// the containers, and later the ephemeral containers of kubectl debug. The
+// kubelet side here pulls the strings: restarts with back-off, probes,
+// statuses and events, with the messages of the kubelet.
+//
+// The language model of webllm.go is a workload of its own: a pod with one
+// container.
+
+// workload is what runs in place of a container that is no image: the
+// language model of webllm.go.
 type workload interface {
 	// start loads the workload and returns once it runs. It reports the
 	// download to pull, and writes to log (kubectl logs) once that is done.
 	start(ctx context.Context, log io.Writer, pull *imagePull) error
 	// exec runs a command of the workload (kubectl exec).
 	exec(ctx context.Context, cmd []string, in io.Reader, out, errOut io.Writer) error
-	// dial connects to a port of the pod (kubectl port-forward).
-	dial(port int32) (net.Conn, error)
+	dialer
 	stop()
 	// imageID tells kubectl describe what runs.
 	imageID() string
@@ -35,10 +47,11 @@ type workload interface {
 	runtime() string
 }
 
-// exiter is a workload that ends by itself, as a container process does.
-type exiter interface {
-	// wait returns the exit code once the workload has ended.
-	wait() <-chan int
+// dialer is what runs a pod: port-forward and the cluster network connect
+// to its ports.
+type dialer interface {
+	// dial connects to a port of the pod (kubectl port-forward).
+	dial(port int32) (net.Conn, error)
 }
 
 // startError is a container that did not start, as runc reports it.
@@ -49,46 +62,71 @@ type startError struct {
 
 func (e *startError) Error() string { return e.msg }
 
-// newWorkload picks the workload for the image of c.
-func newWorkload(tp *tabPod, c *corev1.Container) (workload, error) {
-	if model, ok := webllmModel(c.Image); ok {
-		return newWebLLM(tp, model)
-	}
-	if tp.n.hasVM() {
-		return newV86(tp, c)
-	}
-	return nil, fmt.Errorf("the tab node runs no containers, only images that run in the browser: "+webllmRepo+"<model> (not %q)", c.Image)
-}
-
 const (
 	backoffStart = 10 * time.Second
 	backoffMax   = 5 * time.Minute
 )
 
-// tabPod is a pod on the tab node. It has one container.
+type ctrKind int
+
+const (
+	ctrInit ctrKind = iota
+	ctrRegular
+	ctrEphemeral
+)
+
+// tabCtr is a container of a tab pod.
+type tabCtr struct {
+	tp      *tabPod
+	spec    corev1.Container
+	kind    ctrKind
+	sidecar bool // an init container with restartPolicy Always
+	index   int  // in the VM (init.c), -1 before it is there
+	ref     *corev1.ObjectReference
+
+	// under tp.mu
+	status    corev1.ContainerStatus
+	logs      *logBuffer
+	prev      *logBuffer // of the run before: kubectl logs --previous
+	backoff   time.Duration
+	run       int // counts the runs; the probes of an old run are ignored
+	runAt     time.Time
+	probes    context.CancelFunc
+	startupOK bool
+	ready     bool
+	done      bool // terminated for good
+	pull      *imagePull
+	pending   bool // a start is under way
+}
+
+// tabPod is a pod on the tab node.
 type tabPod struct {
 	n               *tabNode
 	uid             types.UID
 	namespace, name string
-	container       corev1.Container
 	restartPolicy   corev1.RestartPolicy
 	ref             *corev1.ObjectReference
 	ip              string
 	hostname        string
+	pod             *corev1.Pod     // as it was bound, for env, volumes and the downward API
 	spec            *corev1.PodSpec // for DNS and /etc/hosts (clusternet.go)
+	ctrs            []*tabCtr       // init containers, containers, ephemeral containers
 	ignored         []string        // what the pod asks for and the tab node does not have
-	logs            *logBuffer
 	ctx             context.Context
 	cancel          context.CancelFunc
 
 	mu      sync.Mutex
-	w       workload
-	status  corev1.ContainerStatus
+	w       dialer // what runs the pod, once a container started
 	phase   corev1.PodPhase
 	reason  string // of the pod, when the tab cannot run it at all
 	message string
 	started metav1.Time
 	push    sync.Mutex // one status update at a time
+
+	// events of the VM and the probes for the loop of the pod (runVM)
+	evMu   sync.Mutex
+	evs    []podEvent
+	notify chan struct{}
 }
 
 func (n *tabNode) newPod(pod *corev1.Pod) *tabPod {
@@ -102,12 +140,13 @@ func (n *tabNode) newPod(pod *corev1.Pod) *tabPod {
 		ref:           &corev1.ObjectReference{Kind: "Pod", APIVersion: "v1", Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID},
 		ip:            n.allocateIP(),
 		hostname:      pod.Name,
+		pod:           pod.DeepCopy(),
 		spec:          pod.Spec.DeepCopy(),
-		logs:          newLogBuffer(),
 		ctx:           ctx,
 		cancel:        cancel,
 		phase:         corev1.PodPending,
 		started:       metav1.Now(),
+		notify:        make(chan struct{}, 1),
 	}
 	if pod.Spec.HostNetwork {
 		tp.ip = n.ip
@@ -115,68 +154,71 @@ func (n *tabNode) newPod(pod *corev1.Pod) *tabPod {
 	if pod.Spec.Hostname != "" {
 		tp.hostname = pod.Spec.Hostname
 	}
-	if len(pod.Spec.Containers) > 0 {
-		tp.container = pod.Spec.Containers[0]
+	for _, c := range pod.Spec.InitContainers {
+		tc := tp.addCtr(c, ctrInit)
+		tc.sidecar = c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways
 	}
-	tp.status = corev1.ContainerStatus{
-		Name:  tp.container.Name,
-		Image: tp.container.Image,
-		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}},
+	for _, c := range pod.Spec.Containers {
+		tp.addCtr(c, ctrRegular)
 	}
-	if len(pod.Spec.Containers) != 1 || len(pod.Spec.InitContainers) > 0 {
-		tp.phase, tp.reason, tp.message = corev1.PodFailed, "UnsupportedPod", "the tab node runs pods with exactly one container and no init containers"
+	for _, e := range pod.Spec.EphemeralContainers {
+		tp.addCtr(corev1.Container(e.EphemeralContainerCommon), ctrEphemeral)
 	}
-	for _, v := range pod.Spec.Volumes {
-		// every pod has the one of its service account token
-		if !strings.HasPrefix(v.Name, "kube-api-access-") {
-			tp.ignored = append(tp.ignored, "volume "+v.Name)
+	webllm := false
+	for _, c := range tp.ctrs {
+		if _, ok := webllmModel(c.spec.Image); ok {
+			webllm = true
 		}
 	}
-	if len(tp.container.EnvFrom) > 0 {
-		tp.ignored = append(tp.ignored, "envFrom")
+	if webllm && (len(pod.Spec.Containers) != 1 || len(tp.ctrs) != 1) {
+		tp.phase, tp.reason, tp.message = corev1.PodFailed, "UnsupportedPod", "a pod with the language model of "+webllmRepo+" has exactly one container"
 	}
-	for _, e := range tp.container.Env {
-		if _, ok := tp.envValue(e); !ok {
-			tp.ignored = append(tp.ignored, "env "+e.Name)
-		}
-	}
+	tp.ignored = unsupportedVolumes(pod)
 	return tp
 }
 
-// envValue returns the value of an environment variable of the container.
-// Of the downward API the tab node knows the fields of the pod itself, and
-// it does not read ConfigMaps or Secrets: ok is false for these.
-func (tp *tabPod) envValue(e corev1.EnvVar) (value string, ok bool) {
-	if e.ValueFrom == nil {
-		return e.Value, true
+func (tp *tabPod) addCtr(c corev1.Container, kind ctrKind) *tabCtr {
+	field := map[ctrKind]string{ctrInit: "spec.initContainers", ctrRegular: "spec.containers", ctrEphemeral: "spec.ephemeralContainers"}[kind]
+	ref := *tp.ref
+	ref.FieldPath = field + "{" + c.Name + "}"
+	tc := &tabCtr{tp: tp, spec: c, kind: kind, index: -1, ref: &ref, logs: newLogBuffer()}
+	waiting := "ContainerCreating"
+	if kind == ctrRegular && len(tp.spec.InitContainers) > 0 || kind == ctrInit {
+		waiting = "PodInitializing"
 	}
-	if f := e.ValueFrom.FieldRef; f != nil {
-		switch f.FieldPath {
-		case "metadata.name":
-			return tp.name, true
-		case "metadata.namespace":
-			return tp.namespace, true
-		case "metadata.uid":
-			return string(tp.uid), true
-		case "spec.nodeName":
-			return tp.n.name, true
-		case "status.podIP", "status.podIPs":
-			return tp.ip, true
-		case "status.hostIP", "status.hostIPs":
-			return tp.n.ip, true
+	tc.status = corev1.ContainerStatus{
+		Name:    c.Name,
+		Image:   c.Image,
+		State:   corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: waiting}},
+		Started: ptr.To(false),
+	}
+	tp.ctrs = append(tp.ctrs, tc)
+	return tc
+}
+
+// container finds a container by name; "" is the first container.
+func (tp *tabPod) container(name string) *tabCtr {
+	for _, c := range tp.ctrs {
+		if c.kind == ctrRegular && name == "" || c.spec.Name == name {
+			return c
 		}
 	}
-	return "", false
+	return nil
 }
+
+// main is the first container, the one of a pod with one container.
+func (tp *tabPod) main() *tabCtr { return tp.container("") }
 
 func (tp *tabPod) event(typ, reason, msg string) {
 	tp.n.event(tp.ref, typ, reason, msg)
 }
 
-// run starts the workload and restarts it after a failure, with the same
-// back-off as the kubelet.
+func (c *tabCtr) event(typ, reason, msg string) {
+	c.tp.n.event(c.ref, typ, reason, msg)
+}
+
+// run runs the pod until it is done or deleted.
 func (tp *tabPod) run() {
-	ctx := tp.ctx
 	if tp.phase == corev1.PodFailed {
 		tp.update()
 		tp.event(corev1.EventTypeWarning, tp.reason, tp.message)
@@ -188,26 +230,40 @@ func (tp *tabPod) run() {
 	// late one does not undo a newer one (push orders them).
 	go tp.update()
 	if len(tp.ignored) > 0 {
-		tp.event(corev1.EventTypeWarning, "Unsupported", "the tab node has no volumes, and of valueFrom only the fields of the pod; the container starts without: "+strings.Join(tp.ignored, ", "))
+		tp.event(corev1.EventTypeWarning, "Unsupported", "the tab node has no "+strings.Join(tp.ignored, ", ")+"; the containers start without")
 	}
+	if model, ok := webllmModel(tp.main().spec.Image); ok {
+		tp.runWorkload(model)
+		return
+	}
+	if !tp.n.hasVM() {
+		c := tp.main()
+		msg := fmt.Sprintf("the tab node runs no containers, only images that run in the browser: "+webllmRepo+"<model> (not %q)", c.spec.Image)
+		c.event(corev1.EventTypeWarning, "Failed", msg)
+		tp.setWaiting(c, "ErrImagePull", msg)
+		return
+	}
+	tp.runVM()
+}
+
+// runWorkload runs the language model and restarts it after a failure, with
+// the same back-off as the kubelet.
+func (tp *tabPod) runWorkload(model string) {
+	ctx := tp.ctx
+	c := tp.main()
 	backoff := backoffStart
 	for ctx.Err() == nil {
 		tp.mu.Lock()
-		select {
-		case <-tp.logs.done:
-			tp.logs = newLogBuffer()
-		default:
-		}
-		logs := tp.logs
+		logs := tp.newRun(c)
 		tp.mu.Unlock()
-		w, err := newWorkload(tp, &tp.container)
+		w, err := newWebLLM(tp, model)
 		if err != nil {
-			tp.event(corev1.EventTypeWarning, "Failed", err.Error())
-			tp.setWaiting("ErrImagePull", err.Error())
+			c.event(corev1.EventTypeWarning, "Failed", err.Error())
+			tp.setWaiting(c, "ErrImagePull", err.Error())
 			logs.finish()
 			return
 		}
-		pull := &imagePull{tp: tp, t0: time.Now()}
+		pull := &imagePull{c: c, t0: time.Now()}
 		err = w.start(ctx, logs, pull)
 		if ctx.Err() != nil {
 			w.stop()
@@ -218,92 +274,98 @@ func (tp *tabPod) run() {
 			w.stop()
 			if !pull.wasPulled() {
 				logs.finish()
-				if _, ok := errors.AsType[errNeverPull](err); ok {
-					// what the kubelet does: no pull, the pod waits and
-					// tries again
-					tp.event(corev1.EventTypeWarning, "ErrImageNeverPull", err.Error())
-					tp.setWaiting("ErrImageNeverPull", err.Error())
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(backoff):
-					}
-					backoff = min(backoff*2, backoffMax)
-					continue
-				}
 				// the download failed: the kubelet calls that a failed pull
-				image := tp.container.Image
-				tp.event(corev1.EventTypeWarning, "Failed", fmt.Sprintf("Failed to pull image %q: %v", image, err))
-				tp.event(corev1.EventTypeWarning, "Failed", "Error: ErrImagePull")
-				tp.setWaiting("ErrImagePull", err.Error())
-				select {
-				case <-ctx.Done():
+				tp.pullFailed(c, err)
+				if !tp.sleep(backoff) {
 					return
-				case <-time.After(backoff):
 				}
-				tp.event(corev1.EventTypeNormal, "BackOff", fmt.Sprintf("Back-off pulling image %q", image))
-				tp.setWaiting("ImagePullBackOff", fmt.Sprintf("Back-off pulling image %q: ErrImagePull: %v", image, err))
+				tp.pullBackOff(c, err)
 				backoff = min(backoff*2, backoffMax)
 				continue
 			}
-			code, reason := 1, "Error"
-			if se, ok := errors.AsType[*startError](err); ok {
-				// the kubelet tells the error of runc only in the events
-				code, reason = se.code, "StartError"
-				tp.event(corev1.EventTypeWarning, "Failed", "Error: "+err.Error())
-			} else {
-				fmt.Fprintln(logs, "error:", err)
-				tp.event(corev1.EventTypeWarning, "Failed", err.Error())
+			fmt.Fprintln(logs, "error:", err)
+			c.event(corev1.EventTypeWarning, "Failed", err.Error())
+			restart := tp.restarts(c, 1)
+			if !restart {
+				tp.mu.Lock()
+				tp.phase = corev1.PodFailed
+				tp.mu.Unlock()
 			}
-			restart := tp.restarts(code)
-			tp.setTerminated(code, reason, err.Error(), restart)
-			if !restart || !tp.backOff(&backoff) {
+			tp.setTerminated(c, 1, "Error", err.Error(), restart)
+			if !restart || !tp.backOff(c, &backoff) {
 				return
 			}
 			continue
 		}
 		pull.done(0)
-		tp.event(corev1.EventTypeNormal, "Started", "Started container "+tp.container.Name)
-		tp.setRunning(w)
-		e, ok := w.(exiter)
-		if !ok {
-			return
-		}
-		started := time.Now()
-		var code int
-		select {
-		case <-ctx.Done():
-			return
-		case code = <-e.wait():
-		}
+		c.event(corev1.EventTypeNormal, "Started", "Started container "+c.spec.Name)
 		tp.mu.Lock()
-		if tp.w == w {
-			tp.w = nil
-		}
+		tp.w = w
 		tp.mu.Unlock()
-		w.stop()
-		reason := "Completed"
-		if code != 0 {
-			reason = "Error"
-		}
-		restart := tp.restarts(code)
-		tp.setTerminated(code, reason, "", restart)
-		if !restart {
-			return
-		}
-		// the kubelet forgets the back-off of a container that ran for 10 minutes
-		if time.Since(started) > 10*time.Minute {
-			backoff = backoffStart
-		}
-		if !tp.backOff(&backoff) {
-			return
-		}
+		tp.mu.Lock()
+		tp.phase = corev1.PodRunning
+		tp.mu.Unlock()
+		tp.setRunning(c, w.imageID(), w.runtime())
+		return
 	}
 }
 
-// restarts tells whether the restart policy starts the container again
-// after it exited with code.
-func (tp *tabPod) restarts(code int) bool {
+// pullFailed tells that the image of c did not come, as the kubelet does.
+func (tp *tabPod) pullFailed(c *tabCtr, err error) {
+	if _, ok := errors.AsType[errNeverPull](err); ok {
+		c.event(corev1.EventTypeWarning, "ErrImageNeverPull", err.Error())
+		tp.setWaiting(c, "ErrImageNeverPull", err.Error())
+		return
+	}
+	c.event(corev1.EventTypeWarning, "Failed", fmt.Sprintf("Failed to pull image %q: %v", c.spec.Image, err))
+	c.event(corev1.EventTypeWarning, "Failed", "Error: ErrImagePull")
+	tp.setWaiting(c, "ErrImagePull", err.Error())
+}
+
+// pullBackOff is the state after a failed pull, while the kubelet waits.
+func (tp *tabPod) pullBackOff(c *tabCtr, err error) {
+	if _, ok := errors.AsType[errNeverPull](err); ok {
+		return
+	}
+	c.event(corev1.EventTypeNormal, "BackOff", fmt.Sprintf("Back-off pulling image %q", c.spec.Image))
+	tp.setWaiting(c, "ImagePullBackOff", fmt.Sprintf("Back-off pulling image %q: ErrImagePull: %v", c.spec.Image, err))
+}
+
+// sleep waits for d; false if the pod is gone meanwhile.
+func (tp *tabPod) sleep(d time.Duration) bool {
+	select {
+	case <-tp.ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// newRun starts a new log for a run of c: the last one stays for kubectl
+// logs --previous. tp.mu is held.
+func (tp *tabPod) newRun(c *tabCtr) *logBuffer {
+	select {
+	case <-c.logs.done:
+		c.prev = c.logs
+		c.logs = newLogBuffer()
+	default:
+	}
+	c.run++
+	return c.logs
+}
+
+// restarts tells whether c starts again after it exited with code.
+func (tp *tabPod) restarts(c *tabCtr, code int) bool {
+	switch {
+	case c.kind == ctrEphemeral:
+		return false
+	case c.sidecar:
+		return true
+	case c.kind == ctrInit:
+		// an init container that failed runs again, unless the pod never
+		// restarts
+		return code != 0 && tp.restartPolicy != corev1.RestartPolicyNever
+	}
 	switch tp.restartPolicy {
 	case corev1.RestartPolicyNever:
 		return false
@@ -313,37 +375,39 @@ func (tp *tabPod) restarts(code int) bool {
 	return true
 }
 
-// backOff waits before the container starts again, as CrashLoopBackOff. It
-// returns false if the pod is gone meanwhile.
-func (tp *tabPod) backOff(backoff *time.Duration) bool {
-	msg := fmt.Sprintf("back-off %s restarting failed container=%s pod=%s_%s(%s)", *backoff, tp.container.Name, tp.name, tp.namespace, tp.uid)
-	tp.event(corev1.EventTypeWarning, "BackOff", "Back-off restarting failed container "+tp.container.Name+" in pod "+tp.name+"_"+tp.namespace+"("+string(tp.uid)+")")
-	tp.setWaiting("CrashLoopBackOff", msg)
-	select {
-	case <-tp.ctx.Done():
+// backOff waits before c starts again, as CrashLoopBackOff. It returns
+// false if the pod is gone meanwhile.
+func (tp *tabPod) backOff(c *tabCtr, backoff *time.Duration) bool {
+	tp.crashLoop(c, *backoff)
+	if !tp.sleep(*backoff) {
 		return false
-	case <-time.After(*backoff):
 	}
 	*backoff = min(*backoff*2, backoffMax)
 	return true
+}
+
+// crashLoop is the state of c while it waits for a restart.
+func (tp *tabPod) crashLoop(c *tabCtr, d time.Duration) {
+	msg := fmt.Sprintf("back-off %s restarting failed container=%s pod=%s_%s(%s)", d, c.spec.Name, tp.name, tp.namespace, tp.uid)
+	c.event(corev1.EventTypeWarning, "BackOff", "Back-off restarting failed container "+c.spec.Name+" in pod "+tp.name+"_"+tp.namespace+"("+string(tp.uid)+")")
+	tp.setWaiting(c, "CrashLoopBackOff", msg)
 }
 
 // errNeverPull is the error of a container whose image is not present, with
 // the pull policy Never.
 type errNeverPull struct{ error }
 
-// imagePull tells the events of a pod what the kubelet would say about an
-// image pull, for a workload that downloads what it runs: the model of
-// webllm comes from Hugging Face, or from the browser cache.
+// imagePull tells the events of a container what the kubelet would say
+// about an image pull.
 type imagePull struct {
-	tp      *tabPod
+	c       *tabCtr
 	t0      time.Time
 	mu      sync.Mutex
 	pulling bool // the download started
 	pulled  bool // the download is done, the container is created
 }
 
-// fetching says that the workload downloads, not that it reads its cache.
+// fetching says that the image downloads, not that the browser has it.
 func (p *imagePull) fetching() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -351,7 +415,7 @@ func (p *imagePull) fetching() {
 		return
 	}
 	p.pulling = true
-	p.tp.event(corev1.EventTypeNormal, "Pulling", fmt.Sprintf("Pulling image %q", p.tp.container.Image))
+	p.c.event(corev1.EventTypeNormal, "Pulling", fmt.Sprintf("Pulling image %q", p.c.spec.Image))
 }
 
 // done says that the download is complete, with its size if known. Without
@@ -363,14 +427,14 @@ func (p *imagePull) done(size int64) {
 		return
 	}
 	p.pulled = true
-	image := p.tp.container.Image
+	image := p.c.spec.Image
 	if p.pulling {
 		d := time.Since(p.t0).Truncate(time.Millisecond)
-		p.tp.event(corev1.EventTypeNormal, "Pulled", fmt.Sprintf("Successfully pulled image %q in %v (%v including waiting). Image size: %d bytes.", image, d, d, size))
+		p.c.event(corev1.EventTypeNormal, "Pulled", fmt.Sprintf("Successfully pulled image %q in %v (%v including waiting). Image size: %d bytes.", image, d, d, size))
 	} else {
-		p.tp.event(corev1.EventTypeNormal, "Pulled", fmt.Sprintf("Container image %q already present on machine and can be accessed by the pod", image))
+		p.c.event(corev1.EventTypeNormal, "Pulled", fmt.Sprintf("Container image %q already present on machine and can be accessed by the pod", image))
 	}
-	p.tp.event(corev1.EventTypeNormal, "Created", "Created container: "+p.tp.container.Name)
+	p.c.event(corev1.EventTypeNormal, "Created", "Created container: "+p.c.spec.Name)
 }
 
 // wasPulled reports whether the download was done.
@@ -380,73 +444,102 @@ func (p *imagePull) wasPulled() bool {
 	return p.pulled
 }
 
-// stop ends the workload. With a reason, it tells the pod's events.
+// stop ends the pod. With a reason, it tells the events of the containers
+// that run.
 func (tp *tabPod) stop(reason, msg string) {
 	tp.cancel()
 	tp.mu.Lock()
 	w := tp.w
-	logs := tp.logs
 	tp.w = nil
-	tp.mu.Unlock()
-	if w != nil {
-		if reason != "" {
-			tp.event(corev1.EventTypeNormal, reason, msg)
+	var running []*tabCtr
+	for _, c := range tp.ctrs {
+		if c.status.State.Running != nil {
+			running = append(running, c)
 		}
-		w.stop()
+		if c.probes != nil {
+			c.probes()
+		}
 	}
-	logs.finish()
+	tp.mu.Unlock()
+	if reason != "" {
+		for _, c := range running {
+			c.event(corev1.EventTypeNormal, reason, msg+c.spec.Name)
+		}
+	}
+	if s, ok := w.(interface{ stop() }); ok {
+		s.stop()
+	}
+	for _, c := range tp.ctrs {
+		c.logs.finish()
+	}
 }
 
-func (tp *tabPod) running() workload {
+// running is what runs the pod, or nil before a container started.
+func (tp *tabPod) running() dialer {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
 	return tp.w
 }
 
-func (tp *tabPod) setWaiting(reason, msg string) {
+func (tp *tabPod) setWaiting(c *tabCtr, reason, msg string) {
 	tp.mu.Lock()
-	tp.status.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason, Message: msg}}
-	tp.status.Ready, tp.status.Started = false, ptr.To(false)
+	c.status.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason, Message: msg}}
+	c.status.Ready, c.status.Started = false, ptr.To(false)
+	c.ready, c.startupOK = false, false
 	tp.mu.Unlock()
 	tp.update()
 }
 
-// setTerminated records that the container ended. Unless it restarts, the
-// pod is done.
-func (tp *tabPod) setTerminated(code int, reason, msg string, restart bool) {
+// setTerminated records that c ended. Unless it restarts, it is done.
+func (tp *tabPod) setTerminated(c *tabCtr, code int, reason, msg string, restart bool) {
 	tp.mu.Lock()
-	logs := tp.logs
+	logs := c.logs
 	now := metav1.Now()
-	t := &corev1.ContainerStateTerminated{ExitCode: int32(code), Reason: reason, Message: msg, StartedAt: now, FinishedAt: now}
-	if r := tp.status.State.Running; r != nil {
+	t := &corev1.ContainerStateTerminated{ExitCode: int32(code), Reason: reason, Message: msg, StartedAt: now, FinishedAt: now, ContainerID: c.status.ContainerID}
+	if r := c.status.State.Running; r != nil {
 		t.StartedAt = r.StartedAt
 	}
-	tp.status.State = corev1.ContainerState{Terminated: t}
-	tp.status.Ready, tp.status.Started = false, ptr.To(false)
-	switch {
-	case restart:
-		tp.status.LastTerminationState = corev1.ContainerState{Terminated: t}
-		tp.status.RestartCount++
-	case code == 0:
-		tp.phase = corev1.PodSucceeded
-	default:
-		tp.phase = corev1.PodFailed
+	c.status.State = corev1.ContainerState{Terminated: t}
+	c.status.Ready, c.status.Started = false, ptr.To(false)
+	c.ready, c.startupOK = false, false
+	if c.probes != nil {
+		c.probes()
+		c.probes = nil
+	}
+	if restart {
+		c.status.LastTerminationState = corev1.ContainerState{Terminated: t}
+		c.status.RestartCount++
+	} else {
+		c.done = true
 	}
 	tp.mu.Unlock()
 	logs.finish()
 	tp.update()
 }
 
-func (tp *tabPod) setRunning(w workload) {
+func (tp *tabPod) setRunning(c *tabCtr, imageID, runtime string) {
 	tp.mu.Lock()
-	tp.w = w
-	tp.phase = corev1.PodRunning
-	tp.status.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}}
-	tp.status.Ready, tp.status.Started = true, ptr.To(true)
-	tp.status.ImageID = w.imageID()
-	tp.status.ContainerID = w.runtime() + "://" + strings.ReplaceAll(string(tp.uid), "-", "")
+	c.runAt = time.Now()
+	c.status.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}}
+	// without a startup probe the container counts as started at once,
+	// without a readiness probe as ready once started (probes.go)
+	c.startupOK = c.spec.StartupProbe == nil
+	c.ready = c.startupOK && c.spec.ReadinessProbe == nil
+	c.status.Started = ptr.To(c.startupOK)
+	c.status.Ready = c.ready
+	if imageID != "" {
+		c.status.ImageID = imageID
+	}
+	c.status.ContainerID = runtime + "://" + containerID(tp.uid, c.spec.Name, c.run)
 	tp.mu.Unlock()
 	tp.update()
+}
+
+// containerID is unique per run of a container, as with containerd.
+func containerID(uid types.UID, name string, run int) string {
+	h := fnv.New32a()
+	h.Write([]byte(name))
+	return fmt.Sprintf("%.32s%08x%04x", strings.ReplaceAll(string(uid), "-", ""), h.Sum32(), run)
 }
 
 // update writes the status of the pod.
@@ -462,31 +555,56 @@ func (tp *tabPod) update() {
 		if pod.UID != tp.uid {
 			return nil
 		}
+		s := &pod.Status
 		tp.mu.Lock()
-		cs := *tp.status.DeepCopy()
 		phase, reason, message := tp.phase, tp.reason, tp.message
+		var inits, regular, ephemeral []corev1.ContainerStatus
+		initialized, ready := true, true
+		for _, c := range tp.ctrs {
+			cs := *c.status.DeepCopy()
+			cs.Ready = c.ready
+			cs.Started = ptr.To(c.startupOK && cs.State.Running != nil)
+			switch c.kind {
+			case ctrInit:
+				inits = append(inits, cs)
+				if c.sidecar {
+					initialized = initialized && *cs.Started
+					ready = ready && cs.Ready
+				} else {
+					initialized = initialized && cs.State.Terminated != nil && cs.State.Terminated.ExitCode == 0
+				}
+			case ctrRegular:
+				regular = append(regular, cs)
+				ready = ready && cs.Ready
+			case ctrEphemeral:
+				cs.Ready, cs.Started = false, nil
+				ephemeral = append(ephemeral, cs)
+			}
+		}
 		tp.mu.Unlock()
 
-		s := &pod.Status
 		s.Phase, s.Reason, s.Message = phase, reason, message
 		s.HostIP, s.HostIPs = tp.n.ip, []corev1.HostIP{{IP: tp.n.ip}}
 		s.PodIP, s.PodIPs = tp.ip, []corev1.PodIP{{IP: tp.ip}}
 		s.StartTime = &tp.started
 		if phase != corev1.PodFailed || reason == "" {
-			s.ContainerStatuses = []corev1.ContainerStatus{cs}
+			s.InitContainerStatuses, s.ContainerStatuses, s.EphemeralContainerStatuses = inits, regular, ephemeral
 		}
-		ready := corev1.ConditionFalse
-		if cs.Ready {
-			ready = corev1.ConditionTrue
+		cond := func(b bool) corev1.ConditionStatus {
+			if b {
+				return corev1.ConditionTrue
+			}
+			return corev1.ConditionFalse
 		}
+		ready = ready && initialized && phase == corev1.PodRunning
 		for _, c := range []struct {
 			t corev1.PodConditionType
 			s corev1.ConditionStatus
 		}{
 			{corev1.PodReadyToStartContainers, corev1.ConditionTrue},
-			{corev1.PodInitialized, corev1.ConditionTrue},
-			{corev1.ContainersReady, ready},
-			{corev1.PodReady, ready},
+			{corev1.PodInitialized, cond(initialized)},
+			{corev1.ContainersReady, cond(ready)},
+			{corev1.PodReady, cond(ready)},
 			{corev1.PodScheduled, corev1.ConditionTrue},
 		} {
 			setPodCondition(s, c.t, c.s)

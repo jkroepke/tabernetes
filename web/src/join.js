@@ -111,7 +111,12 @@ export function joinBuiltins({ image, stun = "stun:stun.l.google.com:19302", rel
       render();
       if (!cluster) {
         // A failed connection never recovers: free it and its data channels.
-        if (pc.connectionState === "failed") pc.close();
+        // The node goes too, as with the shared worker (meshDown in
+        // cluster.js): its agent ends without a connection.
+        if (pc.connectionState === "failed") {
+          pc.close();
+          if (up) globalThis.tabernetes.dropNode(name);
+        } else if (pc.connectionState === "connected") up = true;
         return;
       }
       if (pc.connectionState === "connected" && !up) {

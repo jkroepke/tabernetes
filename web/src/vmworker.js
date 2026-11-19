@@ -489,11 +489,9 @@ async function bootVM(m, memory, gate = null) {
   await ok;
   bootKernel(e.v86.cpu, { kernel, initrd: initramfs(init), cmdline: KERNEL_CMDLINE });
   const ready = new Promise((resolve, reject) => {
-    let error = "";
     onControl = (l) => {
       if (l === "ready") resolve();
-      else if (l.startsWith("error ")) error = l.slice(6);
-      else if (l.startsWith("exit ")) reject(new Error(`the VM did not boot: ${error || l}`));
+      else if (l.startsWith("fail ")) reject(new Error(`the VM did not boot: ${l.slice(5)}`));
     };
   });
   e.add_listener("serial1-output-byte", control);
@@ -544,7 +542,7 @@ async function exercise(m, memory, { state, build }) {
     let l = "";
     const warmed = new Promise((resolve) => {
       e.add_listener("serial1-output-byte", (b) => {
-        if (b === 10) { if (l.trim() === "warmed" || l.startsWith("exit ")) resolve(); l = ""; } else l += String.fromCharCode(b);
+        if (b === 10) { if (l.trim() === "warmed" || l.startsWith("fail ")) resolve(); l = ""; } else l += String.fromCharCode(b);
       });
       timer = setTimeout(resolve, 10000);
     });
@@ -584,10 +582,122 @@ function address(e, m) {
   if (net && m.gateway) net.router_ip = ip4(m.gateway);
 }
 
+// The root file systems of the containers of a pod. A pod with one
+// container has its image as the root of the VM (the start of most pods
+// does not change); with more, each container has its image in
+// .tabernetes/c/<n>, and init runs it there (vm/init/init.c).
+const CTR_DIR = ".tabernetes/c";
+const VOL_DIR = ".tabernetes/v";
+
+// The state of the pod in this worker: the tree of the VM and the storage
+// of its files, for a container that comes later (kubectl debug).
+let pod = null; // {m, storage, mem, nested}
+let running = false; // init got "go": commands go to it
+const queued = []; // commands before that
+
+function command(line) {
+  if (running) emulator.serial_send_bytes(1, new TextEncoder().encode(line + "\n"));
+  else queued.push(line);
+}
+
+const now = () => Math.floor(Date.now() / 1000);
+const enc = new TextEncoder();
+
+// memFile puts data into the tree at path, served from memory.
+function memFile(tree, mem, path, data, mode = 0o644, uid = 0, gid = 0) {
+  const key = `mem:${mem.size}`;
+  mem.set(key, data);
+  tree.set(path, { uid, gid, mtime: now(), mode: modes.S_IFREG | mode, size: data.length, key });
+}
+
+// containerTree is the root file system of one container: the layers of
+// its image, and what the kubelet puts into every container.
+function containerTree(m, img, mem) {
+  const tree = new Tree();
+  img.layers.forEach((l, i) => {
+    tree.layer = i;
+    tree.addLayer(l.id, l.entries);
+  });
+  tree.layer = img.layers.length;
+  // what the kubelet mounts into every container. init wrote them over
+  // 9p, which took 0.3 million instructions of every start.
+  const hosts = m.hosts || `# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n${m.ip ? `${m.ip}\t${m.hostname || ""}\n` : ""}`;
+  memFile(tree, mem, "etc/hosts", enc.encode(hosts));
+  const resolv = m.resolvConf || (m.gateway ? `nameserver ${m.gateway}\n` : "");
+  if (resolv) memFile(tree, mem, "etc/resolv.conf", enc.encode(resolv));
+  for (const d of ["dev", "proc", "sys", "tmp"]) {
+    if (!tree.files.has(d)) tree.set(d, { uid: 0, gid: 0, mtime: now(), mode: modes.S_IFDIR | (d === "tmp" ? 0o1777 : 0o755) });
+  }
+  return tree;
+}
+
+// volumeTree puts the volumes of the pod into .tabernetes/v/<name>. Files
+// of a ConfigMap, Secret, downward API or projected volume are laid out
+// like the atomic writer of the kubelet does: the data in a directory with
+// a time stamp, ..data links to it, and each entry is a link through
+// ..data. An emptyDir is an empty directory, or a tmpfs (medium Memory).
+function volumeTree(tree, mem, volumes, conf) {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "_").replace("T", "_").replace("Z", "");
+  for (const [name, v] of Object.entries(volumes || {})) {
+    const dir = `${VOL_DIR}/${name}`;
+    tree.set(dir, { uid: 0, gid: 0, mtime: now(), mode: modes.S_IFDIR | (v.files ? 0o1777 : 0o777) });
+    if (v.medium === "Memory") conf.tmpfs.push({ path: "/" + dir, options: v.sizeLimit ? `size=${v.sizeLimit}` : "" });
+    if (!v.files) continue;
+    const data = `..${stamp}`;
+    tree.set(`${dir}/${data}`, { uid: 0, gid: 0, mtime: now(), mode: modes.S_IFDIR | 0o755 });
+    tree.set(`${dir}/..data`, { uid: 0, gid: 0, mtime: now(), mode: modes.S_IFLNK | 0o777, target: data });
+    const top = new Set();
+    for (const f of v.files) {
+      memFile(tree, mem, `${dir}/${data}/${f.path}`, f.data instanceof Uint8Array ? f.data : enc.encode(f.data ?? ""), f.mode ?? 0o644, 0, v.fsGroup ?? 0);
+      top.add(f.path.split("/")[0]);
+    }
+    for (const t of top) tree.set(`${dir}/${t}`, { uid: 0, gid: 0, mtime: now(), mode: modes.S_IFLNK | 0o777, target: `..data/${t}` });
+  }
+}
+
+// ctrConfig is a container for init: its command after the image config,
+// its root and its mounts.
+function ctrConfig(img, c, root) {
+  const spec = containerSpec(img.config, c);
+  if (c.user) spec.user = c.user;
+  return {
+    name: c.name, root, ...spec, console: !!c.console,
+    stdin: !!c.stdin, stdinOnce: !!c.stdinOnce, tty: !!c.tty, mounts: c.mounts || [],
+  };
+}
+
+// pullAll pulls the images of the containers, all at once.
+async function pullAll(m, containers, onLayers) {
+  return Promise.all(containers.map(async (c, i) => {
+    const t0 = Date.now();
+    try {
+      const img = await pullImage(m.registry, c.image, c.pullPolicy, { fetching: () => post({ type: "pulling", i: c.index ?? i }), layers: onLayers });
+      post({ type: "pulled", i: c.index ?? i, present: img.present, size: img.size, imageID: img.imageID, ms: Date.now() - t0 });
+      return img;
+    } catch (e) {
+      e.container = c.index ?? i;
+      throw e;
+    }
+  }));
+}
+
+const pullError = (e, image) => ({
+  type: "error", pull: true, i: e.container, never: e instanceof NeverPullError,
+  message: e instanceof PullError ? e.message : `failed to pull and unpack image "${image}": ${e.message}`,
+});
+
+// The config of the pod (env, command and args of each container, the files
+// of the volumes) comes with the start message, or a moment later: the
+// kubelet side reads ConfigMaps and Secrets and asks for a token while the
+// images come.
+let configReady = null;
+let gotConfig = () => {};
+
 async function start(m) {
   const t0 = Date.now();
   stopExercise();
   const memory = memoryOf(m);
+  configReady = m.config !== undefined ? Promise.resolve(m.config) : new Promise((r) => (gotConfig = r));
   let go;
   const layersDownload = new Promise((resolve) => (go = resolve));
   // The VM of a spare worker, or one that boots while the image is pulled.
@@ -602,65 +712,56 @@ async function start(m) {
   }
   warm = null;
   vm.catch(() => {});
-  let img;
+  let downloads = 0;
+  const containers = m.containers;
+  let imgs;
   try {
-    img = await pullImage(m.registry, m.image, m.pullPolicy, { fetching: () => post({ type: "pulling" }), layers: go });
+    imgs = await pullAll(m, containers, () => { if (++downloads === containers.length) go(); });
   } catch (e) {
     vm.then((v) => v.emulator.destroy(), () => {});
     go();
-    post({ type: "error", pull: true, never: e instanceof NeverPullError, message: e instanceof PullError ? e.message : `failed to pull and unpack image "${m.image}": ${e.message}` });
+    post(pullError(e, containers[e.container]?.image));
     return;
   }
   go();
-  post({ type: "pulled", present: img.present, size: img.size, imageID: img.imageID, ms: Date.now() - t0 });
   // The layers of this pod are in use now; a new image may need room.
-  if (!img.present) store.gc().catch((e) => console.warn("tabernetes: image garbage collection:", e));
+  if (imgs.some((i) => !i.present)) store.gc().catch((e) => console.warn("tabernetes: image garbage collection:", e));
 
-  const spec = containerSpec(img.config, m.container);
-  if (!spec.args.length) {
-    vm.then((v) => v.emulator.destroy(), () => {});
-    post({ type: "exit", code: 128, message: "no command specified" });
-    return;
-  }
-  const c = m.container;
-  const conf = { ...spec, hostname: m.hostname, ip: m.ip, gateway: m.gateway, stdin: !!c.stdin, stdinOnce: !!c.stdinOnce, tty: !!c.tty };
   // The readers of the layers open while the tree is built: each takes
   // a few file system calls (OPFS).
-  const opened = Promise.all(img.layers.map(async (l) => [l.id, await store.layer(l.id)]));
-  // The root file system: the layers, and the config of the pod on top. The
-  // mount points must be there for init.
-  const tree = new Tree();
-  img.layers.forEach((l, i) => {
-    tree.layer = i;
-    tree.addLayer(l.id, l.entries);
-  });
-  tree.layer = img.layers.length;
-  const now = Math.floor(Date.now() / 1000);
+  const ids = new Set(imgs.flatMap((img) => img.layers.map((l) => l.id)));
+  const opened = Promise.all([...ids].map(async (id) => [id, await store.layer(id)]));
+
+  // The root file system: the layers, and the config of the pod on top.
+  const nested = containers.length > 1;
+  const cfg = await configReady;
+  for (const c of containers) Object.assign(c, cfg.containers?.[c.name]);
   const mem = new Map();
-  const enc = new TextEncoder();
-  const extra = {
-    ".tabernetes/config.json": { mode: modes.S_IFREG | 0o644, data: enc.encode(JSON.stringify(conf)) },
-    // what the kubelet mounts into every container. init wrote them over
-    // 9p, which took 0.3 million instructions of every start.
-    "etc/hosts": { mode: modes.S_IFREG | 0o644, data: enc.encode(`# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n${m.ip ? `${m.ip}\t${m.hostname || ""}\n` : ""}`) },
-  };
-  if (m.hosts) extra["etc/hosts"].data = enc.encode(m.hosts);
-  if (m.resolvConf) extra["etc/resolv.conf"] = { mode: modes.S_IFREG | 0o644, data: enc.encode(m.resolvConf) };
-  else if (m.gateway) extra["etc/resolv.conf"] = { mode: modes.S_IFREG | 0o644, data: enc.encode(`nameserver ${m.gateway}\n`) };
-  for (const [path, e] of Object.entries(extra)) {
-    const key = `mem:${mem.size}`;
-    mem.set(key, e.data);
-    tree.set(path, { uid: 0, gid: 0, mtime: now, mode: e.mode, size: e.data.length, key });
+  const conf = { hostname: m.hostname, ip: m.ip, gateway: m.gateway, start: (m.start || []).map(String), tmpfs: [], containers: [] };
+  let tree;
+  if (!nested) {
+    tree = containerTree(m, imgs[0], mem);
+    conf.containers.push(ctrConfig(imgs[0], containers[0], "/"));
+  } else {
+    tree = new Tree();
+    imgs.forEach((img, i) => {
+      const t = containerTree(m, img, mem), prefix = `${CTR_DIR}/${i}`;
+      tree.set(prefix, { uid: 0, gid: 0, mtime: now(), mode: modes.S_IFDIR | 0o755 });
+      for (const [k, v] of t.files) tree.files.set(`${prefix}/${k}`, v);
+      conf.containers.push(ctrConfig(img, containers[i], "/" + prefix));
+    });
+    for (const d of ["dev", "proc", "sys", "tmp"]) tree.set(d, { uid: 0, gid: 0, mtime: now(), mode: modes.S_IFDIR | (d === "tmp" ? 0o1777 : 0o755) });
   }
-  for (const d of ["dev", "proc", "sys", "tmp"]) {
-    if (!tree.files.has(d)) tree.set(d, { uid: 0, gid: 0, mtime: now, mode: modes.S_IFDIR | (d === "tmp" ? 0o1777 : 0o755) });
-  }
+  imgs.forEach((img) => (img.layers = null));
+  volumeTree(tree, mem, cfg.volumes, conf);
+  memFile(tree, mem, ".tabernetes/config.json", enc.encode(JSON.stringify(conf)));
   const layers = new Map(await opened);
   const fsJSON = tree.v86();
-  img.layers = null;
 
   ({ emulator } = await vm);
   clusterNetwork(emulator.network_adapter, m);
+  pod = { m, mem, nested, layers, storage: null };
+
   // The console is stdout and stderr of the container. Batch the bytes.
   // A character of several bytes may be split between two batches.
   const utf8 = new TextDecoder();
@@ -677,24 +778,75 @@ async function start(m) {
     if (out.length >= 4096) flush();
     else if (!timer) timer = setTimeout(flush, 20);
   });
+
   // The init of the pod (vm/init) reports on the second serial port.
-  let error = "";
+  const errors = new Map();
+  const logs = new Map(); // container -> TextDecoder of its "log" lines
   onControl = (l) => {
-    if (l === "started") post({ type: "started", memory });
-    else if (l.startsWith("error ")) error = l.slice(6);
-    else if (l.startsWith("exit ")) { flush(); post({ type: "exit", code: Number(l.slice(5)), message: error }); }
+    const sp = l.indexOf(" "), word = sp < 0 ? l : l.slice(0, sp), rest = sp < 0 ? "" : l.slice(sp + 1);
+    const sp2 = rest.indexOf(" "), i = Number(sp2 < 0 ? rest : rest.slice(0, sp2)), arg = sp2 < 0 ? "" : rest.slice(sp2 + 1);
+    switch (word) {
+      case "started": post({ type: "started", i, memory }); break;
+      case "error": errors.set(i, arg); break;
+      case "exit":
+        if (containers[i]?.console || !nested) flush();
+        post({ type: "exit", i, code: Number(arg), message: errors.get(i) || "" });
+        errors.delete(i);
+        break;
+      case "log": {
+        if (!logs.has(i)) logs.set(i, new TextDecoder());
+        const data = logs.get(i).decode(Uint8Array.from(atob(arg), (c) => c.charCodeAt(0)), { stream: true });
+        if (data) post({ type: "log", i, data });
+        break;
+      }
+      case "fail": flush(); post({ type: "error", message: rest }); break;
+    }
   };
   if (!emulator.is_running()) {
     // restored: it waits for the pod already
     emulator.add_listener("serial1-output-byte", control);
   }
-  emulator.fs9p.storage = new LayerStorage(layers, mem);
+  emulator.fs9p.storage = pod.storage = new LayerStorage(layers, mem);
   emulator.fs9p.load_from_json(fsJSON);
   statRoot(emulator.fs9p, m.ephemeralStorage || (await imageFSCapacity()));
   emulator.run();
   // A restored VM has the clock and the random numbers of the saved one.
   const seed = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
-  emulator.serial_send_bytes(1, new TextEncoder().encode(`go ${Date.now()} ${seed}\n`));
+  emulator.serial_send_bytes(1, enc.encode(`go ${Date.now()} ${seed}\n`));
+  running = true;
+  for (const l of queued.splice(0)) command(l);
+  post({ type: "booted", ms: Date.now() - t0 });
+}
+
+// add pulls the image of a container that comes after the start (kubectl
+// debug, an ephemeral container), puts it into the file system of the
+// running VM and starts it.
+async function add(c) {
+  const i = c.index;
+  let img;
+  try {
+    [img] = await pullAll(pod.m, [c], () => {});
+  } catch (e) {
+    post(pullError(e, c.image));
+    return;
+  }
+  const fs = emulator.fs9p;
+  const ids = img.layers.map((l) => l.id);
+  for (const id of ids) if (!pod.layers.has(id)) pod.layers.set(id, await store.layer(id));
+  const t = containerTree(pod.m, img, pod.mem);
+  const root = `${CTR_DIR}/${i}`;
+  // the directories down to .tabernetes/c
+  let parent = 0;
+  for (const name of root.split("/").slice(0, -1)) {
+    const id = fs.Search(parent, name);
+    parent = id >= 0 ? id : fs.CreateDirectory(name, parent);
+  }
+  const dir = fs.CreateDirectory(String(i), parent);
+  for (const e of t.v86().fsroot) fs.LoadRecursive(e, dir);
+  const conf = enc.encode(JSON.stringify(ctrConfig(img, c, "/" + root)));
+  await fs.CreateBinaryFile(`ctr-${i}.json`, fs.Search(0, ".tabernetes"), conf);
+  command(`add /.tabernetes/ctr-${i}.json`);
+  command(`start ${i}`);
 }
 
 // wire passes the events of a TCP connection of the network adapter to the
@@ -789,6 +941,9 @@ self.onmessage = ({ data: m }) => {
     case "warm": warmUp(m); break;
     case "layer": layerJob(m); break;
     case "start": start(m).catch((e) => post({ type: "error", message: String(e?.message || e) })); break;
+    case "config": gotConfig(m.config); break;
+    case "command": command(m.line); break;
+    case "add": add(m.container).catch((e) => post({ type: "error", i: m.container.index, message: String(e?.message || e) })); break;
     case "connect": connect(m.id, m.port, m.src); break;
     case "accept": conns.get(m.id)?.accept(); break;
     case "refuse": conns.get(m.id)?.reset(); conns.delete(m.id); break;

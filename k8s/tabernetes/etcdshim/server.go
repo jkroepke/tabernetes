@@ -403,6 +403,9 @@ func (srv *Server) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.Co
 
 // ---- Watch ----
 
+// progressNotifyInterval is that of etcd.
+const progressNotifyInterval = 10 * time.Minute
+
 type watcher struct {
 	id       int64
 	key, end []byte
@@ -484,7 +487,13 @@ func (srv *Server) Watch(stream grpc.BidiStreamingServer[pb.WatchRequest, pb.Wat
 		}
 	}()
 
-	ticker := time.NewTicker(5 * time.Second)
+	// Watchers that asked for progress notifications get one when nothing
+	// happened for this long. etcd waits 10 minutes by default
+	// (--experimental-watch-progress-notify-interval); the shim used 5 s,
+	// which woke every watch stream of kube-apiserver 12 times a minute in
+	// an idle cluster. kube-apiserver asks for progress itself when it
+	// needs it (ProgressRequest, answered at once below).
+	ticker := time.NewTicker(progressNotifyInterval)
 	defer ticker.Stop()
 	periodic := false
 	for {
