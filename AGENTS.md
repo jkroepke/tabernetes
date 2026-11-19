@@ -148,6 +148,13 @@ that name.
   lets an idle guest sleep until its next timer instead of calling
   main_loop again at once (~115 times per 10 ms tick in a Chromium worker):
   an idle nginx pod 89 -> 20 ms CPU per second.
+  0.5.5103-fork lowers the JIT threshold 750k -> 200k again (2026-11-19):
+  750k was measured with rounds in one process, which share compiled
+  modules through the native module cache of V8; the first pod of a tab
+  does not. First pod (warm-up and kernel modules as in the tab), wall
+  time, headless Chromium: goapp 1205 -> 1124 ms, glibc tools 3532 ->
+  3344 ms, a CPU-bound job 4648 -> 4143 ms, nginx unchanged; Node.js:
+  spring 35.6 -> 33.0 s. TurboFan uses more CPU on other threads.
 - **Saved VM states** (`web/src/vmstate.js`, stage 0 in
   `vm/init/init.c`): init waits in an initramfs for the pod; the first VM
   per memory size saves its state there, later pods restore it (~0.6 s less
