@@ -17,7 +17,7 @@ ARG TARGETARCH
 ARG KUBERNETES_VERSION
 ARG CONTAINERD_VERSION=2.4.2
 # renovate: github-releases=opencontainers/runc
-ARG RUNC_VERSION=v1.5.2
+ARG RUNC_VERSION=v1.5.3
 # renovate: github-releases=containernetworking/plugins
 ARG CNI_PLUGINS_VERSION=v1.10.0
 # renovate: github-releases=kubernetes-sigs/cri-tools
