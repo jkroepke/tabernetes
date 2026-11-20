@@ -335,6 +335,38 @@ that name.
   kernel; first pod in a fresh process (pod-bench, main thread CPU, 16
   alternating runs): nginx -9.1 %, goapp -6.2 %; with the kernel JIT
   modules (14 runs) nginx -15.6 %, goapp -3.0 %.
+- **Large folios for the image, 9p without an interrupt per request**
+  (2026-11-20, `vm/kernel-patches/9p-large-folios.patch`,
+  `9p-virtio-no-irq.patch`): page faults were 22 % of the guest
+  instructions of an nginx start, more than half of it reading the files
+  of the image into the page cache one 4 KiB folio at a time (allocate,
+  add to the page cache and LRU, map by fault-around, unmap at exit). The
+  pages are needed: a smaller mmap readahead did not cut instructions.
+  Now 9p files get large folios (needs `CONFIG_TRANSPARENT_HUGEPAGE`,
+  "never" for anonymous memory), a page fault reads 64 KiB folios for code
+  and data, and readahead skips a folio that is there instead of falling
+  back to 4 KiB for the rest of the window (the first page of every ELF
+  file was read with read() before). And the 9p transport collects the
+  answer right after the notify with the queue callback off: v86 answers
+  in the notify, so a request raised an interrupt for nothing (~660 per
+  nginx start, 43 now; v86 must honour `VIRTIO_F_RING_EVENT_IDX`, the
+  fork does since 2026-11-20). Profile with a stack sampler of the
+  fork (EBP chains of the kernel in `gueststat`): execve ~5 %, exit_group
+  ~4 % (the unmap of present 4 KiB pages, not empty page tables), 9p
+  RPCs ~6 % (walk, clunk, getattr, open per file). Guest instructions
+  (Node.js, pod-bench): nginx 44.0M -> 37.8M, goapp 84.2M -> 80.8M, glibc
+  text tools 847M -> 838M. Time of the first pod of a fresh process
+  (pod-bench `STATE_FILE`, 100 kernel JIT modules warmed, alternating,
+  medians): nginx 524 -> 491 ms (24 runs), goapp 1046 -> 1060 ms (16),
+  glibc 3223 -> 3308 ms (8), the last two within the noise. Headless
+  Chromium (`tools/pod-bench/chromium`, a new browser per run, 3 pods):
+  nginx first pod 484 -> 469 ms, later pods 409 -> 364 ms (12 runs);
+  goapp first pod 1179 -> 1198 ms, later pods ~957 -> ~1004 ms (26 runs,
+  noise ~10 %). The kernel time per instruction rises (more distinct
+  kernel code: 90 % of the kernel instructions of nginx on 43 instead of
+  34 pages even when packed). No gain: anonymous large folios
+  (`thp_anon=16K..64K`), fault-around 16/32/128 KiB, mmap readahead of
+  32/64/128 KiB.
 - **Kernel functions in the order of a pod** (2026-11-14,
   `vm/kernel-order.txt`, details in `vm/kernel-order.md`): the JIT of v86
   works per page of 4 KiB, and in link order 90 % of the kernel
