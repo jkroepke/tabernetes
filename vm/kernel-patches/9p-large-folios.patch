@@ -1,0 +1,113 @@
+9p, mm: large folios in the page cache of the image files
+
+Page faults were 22 % of the guest instructions of an nginx start, and
+more than half of that was reading files into the page cache: every
+folio of 4 KiB was allocated, added to the page cache and to the LRU,
+mapped by fault-around (next_uptodate_folio, set_pte_range) and unmapped
+again at exit, one page at a time. The pages are needed: a smaller
+readahead window did not cut instructions.
+
+- 9p (cache=loose, as init mounts the image) gets large folios for
+  regular files. This needs CONFIG_TRANSPARENT_HUGEPAGE (kernel.config).
+- A page fault reads 64 KiB folios, for code (like exec_folio_order() of
+  arm64) and for data (mmap read-around, which used order 0). The window
+  of the read-around starts at a folio boundary, else it began with small
+  folios.
+- page_cache_ra_order() skips a folio that is already there (-EEXIST)
+  and goes on with large folios. It fell back to the order-0 readahead for
+  the rest of the window, which happened at almost every first fault of an
+  ELF file: ld.so and the kernel read its first page with read() before.
+
+Measured with tools/pod-bench of jkroepke/v86 (Node.js, 256 MiB, with
+9p-virtio-no-irq.patch and a new kernel-order.txt): nginx start 44.0M ->
+37.8M guest instructions, kernel instructions per user page fault 5800 ->
+~3900, calls of next_uptodate_folio 5459 -> 2637; goapp 84.2M -> 80.8M;
+glibc text tools 847M -> 838M. See AGENTS.md for the times.
+
+diff --git a/fs/9p/vfs_inode.c b/fs/9p/vfs_inode.c
+index 3829554ca..78cf36717 100644
+--- a/fs/9p/vfs_inode.c
++++ b/fs/9p/vfs_inode.c
+@@ -253,6 +253,9 @@ void v9fs_set_netfs_context(struct inode *inode)
+ {
+ 	struct v9fs_inode *v9inode = V9FS_I(inode);
+ 	netfs_inode_init(&v9inode->netfs, &v9fs_req_ops, true);
++	if (S_ISREG(inode->i_mode) &&
++	    (v9fs_inode2v9ses(inode)->cache & CACHE_LOOSE))
++		mapping_set_large_folios(inode->i_mapping);
+ }
+ 
+ int v9fs_init_inode(struct v9fs_session_info *v9ses,
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 00fd89cf6..8669c9a7a 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3319,6 +3319,13 @@ static int lock_folio_maybe_drop_mmap(struct vm_fault *vmf, struct folio *folio,
+ 	return 1;
+ }
+ 
++/*
++ * The order of the folios that a page fault reads into the page cache of
++ * a file that supports large folios: 64 KiB, as exec_folio_order() of
++ * arm64, for code and for data (mmap read-around).
++ */
++#define MMAP_FOLIO_ORDER ilog2(SZ_64K >> PAGE_SHIFT)
++
+ /*
+  * Synchronous readahead happens when we don't even find a page in the page
+  * cache at all.  We don't want to perform IO under the mmap sem, so if we have
+@@ -3421,7 +3428,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
+ 		const unsigned long end = vma_end_pgoff(vma);
+ 		unsigned long ra_end;
+ 
+-		ra->order = exec_folio_order();
++		ra->order = max(exec_folio_order(), MMAP_FOLIO_ORDER);
+ 		ra->start = round_down(vmf->pgoff, 1UL << ra->order);
+ 		ra->start = max(ra->start, start);
+ 		ra_end = round_up(ra->start + ra->ra_pages, 1UL << ra->order);
+@@ -3433,9 +3440,11 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
+ 		 * mmap read-around
+ 		 */
+ 		ra->start = max_t(long, 0, vmf->pgoff - ra->ra_pages / 2);
++		/* An aligned start, else the window begins with small folios. */
++		ra->start = round_down(ra->start, 1UL << MMAP_FOLIO_ORDER);
+ 		ra->size = ra->ra_pages;
+ 		ra->async_size = ra->ra_pages / 4;
+-		ra->order = 0;
++		ra->order = MMAP_FOLIO_ORDER;
+ 	}
+ 
+ 	fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+diff --git a/mm/readahead.c b/mm/readahead.c
+index 6e5563290..5e4bbda29 100644
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@ -533,6 +533,28 @@ void page_cache_ra_order(struct readahead_control *ractl,
+ 		while (order > min_order && index + (1UL << order) - 1 > limit)
+ 			order--;
+ 		err = ra_alloc_folio(ractl, index, mark, order, gfp);
++		if (err == -EEXIST) {
++			/*
++			 * A folio is there already (the start of an ELF file
++			 * that was read with read(), or an earlier window).
++			 * Skip it and go on with large folios: falling back
++			 * to the order-0 readahead below would read the rest
++			 * of the window in single pages.
++			 */
++			struct folio *folio;
++			pgoff_t next = index + 1;
++
++			read_pages(ractl);
++			rcu_read_lock();
++			folio = xa_load(&mapping->i_pages, index);
++			if (folio && !xa_is_value(folio))
++				next = max(next, folio_next_index(folio));
++			rcu_read_unlock();
++			index = next;
++			ractl->_index = index;
++			err = 0;
++			continue;
++		}
+ 		if (err)
+ 			break;
+ 		index += 1UL << order;
