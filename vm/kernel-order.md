@@ -184,10 +184,12 @@ clusters are sorted by heat per byte, hottest first. The heat of a function
 is the share of the sampled kernel instructions (one sample per 997
 instructions, at the start address of the block) that fell into it.
 
-The current file was made on 2026-11-14 from Linux 7.3.4 with the patches
-and the configuration of this directory, built with clang 18 (the release
-build uses the clang of Ubuntu 26.04: 1917 of its 1961 names exist there,
-and nginx had 90 % of its kernel instructions on 48 pages).
+The current file was made on 2026-11-20 from Linux 7.3.4 with the patches
+and the configuration of this directory (large folios for 9p, see
+`kernel-patches/9p-large-folios.patch`), built with clang 18. nginx had
+90 % of its kernel instructions on 57 pages (packed: 43). The large
+folios run more distinct kernel code than the 4 KiB pages did (packed 34
+before), so the page counts of the table above are not comparable.
 
 ## What did not go in
 

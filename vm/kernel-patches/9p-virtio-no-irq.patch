@@ -1,0 +1,108 @@
+9p: collect the answer of virtio right after the notify
+
+v86 answers a 9p request while the guest writes the notify register, so
+the answer is there when virtqueue_kick() returns. Still every request
+raised an interrupt (~660 in an nginx start), and the guest went through
+the interrupt entry, the irq handler of virtio-pci and vring_interrupt()
+to complete it (~1.3 % of all instructions).
+
+p9_virtio_request() and p9_virtio_zc_request() now kick with the
+callback of the queue disabled, complete what the device answered and
+enable the callback again; virtqueue_enable_cb() says if more answers came
+in between, and those are collected too. A device that answers later
+(v86 without a synchronous read of the layer) interrupts as before.
+
+v86 must honour VIRTIO_F_RING_EVENT_IDX for this: upstream v86 raised the
+interrupt for every answer. jkroepke/v86 does it since 2026-11-20.
+nginx start: 660 -> 43 interrupts of virtio, 38.1M -> 37.8M instructions.
+
+diff --git a/net/9p/trans_virtio.c b/net/9p/trans_virtio.c
+index b0d0094ec..2d24f9d0b 100644
+--- a/net/9p/trans_virtio.c
++++ b/net/9p/trans_virtio.c
+@@ -125,17 +125,13 @@ static void p9_virtio_close(struct p9_client *client)
+  *
+  */
+ 
+-static void req_done(struct virtqueue *vq)
++/* Completes the answered requests; called with chan->lock held. */
++static bool p9_virtio_reap(struct virtio_chan *chan)
+ {
+-	struct virtio_chan *chan = vq->vdev->priv;
+ 	unsigned int len;
+ 	struct p9_req_t *req;
+ 	bool need_wakeup = false;
+-	unsigned long flags;
+-
+-	p9_debug(P9_DEBUG_TRANS, ": request done\n");
+ 
+-	spin_lock_irqsave(&chan->lock, flags);
+ 	while ((req = virtqueue_get_buf(chan->vq, &len)) != NULL) {
+ 		if (!chan->ring_bufs_avail) {
+ 			chan->ring_bufs_avail = 1;
+@@ -147,12 +143,45 @@ static void req_done(struct virtqueue *vq)
+ 			p9_client_cb(chan->client, req, REQ_STATUS_RCVD);
+ 		}
+ 	}
++	return need_wakeup;
++}
++
++static void req_done(struct virtqueue *vq)
++{
++	struct virtio_chan *chan = vq->vdev->priv;
++	bool need_wakeup;
++	unsigned long flags;
++
++	p9_debug(P9_DEBUG_TRANS, ": request done\n");
++
++	spin_lock_irqsave(&chan->lock, flags);
++	need_wakeup = p9_virtio_reap(chan);
+ 	spin_unlock_irqrestore(&chan->lock, flags);
+ 	/* Wakeup if anyone waiting for VirtIO ring space. */
+ 	if (need_wakeup)
+ 		wake_up(chan->vc_wq);
+ }
+ 
++/*
++ * Kick the device and complete what it answered at once, without an
++ * interrupt. A device that answers in the notify itself (v86) then raises
++ * no interrupt for the request; one that answers later gets the callback
++ * enabled again and interrupts as before.
++ */
++static void p9_virtio_kick(struct virtio_chan *chan, unsigned long flags)
++{
++	bool need_wakeup = false;
++
++	virtqueue_disable_cb(chan->vq);
++	virtqueue_kick(chan->vq);
++	do {
++		need_wakeup |= p9_virtio_reap(chan);
++	} while (!virtqueue_enable_cb(chan->vq));
++	spin_unlock_irqrestore(&chan->lock, flags);
++	if (need_wakeup)
++		wake_up(chan->vc_wq);
++}
++
+ /**
+  * pack_sg_list - pack a scatter gather list from a linear buffer
+  * @sg: scatter/gather list to pack into
+@@ -298,8 +327,7 @@ p9_virtio_request(struct p9_client *client, struct p9_req_t *req)
+ 			return -EIO;
+ 		}
+ 	}
+-	virtqueue_kick(chan->vq);
+-	spin_unlock_irqrestore(&chan->lock, flags);
++	p9_virtio_kick(chan, flags);
+ 
+ 	p9_debug(P9_DEBUG_TRANS, "virtio request kicked\n");
+ 	return 0;
+@@ -526,8 +554,7 @@ p9_virtio_zc_request(struct p9_client *client, struct p9_req_t *req,
+ 			goto err_out;
+ 		}
+ 	}
+-	virtqueue_kick(chan->vq);
+-	spin_unlock_irqrestore(&chan->lock, flags);
++	p9_virtio_kick(chan, flags);
+ 	kicked = 1;
+ 	p9_debug(P9_DEBUG_TRANS, "virtio request kicked\n");
+ 	err = io_wait_event_killable(req->wq,
