@@ -4,14 +4,14 @@ go 1.27.4
 
 require (
 	github.com/pion/ice/v4 v4.4.9
-	github.com/pion/webrtc/v4 v4.2.26
+	github.com/pion/webrtc/v4 v4.2.27
 	github.com/vishvananda/netlink v1.3.1
 )
 
 require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/datachannel v1.6.4 // indirect
-	github.com/pion/dtls/v3 v3.1.15 // indirect
+	github.com/pion/dtls/v3 v3.1.16 // indirect
 	github.com/pion/interceptor v0.1.51 // indirect
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/mdns/v2 v2.2.2 // indirect
@@ -27,7 +27,7 @@ require (
 	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.59.0 // indirect
-	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/net v0.63.0 // indirect
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 )

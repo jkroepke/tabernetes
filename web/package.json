@@ -7,7 +7,7 @@
     "test": "node --test"
   },
   "devDependencies": {
-    "@mlc-ai/web-llm": "0.2.88",
+    "@mlc-ai/web-llm": "0.2.89",
     "@novnc/novnc": "1.7.0",
     "@xterm/addon-fit": "0.11.0",
     "@xterm/addon-web-links": "0.12.0",
