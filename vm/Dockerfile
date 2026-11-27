@@ -16,7 +16,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
   && apt-get install -y --no-install-recommends bc bison clang flex libelf-dev libssl-dev lld llvm lz4 make patch perl python3 \
   && rm -rf /var/lib/apt/lists/*
-ADD --checksum=7595a62d45ee1a2297eafa5f2ef5d0a45142d84d https://github.com/gregkh/linux.git#v7.3.4 /src
+ADD --checksum=988117cc1bb17338c586a4e21ade88b5397eac33 https://github.com/gregkh/linux.git#v7.3.5 /src
 WORKDIR /src
 COPY kernel.config /kernel.config
 # Small changes to the kernel for pods; the head of each file says why.
