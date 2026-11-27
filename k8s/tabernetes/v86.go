@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"syscall/js"
 	"time"
 
@@ -31,6 +32,8 @@ type v86Pod struct {
 	funcs []js.Func
 	ids   map[int]string // image IDs by container index
 	next  int            // the index of the next container (kubectl debug)
+
+	stopped bool
 }
 
 // hasVM tells whether the tab can run container images (web/src/vm.js).
@@ -145,6 +148,9 @@ func (tp *tabPod) vmContainer(c *tabCtr, env []string) map[string]any {
 // startVM starts the VM of the pod with all of its init containers and
 // containers; the first ones start at once.
 func (tp *tabPod) startVM(gen int) *v86Pod {
+	tp.mu.Lock()
+	tp.vmGen = gen
+	tp.mu.Unlock()
 	v := &v86Pod{tp: tp, gen: gen, ids: map[int]string{}}
 	host := tp.n.host.Get("vm")
 	cfg, pending := tp.localConfig()
@@ -252,8 +258,10 @@ func (v *v86Pod) callbacks() map[string]any {
 		"started": fn(func(a []js.Value) {
 			post(podEvent{kind: "started", i: a[0].Int()})
 			// the informers of the cluster network and the policies start
-			// now, after the first pod of a tab, not before it
-			go clusterNet(context.Background())
+			// a moment after the first pod of a session, so that they do not
+			// slow down its status (a DNS query or a connection of a pod
+			// starts them at once)
+			time.AfterFunc(2*time.Second, func() { clusterNet(context.Background()) })
 		}),
 		// the console: the first container, and the kernel
 		"console": fn(func(a []js.Value) { tp.writeLog(tp.main(), a[0].String()) }),
@@ -311,9 +319,25 @@ func (v *v86Pod) kill(c *tabCtr, sig int) {
 }
 
 func (v *v86Pod) stop() {
+	if v.stopped {
+		return
+	}
+	v.stopped = true
 	removeVM(v)
+	// the worker writes the persistent volumes back first (vm.js), then the
+	// volumes are free for the next sandbox or pod
+	release := sync.OnceFunc(func() { v.tp.releaseVolumes(v.gen) })
+	time.AfterFunc(10*time.Second, release) // a worker that is gone with its tab
 	if v.h.Type() == js.TypeObject {
-		v.h.Call("stop")
+		var done js.Func
+		done = js.FuncOf(func(js.Value, []js.Value) any { release(); done.Release(); return nil })
+		if p := v.h.Call("stop"); p.Type() == js.TypeObject {
+			p.Call("then", done, done)
+		} else {
+			release()
+		}
+	} else {
+		release()
 	}
 	funcs := v.funcs
 	v.funcs = nil

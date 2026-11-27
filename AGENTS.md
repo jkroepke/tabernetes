@@ -112,7 +112,29 @@ that name.
   (`add` in `vmworker.js`; v86 keeps the names `Search`, `CreateDirectory`,
   `LoadRecursive` and `CreateBinaryFile` in its Closure build). Not there:
   `--target` process namespaces (all containers share one PID namespace
-  anyway), `subPathExpr`, volume updates, PVCs, hostPath.
+  anyway), `subPathExpr`, volume updates, hostPath.
+- **PersistentVolumes in OPFS** (`provision.go`, `web/src/volumes.js`,
+  2026-11-27): the StorageClass `standard` (addons/storage.yaml, default,
+  `WaitForFirstConsumer`) belongs to a provisioner in the control plane,
+  like an external provisioner: it creates a `local` PV with the node
+  affinity `kubernetes.io/os=browser` (tab nodes come and go, OPFS is the
+  same for all of them), and deletes a released one with its data. The
+  pod worker loads the files into its tree at the start (as memory files)
+  and writes back the changes every 3 s and on `flush` (vm.js `stop`
+  waits for it, at most 5 s). 9p is `cache=loose`, so the page cache of
+  the guest holds new data for ~30 s: init answers `sync` with `synced`
+  after sync(2). That changed init, so the saved state and `jit.bin` of
+  a build change too. Files are blobs that are new for every write, and
+  the index has two slots (`index-0.json`, `index-1.json`), so a write
+  that breaks off keeps the last one. Go allows one pod per volume at a
+  time (`volumeUsers`) and keeps it until the worker wrote back, so a
+  StatefulSet pod that comes back reads the newest data. The provisioner
+  starts 8 s after the controllers, and the cluster network informers
+  2 s after the first pod started: earlier, they made `kubectl run` ->
+  Ready of the first pod ~20 ms slower (10 rounds, noise-level but
+  consistent). With the delays, 8 alternating rounds (headless Chromium,
+  nginx:alpine 3 s after the prompt, against v1.25.1): median 772 -> 755
+  ms.
 - **Real images in a tab run in v86** (32-bit x86 JIT to Wasm, Joe's fork
   [jkroepke/v86](https://github.com/jkroepke/v86), see below),
   one worker per pod, `linux/386` image variants. Chosen over TinyEMU (no JIT,
@@ -571,9 +593,10 @@ that name.
   adapter of v86 without Go, so Go sends each VM `egress(true|false)` when a
   policy, a pod or a namespace changes; only an ipBlock of `0.0.0.0/0`
   matches "outside", because the address is unknown. The informers
-  (policies, pods, namespaces) start with the others of `clusterNet`, after
-  the first pod of the session started, so the first pod does not wait
-  for them; until they synced the pods may reach out. First pod unchanged
+  (policies, pods, namespaces) start with the others of `clusterNet`, 2 s
+  after the first pod of the session started (or at the first connection
+  or DNS query of a pod), so the first pod does not wait for them; until
+  they synced the pods may reach out. First pod unchanged
   (headless Chromium, nginx:alpine `kubectl run` -> Ready 3 s after the
   prompt, 5 alternating rounds, medians 784 -> 788 ms).
 - **From `kubectl run` to the start message** (2026-11-14): measured with

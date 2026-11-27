@@ -1,0 +1,13 @@
+# The default StorageClass. Its volumes are in the storage of the browser
+# (OPFS), for the pods of the tab nodes (k8s/tabernetes/provision.go). Like
+# the local-path provisioner of kind, a volume is made when the first pod of
+# its claim has a node.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: tabernetes.dev/opfs
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer

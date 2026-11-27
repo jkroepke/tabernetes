@@ -197,7 +197,7 @@ export class LayerStorage {
 LayerStorage.WHOLE = 4 << 20;
 LayerStorage.CACHE = 64 << 20;
 
-export const modes = { S_IFDIR, S_IFREG, S_IFLNK };
+export const modes = { S_IFMT, S_IFDIR, S_IFREG, S_IFLNK };
 
 // statRoot makes statfs of the root file system (df) tell the truth. v86
 // says that every 9p file system has 256 GiB and that the files of the

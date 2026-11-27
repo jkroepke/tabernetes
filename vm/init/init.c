@@ -1395,11 +1395,16 @@ static void ctr_start(int i) {
 }
 
 // command runs a line of the page on ttyS1: "start <i>", "kill <i>
-// <signal>", "add <path>" (kubectl debug: a container in a file).
+// <signal>", "add <path>" (kubectl debug: a container in a file), "sync"
+// (the page writes the persistent volumes back and needs the data that the
+// page cache of 9p still holds: cache=loose writes back after ~30 s).
 static void command(char *line) {
   int i, sig;
   char path[512];
-  if (sscanf(line, "start %d", &i) == 1) {
+  if (!strcmp(line, "sync")) {
+    sync();
+    report("synced");
+  } else if (sscanf(line, "start %d", &i) == 1) {
     ctr_start(i);
   } else if (sscanf(line, "kill %d %d", &i, &sig) == 2) {
     if (i >= 0 && i < nctrs && ctrs[i]->started && !ctrs[i]->exited && !ctrs[i]->proc.done) kill(-ctrs[i]->proc.pid, sig);

@@ -327,9 +327,9 @@ func dnsAllowed(ctx context.Context, src string) bool {
 
 // The pods reach names outside the cluster through the network adapter of
 // v86 (fetch), without Go. So Go tells each VM whether its pod may. The
-// informers start when the first pod of the session started (v86.go), not
-// before, so that the first pod does not wait for them; until they synced
-// (~0.1-0.3 s), the pods may.
+// informers start 2 s after the first pod of the session started (v86.go),
+// or at the first connection or DNS query of a pod, so that the first pod
+// does not wait for them; until they synced, the pods may.
 var (
 	vmsMu      sync.Mutex
 	vms        = map[*v86Pod]int{} // the last state sent: 0 none, 1 allowed, 2 denied

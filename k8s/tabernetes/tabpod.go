@@ -121,6 +121,7 @@ type tabPod struct {
 	reason  string // of the pod, when the tab cannot run it at all
 	message string
 	started metav1.Time
+	vmGen   int        // the run of the sandbox that starts now (claimVolume)
 	push    sync.Mutex // one status update at a time
 
 	// events of the VM and the probes for the loop of the pod (runVM)

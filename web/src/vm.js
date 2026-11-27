@@ -153,6 +153,9 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
       spare = null;
       const conns = new Map();
       let next = 1;
+      // persistent volumes: the worker writes them back before it ends
+      const hasPV = (c) => Object.values(c?.volumes || {}).some((v) => v.pv);
+      let pv = hasPV(opts.config), flushed = null;
       worker.onmessage = ({ data: m }) => {
         switch (m.type) {
           // i: the container, by its index in opts.containers (or in add)
@@ -174,6 +177,7 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
             else { conns.delete(m.id); c.onClose(); }
             break;
           }
+          case "flushed": flushed?.(); break;
           case "dial": on.dial?.(m.id, m.ip, m.port); break;
           case "dns": on.dns?.(m.query, (answer) => send({ type: "dns", id: m.id, answer })); break;
         }
@@ -229,15 +233,26 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
         // (a NetworkPolicy, k8s/tabernetes/netpol.go).
         egress(allowed) { send({ type: "egress", allowed }); },
         // config gives the env and the volumes, when the start had none
-        config(c) { send({ type: "config", config: c }); },
+        config(c) { pv ||= hasPV(c); send({ type: "config", config: c }); },
         // command sends a line to init: start <i>, kill <i> <signal>
         command(line) { send({ type: "command", line }); },
         // add starts a container in the running pod (kubectl debug)
         add(c) { send({ type: "add", container: c }); },
+        // stop ends the VM. It returns a promise: done once the persistent
+        // volumes are written back (at most 5 s).
         stop() {
-          worker.terminate();
-          for (const c of conns.values()) c.onClose();
-          conns.clear();
+          const end = () => {
+            worker.terminate();
+            for (const c of conns.values()) c.onClose();
+            conns.clear();
+          };
+          if (!pv) { end(); return Promise.resolve(); }
+          return new Promise((resolve) => {
+            const done = () => { flushed = null; clearTimeout(t); end(); resolve(); };
+            const t = setTimeout(done, 5000);
+            flushed = done;
+            send({ type: "flush" });
+          });
         },
       };
     },

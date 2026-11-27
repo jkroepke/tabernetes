@@ -204,8 +204,24 @@ browser tab (single wasm binary)                     docker run tabernetes
   `kubectl debug`), each image is a root of its own under
   `/.tabernetes/c/<n>`, and init starts the processes there with `chroot`.
   The volumes (ConfigMap, Secret, downward API, projected with the token of
-  the service account, emptyDir) are files in `/.tabernetes/v/<name>`, laid
-  out like the kubelet writes them, and init binds them into the containers.
+  the service account, emptyDir, PersistentVolumeClaim) are files in
+  `/.tabernetes/v/<name>`, laid out like the kubelet writes them, and init
+  binds them into the containers.
+  A PersistentVolumeClaim of the default StorageClass `standard` gets a
+  volume in the storage of the browser (OPFS, `k8s/tabernetes/provision.go`,
+  `web/src/volumes.js`). Like the local-path provisioner of kind, the
+  volume is made when the first pod of the claim has a node
+  (`WaitForFirstConsumer`), as a PersistentVolume of the type `local` with
+  the node affinity `kubernetes.io/os=browser`, and the PV controller binds
+  it. All tabs of the browser share the storage, so the data survives a
+  pod that is deleted, a closed tab and a reload: a StatefulSet finds its
+  files again on a new tab node. The worker of the pod loads the files at
+  the start, and every 3 seconds and when the pod stops, init writes the
+  page cache back (`sync`) and the worker saves what changed. So a tab that
+  closes loses up to the last 3 seconds of writes. One pod at a time uses a
+  volume (a second one waits with `Multi-Attach error`), the size is not
+  enforced, and the nodes from `join` cannot use these volumes. Deleting
+  the claim deletes the volume and its data (reclaim policy `Delete`).
   The first serial port is the log of the first container; the second one
   tells the kubelet `started <n>`, `exit <n> <code>`, the log lines of the
   other containers, or why a container did not start (`StartError`, exit
@@ -505,8 +521,9 @@ still works, too. Real isolation from the host needs rootless Docker or Podman.
   reload.
 - The kubelet of a tab is not the real one. It runs at most 8 pods per tab.
   Of the resources only the limits count: the memory and ephemeral storage
-  of the VM. Its volumes are ConfigMap, Secret, downwardAPI, projected and
-  emptyDir; their files are read once when the pod starts, so a change of a
+  of the VM. Its volumes are ConfigMap, Secret, downwardAPI, projected,
+  emptyDir and PersistentVolumeClaim (of the StorageClass `standard`); the
+  files of the first ones are read once when the pod starts, so a change of a
   ConfigMap does not reach a running pod. A pod that asks for another volume
   gets an `Unsupported` warning event and starts without it. `kubectl logs
   --previous` keeps the last run of each container.

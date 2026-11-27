@@ -21,6 +21,7 @@ import { initramfs } from "./initramfs.js";
 import { bootKernel } from "./kernelboot.js";
 import { buildID, loadState, saveState, dropState, parseState } from "./vmstate.js";
 import { importJIT } from "./jit.js";
+import { openVolume, saveVolume } from "./volumes.js";
 
 const post = (m, transfer) => self.postMessage(m, transfer || []);
 const CACHE = "tabernetes-configs"; // the configs of the images, small JSON blobs
@@ -636,10 +637,27 @@ function containerTree(m, img, mem) {
 // like the atomic writer of the kubelet does: the data in a directory with
 // a time stamp, ..data links to it, and each entry is a link through
 // ..data. An emptyDir is an empty directory, or a tmpfs (medium Memory).
-function volumeTree(tree, mem, volumes, conf) {
+function volumeTree(tree, mem, volumes, conf, pvs) {
   const stamp = new Date().toISOString().replace(/[-:]/g, "_").replace("T", "_").replace("Z", "");
   for (const [name, v] of Object.entries(volumes || {})) {
     const dir = `${VOL_DIR}/${name}`;
+    const pv = pvs.get(name);
+    if (pv) {
+      // a persistent volume: the files of its last run (volumes.js)
+      const root = pv.files.get("") || { mode: 0o777, uid: 0, gid: 0, mtime: now() };
+      tree.set(dir, { uid: root.uid, gid: root.gid, mtime: root.mtime, mode: modes.S_IFDIR | root.mode });
+      for (const [path, f] of pv.files) {
+        if (!path) continue;
+        const p = `${dir}/${path}`;
+        if (f.type === "dir") tree.set(p, { uid: f.uid, gid: f.gid, mtime: f.mtime, mode: modes.S_IFDIR | f.mode });
+        else if (f.type === "link") tree.set(p, { uid: f.uid, gid: f.gid, mtime: f.mtime, mode: modes.S_IFLNK | 0o777, target: f.target });
+        else if (f.type === "file") {
+          memFile(tree, mem, p, f.data, f.mode, f.uid, f.gid);
+          tree.files.get(p).mtime = f.mtime;
+        }
+      }
+      continue;
+    }
     tree.set(dir, { uid: 0, gid: 0, mtime: now(), mode: modes.S_IFDIR | (v.files ? 0o1777 : 0o777) });
     if (v.medium === "Memory") conf.tmpfs.push({ path: "/" + dir, options: v.sizeLimit ? `size=${v.sizeLimit}` : "" });
     if (!v.files) continue;
@@ -753,14 +771,23 @@ async function start(m) {
     for (const d of ["dev", "proc", "sys", "tmp"]) tree.set(d, { uid: 0, gid: 0, mtime: now(), mode: modes.S_IFDIR | (d === "tmp" ? 0o1777 : 0o755) });
   }
   imgs.forEach((img) => (img.layers = null));
-  volumeTree(tree, mem, cfg.volumes, conf);
+  // the persistent volumes, from the storage of the browser
+  const pvs = new Map();
+  try {
+    for (const [name, v] of Object.entries(cfg.volumes || {})) if (v.pv) pvs.set(name, await openVolume(v.pv));
+  } catch (e) {
+    vm.then((v) => v.emulator.destroy(), () => {});
+    post({ type: "error", message: `MountVolume.SetUp failed: the storage of the browser: ${e?.message || e}` });
+    return;
+  }
+  volumeTree(tree, mem, cfg.volumes, conf, pvs);
   memFile(tree, mem, ".tabernetes/config.json", enc.encode(JSON.stringify(conf)));
   const layers = new Map(await opened);
   const fsJSON = tree.v86();
 
   ({ emulator } = await vm);
   clusterNetwork(emulator.network_adapter, m);
-  pod = { m, mem, nested, layers, storage: null };
+  pod = { m, mem, nested, layers, storage: null, pvs };
 
   // The console is stdout and stderr of the container. Batch the bytes.
   // A character of several bytes may be split between two batches.
@@ -786,7 +813,8 @@ async function start(m) {
     const sp = l.indexOf(" "), word = sp < 0 ? l : l.slice(0, sp), rest = sp < 0 ? "" : l.slice(sp + 1);
     const sp2 = rest.indexOf(" "), i = Number(sp2 < 0 ? rest : rest.slice(0, sp2)), arg = sp2 < 0 ? "" : rest.slice(sp2 + 1);
     switch (word) {
-      case "started": post({ type: "started", i, memory }); break;
+      case "started": post({ type: "started", i, memory }); writeBackSoon(); break;
+      case "synced": for (const r of syncWaits.splice(0)) r(); break;
       case "error": errors.set(i, arg); break;
       case "exit":
         if (containers[i]?.console || !nested) flush();
@@ -816,6 +844,66 @@ async function start(m) {
   running = true;
   for (const l of queued.splice(0)) command(l);
   post({ type: "booted", ms: Date.now() - t0 });
+}
+
+// The persistent volumes go back to the storage of the browser every few
+// seconds while the pod runs, and when it stops (flush). init first writes
+// the page cache of the guest back (sync), else the newest data would still
+// be in the VM (9p with cache=loose).
+const WRITE_BACK_MS = 3000;
+const syncWaits = [];
+let writeBackTimer = 0, writing = null;
+function writeBackSoon() {
+  if (!pod?.pvs.size || writeBackTimer) return;
+  writeBackTimer = setTimeout(async () => {
+    await writeBack().catch((e) => console.warn("tabernetes: writing back the volumes:", e));
+    writeBackTimer = 0;
+    writeBackSoon();
+  }, WRITE_BACK_MS);
+}
+
+function writeBack() {
+  if (!writing) writing = writeBackNow().finally(() => (writing = null));
+  return writing;
+}
+
+async function writeBackNow() {
+  if (!pod?.pvs.size || !emulator) return;
+  const synced = new Promise((r) => syncWaits.push(r));
+  command("sync");
+  await Promise.race([synced, new Promise((r) => setTimeout(r, 5000))]);
+  const fs = emulator.fs9p;
+  const t = now();
+  for (const [name, vol] of pod.pvs) {
+    let id = 0;
+    for (const part of `${VOL_DIR}/${name}`.split("/")) {
+      id = fs.Search(id, part);
+      if (id < 0) break;
+    }
+    if (id < 0) continue;
+    const entries = new Map();
+    const walk = (dir, prefix) => {
+      const ino = fs.inodes[dir];
+      const kind = ino.mode & modes.S_IFMT;
+      const e = { mode: ino.mode & 0o7777, uid: ino.uid, gid: ino.gid, mtime: ino.mtime };
+      if (kind === modes.S_IFDIR) {
+        entries.set(prefix, { ...e, type: "dir" });
+        for (const [n, child] of ino.direntries) {
+          if (n !== "." && n !== "..") walk(child, prefix ? `${prefix}/${n}` : n);
+        }
+      } else if (kind === modes.S_IFLNK) {
+        entries.set(prefix, { ...e, type: "link", target: ino.symlink });
+      } else if (kind === modes.S_IFREG) {
+        const size = ino.size;
+        // a file written in the last seconds may change again within the
+        // same second (mtime has seconds): it is read again
+        entries.set(prefix, { ...e, type: "file", size, sig: `${ino.mtime}:${ino.ctime}:${size}`, dirty: ino.mtime >= t - 1 - WRITE_BACK_MS / 1000,
+          read: async () => (size ? (await fs.Read(dir, 0, size)).slice() : new Uint8Array(0)) });
+      }
+    };
+    walk(id, "");
+    await saveVolume(vol, entries);
+  }
 }
 
 // add pulls the image of a container that comes after the start (kubectl
@@ -968,6 +1056,8 @@ self.onmessage = ({ data: m }) => {
     case "accept": conns.get(m.id)?.accept(); break;
     case "refuse": conns.get(m.id)?.reset(); conns.delete(m.id); break;
     case "drop": { const c = conns.get(m.id); conns.delete(m.id); if (c) forget(c); break; }
+    // the pod stops: the persistent volumes go back first
+    case "flush": writeBack().catch((e) => console.warn("tabernetes: writing back the volumes:", e)).finally(() => post({ type: "flushed" })); break;
     case "egress": setEgress(m.allowed); break;
     case "write": conns.get(m.id)?.write(new Uint8Array(m.data)); break;
     // a FIN to the pod; it may still send
