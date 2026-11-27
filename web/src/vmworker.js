@@ -889,6 +889,17 @@ const ip4 = (s) => new Uint8Array(s.split(".").map(Number));
 // the DNS queries. The rest stays with the network adapter of v86 (HTTP
 // through fetch()).
 let outbound = 0; // ids of connections that the pod opens: negative
+// may the pod reach names outside the cluster (a NetworkPolicy)? Go tells
+// it once the policies are known; until then it may.
+let egress = true;
+let tcpConns = null; // the connections of the network adapter, by tuple
+// forget drops a claimed connection that got no answer, so that the next
+// SYN of the pod is new to the network adapter.
+function forget(c) {
+  if (tcpConns && tcpConns[c.tuple] === c) delete tcpConns[c.tuple];
+}
+function setEgress(allowed) { egress = !!allowed; egressSet = true; }
+let egressSet = false;
 const dnsWaits = new Map();
 let dnsNext = 0;
 function clusterNetwork(net, m) {
@@ -901,8 +912,17 @@ function clusterNetwork(net, m) {
   const inCluster = (a) => { const u = ip4u(a); return nets.some(([n, mask]) => ((u & mask) >>> 0) === n); };
   // other pods of the node share its /24: the gateway answers ARP for them
   net.arp_subnet = true;
+  tcpConns = net.tcp_conn;
+  // an egress message may have come before the network
+  if (!egressSet && m.egress != null) egress = !!m.egress;
   net.claim_tcp = (c) => {
-    if (!inCluster(c.psrc)) return false;
+    if (!inCluster(c.psrc)) {
+      // HTTP through fetch(), unless a NetworkPolicy denies it: then the SYN
+      // gets no answer, and a retransmission is checked again.
+      if (egress) return false;
+      queueMicrotask(() => forget(c));
+      return true;
+    }
     const id = --outbound;
     wire(id, c);
     // c.sport: the port the pod connects to
@@ -947,6 +967,8 @@ self.onmessage = ({ data: m }) => {
     case "connect": connect(m.id, m.port, m.src); break;
     case "accept": conns.get(m.id)?.accept(); break;
     case "refuse": conns.get(m.id)?.reset(); conns.delete(m.id); break;
+    case "drop": { const c = conns.get(m.id); conns.delete(m.id); if (c) forget(c); break; }
+    case "egress": setEgress(m.allowed); break;
     case "write": conns.get(m.id)?.write(new Uint8Array(m.data)); break;
     // a FIN to the pod; it may still send
     case "end": conns.get(m.id)?.close(); break;

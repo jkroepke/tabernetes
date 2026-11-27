@@ -233,9 +233,22 @@ browser tab (single wasm binary)                     docker run tabernetes
   named ports, ExternalName, `1-2-3-4.default.pod.cluster.local` and reverse
   lookups. `/etc/resolv.conf` and `/etc/hosts` are what the kubelet writes
   (`dnsPolicy`, `dnsConfig`, `hostname`, `subdomain`, `hostAliases`). Only
-  TCP and DNS: UDP between pods, NodePorts, NetworkPolicies and
-  `sessionAffinity` are not there. Other names resolve to an address that
-  goes out through `fetch()`, HTTP on port 80 only.
+  TCP and DNS: UDP between pods, NodePorts and `sessionAffinity` are not
+  there. Other names resolve to an address that goes out through `fetch()`,
+  HTTP on port 80 only.
+  NetworkPolicies work for the tab pods, as with a network plugin that
+  enforces them (`k8s/tabernetes/netpol.go`): Go checks the egress policies
+  of the client pod and the ingress policies of the server pod before it
+  opens a connection (pod selectors, namespace selectors, ipBlock, ports,
+  named ports and port ranges). A connection that no rule allows gets no
+  answer, so the client sees a timeout, as with Calico or Cilium. DNS is UDP
+  53 to the pods of `kube-system/kube-dns`, so a default-deny egress policy
+  needs a rule for it, as in any cluster. A name outside the cluster stands
+  for the internet, because the page does not know its address: only an
+  ipBlock of `0.0.0.0/0` (with or without `except`) allows it. Traffic from
+  the node (probes, `exec`, `port-forward`, `wget` in the terminal) is not
+  checked, and the pods of a node from `join` are not either (flannel has
+  no policies).
   The VM boots while the image is pulled. init starts in an initramfs and
   waits there for the pod; the first VM of each memory size saves its state
   at that point (`web/src/vmstate.js`, OPFS), and later pods restore it

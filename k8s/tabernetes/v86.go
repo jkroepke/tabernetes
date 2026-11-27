@@ -193,7 +193,13 @@ func (tp *tabPod) startVM(gen int) *v86Pod {
 	if !pending {
 		opts["config"] = tp.configJS(cfg)
 	}
+	// may the pod reach names outside the cluster (netpol.go)? Not known
+	// before the first pod started: then it may, until Go tells it.
+	if allowed, known := egressAllowed(tp.ip); known {
+		opts["egress"] = allowed
+	}
 	v.h = host.Call("start", js.ValueOf(opts), js.ValueOf(v.callbacks()))
+	addVM(v)
 	if pending {
 		go tp.resolveConfig(v)
 	}
@@ -243,7 +249,12 @@ func (v *v86Pod) callbacks() map[string]any {
 		"pulled": fn(func(a []js.Value) {
 			post(podEvent{kind: "pulled", i: a[0].Int(), imageID: a[1].Get("imageID").String(), size: int64(a[1].Get("size").Float())})
 		}),
-		"started": fn(func(a []js.Value) { post(podEvent{kind: "started", i: a[0].Int()}) }),
+		"started": fn(func(a []js.Value) {
+			post(podEvent{kind: "started", i: a[0].Int()})
+			// the informers of the cluster network and the policies start
+			// now, after the first pod of a tab, not before it
+			go clusterNet(context.Background())
+		}),
 		// the console: the first container, and the kernel
 		"console": fn(func(a []js.Value) { tp.writeLog(tp.main(), a[0].String()) }),
 		"log": fn(func(a []js.Value) {
@@ -300,6 +311,7 @@ func (v *v86Pod) kill(c *tabCtr, sig int) {
 }
 
 func (v *v86Pod) stop() {
+	removeVM(v)
 	if v.h.Type() == js.TypeObject {
 		v.h.Call("stop")
 	}
@@ -639,6 +651,12 @@ func (v *v86Pod) outbound(id int, ip string, port int) {
 	ctx, cancel := context.WithTimeout(v.tp.ctx, 10*time.Second)
 	defer cancel()
 	dst, err := dialFromPod(ctx, v.tp.ip, ip, port)
+	if errors.Is(err, errDropped) {
+		// no answer: the pod sends the SYN again, and that one is checked
+		// again
+		v.h.Call("drop", id)
+		return
+	}
 	if err != nil {
 		v.h.Call("refuse", id)
 		return
@@ -651,6 +669,12 @@ func (v *v86Pod) outbound(id int, ip string, port int) {
 
 // resolve answers a DNS query of the pod (clusternet.go).
 func (v *v86Pod) resolve(query []byte, reply js.Value) {
+	ctx, cancel := context.WithTimeout(v.tp.ctx, 5*time.Second)
+	defer cancel()
+	if !dnsAllowed(ctx, v.tp.ip) {
+		reply.Invoke(js.Null()) // dropped by a NetworkPolicy
+		return
+	}
 	answer := clusterDNS(v.tp.namespace, query)
 	if answer == nil {
 		reply.Invoke(js.Null())

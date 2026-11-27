@@ -48,6 +48,10 @@ const (
 type clusterCache struct {
 	svcs   cache.Indexer
 	slices cache.Indexer
+	// for NetworkPolicy (netpol.go)
+	netpols cache.Indexer
+	pods    cache.Indexer
+	nss     cache.Indexer
 }
 
 var (
@@ -60,6 +64,7 @@ var (
 const (
 	byClusterIP = "clusterIP"
 	byService   = "service"
+	byPodIP     = "podIP"
 )
 
 // clusterNet returns the cache of Services and EndpointSlices once it is
@@ -92,14 +97,35 @@ func clusterNet(ctx context.Context) (*clusterCache, error) {
 				}
 				return nil, nil
 			}})
+			npi := f.Networking().V1().NetworkPolicies().Informer()
+			npi.AddIndexers(cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+			pi := f.Core().V1().Pods().Informer()
+			pi.AddIndexers(cache.Indexers{byPodIP: func(o any) ([]string, error) {
+				p := o.(*corev1.Pod)
+				if p.Spec.HostNetwork || p.Status.PodIP == "" || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+					return nil, nil
+				}
+				return []string{p.Status.PodIP}, nil
+			}})
+			nsi := f.Core().V1().Namespaces().Informer()
+			// a change of a policy, or of the labels of a pod or a namespace,
+			// can change what the pods may reach outside the cluster
+			for _, i := range []cache.SharedIndexInformer{npi, pi, nsi} {
+				i.AddEventHandler(cache.ResourceEventHandlerFuncs{
+					AddFunc:    func(any) { egressSoon() },
+					UpdateFunc: func(any, any) { egressSoon() },
+					DeleteFunc: func(any) { egressSoon() },
+				})
+			}
 			f.Start(make(chan struct{}))
 			wait, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if !cache.WaitForCacheSync(wait.Done(), si.HasSynced, ei.HasSynced) {
-				clusterCacheErr = errors.New("the Services and EndpointSlices of the cluster did not sync")
+			if !cache.WaitForCacheSync(wait.Done(), si.HasSynced, ei.HasSynced, npi.HasSynced, pi.HasSynced, nsi.HasSynced) {
+				clusterCacheErr = errors.New("the Services, EndpointSlices, NetworkPolicies, Pods and Namespaces of the cluster did not sync")
 				return
 			}
-			clusterCacheV = &clusterCache{svcs: si.GetIndexer(), slices: ei.GetIndexer()}
+			clusterCacheV = &clusterCache{svcs: si.GetIndexer(), slices: ei.GetIndexer(), netpols: npi.GetIndexer(), pods: pi.GetIndexer(), nss: nsi.GetIndexer()}
+			egressSoon()
 		}()
 	})
 	select {
@@ -203,6 +229,10 @@ func dialFromPod(ctx context.Context, src, ip string, port int) (net.Conn, error
 			if conn, err = dialEndpoint(ctx, src, e, target); err == nil {
 				return conn, nil
 			}
+			if errors.Is(err, errDropped) {
+				// kube-proxy picked this endpoint, and the packet is gone
+				return nil, err
+			}
 		}
 		return nil, err
 	}
@@ -211,6 +241,9 @@ func dialFromPod(ctx context.Context, src, ip string, port int) (net.Conn, error
 
 // dialEndpoint connects src to port of the pod e.
 func dialEndpoint(ctx context.Context, src string, e endpoint, port int) (net.Conn, error) {
+	if err := checkPolicy(ctx, src, e.ip, port); err != nil {
+		return nil, err
+	}
 	if src == e.ip {
 		// a pod that reaches itself through its Service: Linux drops a
 		// packet from its own address, so it comes from the gateway, as

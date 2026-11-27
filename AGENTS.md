@@ -558,8 +558,24 @@ that name.
   programs do. Headless Chromium, nginx:alpine and busybox, 4 MiB through a
   Service: same tab and across two tabs 0.20 s (~20 MB/s), a small request
   ~11-15 ms including the start of wget. Not there: UDP between pods,
-  NodePorts, NetworkPolicies, `sessionAffinity`, pods on joined nodes
-  reaching tab pods.
+  NodePorts, `sessionAffinity`, pods on joined nodes reaching tab pods.
+- **NetworkPolicy** (`netpol.go`, 2026-11-27): Go sees every TCP connection
+  and DNS query of a tab pod, so it checks the policies there, at the dial
+  (after the Service picked an endpoint, like after the DNAT of kube-proxy).
+  A denied connection is dropped (`drop` in `vmworker.js` forgets the held
+  SYN, so the retransmission is checked again and a new policy works on the
+  next try), not reset: the client times out as with Calico or Cilium. DNS
+  is checked as UDP 53 to the pods of kube-dns, or, without them (CoreDNS
+  runs on joined nodes only), to a pod with the labels of the selector of
+  the Service. HTTP to names outside the cluster goes through the fetch
+  adapter of v86 without Go, so Go sends each VM `egress(true|false)` when a
+  policy, a pod or a namespace changes; only an ipBlock of `0.0.0.0/0`
+  matches "outside", because the address is unknown. The informers
+  (policies, pods, namespaces) start with the others of `clusterNet`, after
+  the first pod of the session started, so the first pod does not wait
+  for them; until they synced the pods may reach out. First pod unchanged
+  (headless Chromium, nginx:alpine `kubectl run` -> Ready 3 s after the
+  prompt, 5 alternating rounds, medians 784 -> 788 ms).
 - **From `kubectl run` to the start message** (2026-11-14): measured with
   marks in the Go code (apiserver requests, scheduler, etcd writes, tab
   node), read from the shared worker over CDP. 3 s after the prompt it was

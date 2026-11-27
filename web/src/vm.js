@@ -147,7 +147,7 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
     // console(text), exit(code, message: why the entrypoint did not start),
     // error(message, pull, never: not present with the pull policy Never),
     // dial(id, ip, port: the pod opens a connection into the cluster
-    // network; answer with accept or refuse), dns(query, reply(answer)).
+    // network; answer with accept, refuse or drop), dns(query, reply(answer)).
     start(opts, on) {
       const worker = spare || newWorker();
       spare = null;
@@ -222,6 +222,12 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
         },
         // refuse resets it, as a host where nothing listens.
         refuse(id) { send({ type: "refuse", id }); },
+        // drop forgets it without an answer, as a NetworkPolicy drops the
+        // packet; the pod may send the SYN again.
+        drop(id) { send({ type: "drop", id }); },
+        // egress tells whether the pod may reach names outside the cluster
+        // (a NetworkPolicy, k8s/tabernetes/netpol.go).
+        egress(allowed) { send({ type: "egress", allowed }); },
         // config gives the env and the volumes, when the start had none
         config(c) { send({ type: "config", config: c }); },
         // command sends a line to init: start <i>, kill <i> <signal>
