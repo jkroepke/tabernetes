@@ -36,7 +36,7 @@ func volDir(name string) string { return "/.tabernetes/v/" + name }
 // supportedVolume tells whether the tab node has the volume.
 func supportedVolume(v corev1.Volume) bool {
 	s := v.VolumeSource
-	return s.ConfigMap != nil || s.Secret != nil || s.DownwardAPI != nil || s.Projected != nil || s.EmptyDir != nil
+	return s.ConfigMap != nil || s.Secret != nil || s.DownwardAPI != nil || s.Projected != nil || s.EmptyDir != nil || s.PersistentVolumeClaim != nil
 }
 
 // unsupportedVolumes lists what the tab node does not have.
@@ -58,6 +58,7 @@ type podConfig struct {
 
 type vmVolume struct {
 	files     []vmFile // nil for an emptyDir
+	pv        string   // a PersistentVolume of the browser (provision.go)
 	medium    string
 	sizeLimit int64
 	fsGroup   *int64
@@ -96,6 +97,9 @@ func (tp *tabPod) configJS(cfg *podConfig) js.Value {
 	vols := map[string]any{}
 	for name, v := range cfg.volumes {
 		m := map[string]any{"medium": v.medium}
+		if v.pv != "" {
+			m["pv"] = v.pv
+		}
 		if v.sizeLimit > 0 {
 			m["sizeLimit"] = v.sizeLimit
 		}
@@ -138,7 +142,7 @@ func (tp *tabPod) needsAPI() bool {
 		}
 	}
 	for _, v := range tp.pod.Spec.Volumes {
-		if v.ConfigMap != nil || v.Secret != nil || v.Projected != nil {
+		if v.ConfigMap != nil || v.Secret != nil || v.Projected != nil || v.PersistentVolumeClaim != nil {
 			return true
 		}
 	}
@@ -177,6 +181,12 @@ func (tp *tabPod) apiConfig(ctx context.Context) (*podConfig, error) {
 		}
 		vol, err := tp.volume(ctx, v)
 		if err != nil {
+			// let go of the claims of this try: two pods that wait for the
+			// volume of each other would wait forever
+			tp.mu.Lock()
+			gen := tp.vmGen
+			tp.mu.Unlock()
+			tp.releaseVolumes(gen)
 			return nil, fmt.Errorf("MountVolume.SetUp failed for volume %q : %w", v.Name, err)
 		}
 		cfg.volumes[v.Name] = vol
@@ -404,7 +414,7 @@ func (tp *tabPod) vmMounts(c *tabCtr) []any {
 			src = path.Join(src, path.Clean("/"+sub))
 		}
 		// configMap, secret, downwardAPI and projected volumes are read-only
-		ro := m.ReadOnly || v.EmptyDir == nil
+		ro := m.ReadOnly || v.EmptyDir == nil && v.PersistentVolumeClaim == nil || v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ReadOnly
 		out = append(out, map[string]any{"src": src, "dst": m.MountPath, "ro": ro})
 	}
 	return out
@@ -418,6 +428,9 @@ func (tp *tabPod) volume(ctx context.Context, v corev1.Volume) (vmVolume, error)
 	}
 	s := v.VolumeSource
 	switch {
+	case s.PersistentVolumeClaim != nil:
+		pv, err := tp.claimVolume(ctx, s.PersistentVolumeClaim.ClaimName)
+		return vmVolume{pv: pv}, err
 	case s.EmptyDir != nil:
 		vol := vmVolume{medium: string(s.EmptyDir.Medium)}
 		if s.EmptyDir.SizeLimit != nil {

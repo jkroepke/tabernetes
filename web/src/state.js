@@ -16,6 +16,12 @@
 // all of it.
 
 import { forgetStates } from "./vmstate.js";
+import { forgetVolumes, removeVolume, volumeNames } from "./volumes.js";
+
+// for the provisioner of the persistent volumes (k8s/tabernetes/provision.go),
+// which runs where the control plane runs
+globalThis.tabernetesRemoveVolume = removeVolume;
+globalThis.tabernetesVolumeNames = volumeNames;
 
 const DB = "tabernetes";
 
@@ -250,5 +256,6 @@ export async function forget() {
     }
   } catch { /* no Cache Storage */ }
   await forgetStates().catch(() => {});
+  await forgetVolumes().catch(() => {});
   return forgetLayers().catch(() => 0);
 }

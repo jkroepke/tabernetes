@@ -204,8 +204,24 @@ browser tab (single wasm binary)                     docker run tabernetes
   `kubectl debug`), each image is a root of its own under
   `/.tabernetes/c/<n>`, and init starts the processes there with `chroot`.
   The volumes (ConfigMap, Secret, downward API, projected with the token of
-  the service account, emptyDir) are files in `/.tabernetes/v/<name>`, laid
-  out like the kubelet writes them, and init binds them into the containers.
+  the service account, emptyDir, PersistentVolumeClaim) are files in
+  `/.tabernetes/v/<name>`, laid out like the kubelet writes them, and init
+  binds them into the containers.
+  A PersistentVolumeClaim of the default StorageClass `standard` gets a
+  volume in the storage of the browser (OPFS, `k8s/tabernetes/provision.go`,
+  `web/src/volumes.js`). Like the local-path provisioner of kind, the
+  volume is made when the first pod of the claim has a node
+  (`WaitForFirstConsumer`), as a PersistentVolume of the type `local` with
+  the node affinity `kubernetes.io/os=browser`, and the PV controller binds
+  it. All tabs of the browser share the storage, so the data survives a
+  pod that is deleted, a closed tab and a reload: a StatefulSet finds its
+  files again on a new tab node. The worker of the pod loads the files at
+  the start, and every 3 seconds and when the pod stops, init writes the
+  page cache back (`sync`) and the worker saves what changed. So a tab that
+  closes loses up to the last 3 seconds of writes. One pod at a time uses a
+  volume (a second one waits with `Multi-Attach error`), the size is not
+  enforced, and the nodes from `join` cannot use these volumes. Deleting
+  the claim deletes the volume and its data (reclaim policy `Delete`).
   The first serial port is the log of the first container; the second one
   tells the kubelet `started <n>`, `exit <n> <code>`, the log lines of the
   other containers, or why a container did not start (`StartError`, exit
@@ -233,9 +249,22 @@ browser tab (single wasm binary)                     docker run tabernetes
   named ports, ExternalName, `1-2-3-4.default.pod.cluster.local` and reverse
   lookups. `/etc/resolv.conf` and `/etc/hosts` are what the kubelet writes
   (`dnsPolicy`, `dnsConfig`, `hostname`, `subdomain`, `hostAliases`). Only
-  TCP and DNS: UDP between pods, NodePorts, NetworkPolicies and
-  `sessionAffinity` are not there. Other names resolve to an address that
-  goes out through `fetch()`, HTTP on port 80 only.
+  TCP and DNS: UDP between pods, NodePorts and `sessionAffinity` are not
+  there. Other names resolve to an address that goes out through `fetch()`,
+  HTTP on port 80 only.
+  NetworkPolicies work for the tab pods, as with a network plugin that
+  enforces them (`k8s/tabernetes/netpol.go`): Go checks the egress policies
+  of the client pod and the ingress policies of the server pod before it
+  opens a connection (pod selectors, namespace selectors, ipBlock, ports,
+  named ports and port ranges). A connection that no rule allows gets no
+  answer, so the client sees a timeout, as with Calico or Cilium. DNS is UDP
+  53 to the pods of `kube-system/kube-dns`, so a default-deny egress policy
+  needs a rule for it, as in any cluster. A name outside the cluster stands
+  for the internet, because the page does not know its address: only an
+  ipBlock of `0.0.0.0/0` (with or without `except`) allows it. Traffic from
+  the node (probes, `exec`, `port-forward`, `wget` in the terminal) is not
+  checked, and the pods of a node from `join` are not either (flannel has
+  no policies).
   The VM boots while the image is pulled. init starts in an initramfs and
   waits there for the pod; the first VM of each memory size saves its state
   at that point (`web/src/vmstate.js`, OPFS), and later pods restore it
@@ -492,8 +521,9 @@ still works, too. Real isolation from the host needs rootless Docker or Podman.
   reload.
 - The kubelet of a tab is not the real one. It runs at most 8 pods per tab.
   Of the resources only the limits count: the memory and ephemeral storage
-  of the VM. Its volumes are ConfigMap, Secret, downwardAPI, projected and
-  emptyDir; their files are read once when the pod starts, so a change of a
+  of the VM. Its volumes are ConfigMap, Secret, downwardAPI, projected,
+  emptyDir and PersistentVolumeClaim (of the StorageClass `standard`); the
+  files of the first ones are read once when the pod starts, so a change of a
   ConfigMap does not reach a running pod. A pod that asks for another volume
   gets an `Unsupported` warning event and starts without it. `kubectl logs
   --previous` keeps the last run of each container.

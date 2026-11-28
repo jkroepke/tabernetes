@@ -282,6 +282,13 @@ func runControllers() {
 	if err := waitServing("https://127.0.0.1:10259/readyz", scheduler); err != nil {
 		fmt.Fprintln(os.Stderr, "tabernetes: kube-scheduler is not ready:", err)
 	}
+	// the provisioner of the StorageClass standard (provision.go), after the
+	// controllers have started and the first pods of a visitor
+	time.AfterFunc(8*time.Second, func() {
+		if err := runProvisioner(context.Background()); err != nil {
+			fmt.Fprintln(os.Stderr, "tabernetes: provisioner:", err)
+		}
+	})
 	run("kube-controller-manager", cmapp.NewControllerManagerCommand(), []string{
 		"--kubeconfig=" + p("controller-manager.kubeconfig"),
 		"--authentication-kubeconfig=" + p("controller-manager.kubeconfig"),

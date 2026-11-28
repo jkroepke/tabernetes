@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"syscall/js"
 	"time"
 
@@ -31,6 +32,8 @@ type v86Pod struct {
 	funcs []js.Func
 	ids   map[int]string // image IDs by container index
 	next  int            // the index of the next container (kubectl debug)
+
+	stopped bool
 }
 
 // hasVM tells whether the tab can run container images (web/src/vm.js).
@@ -145,6 +148,9 @@ func (tp *tabPod) vmContainer(c *tabCtr, env []string) map[string]any {
 // startVM starts the VM of the pod with all of its init containers and
 // containers; the first ones start at once.
 func (tp *tabPod) startVM(gen int) *v86Pod {
+	tp.mu.Lock()
+	tp.vmGen = gen
+	tp.mu.Unlock()
 	v := &v86Pod{tp: tp, gen: gen, ids: map[int]string{}}
 	host := tp.n.host.Get("vm")
 	cfg, pending := tp.localConfig()
@@ -193,7 +199,13 @@ func (tp *tabPod) startVM(gen int) *v86Pod {
 	if !pending {
 		opts["config"] = tp.configJS(cfg)
 	}
+	// may the pod reach names outside the cluster (netpol.go)? Not known
+	// before the first pod started: then it may, until Go tells it.
+	if allowed, known := egressAllowed(tp.ip); known {
+		opts["egress"] = allowed
+	}
 	v.h = host.Call("start", js.ValueOf(opts), js.ValueOf(v.callbacks()))
+	addVM(v)
 	if pending {
 		go tp.resolveConfig(v)
 	}
@@ -243,7 +255,14 @@ func (v *v86Pod) callbacks() map[string]any {
 		"pulled": fn(func(a []js.Value) {
 			post(podEvent{kind: "pulled", i: a[0].Int(), imageID: a[1].Get("imageID").String(), size: int64(a[1].Get("size").Float())})
 		}),
-		"started": fn(func(a []js.Value) { post(podEvent{kind: "started", i: a[0].Int()}) }),
+		"started": fn(func(a []js.Value) {
+			post(podEvent{kind: "started", i: a[0].Int()})
+			// the informers of the cluster network and the policies start
+			// a moment after the first pod of a session, so that they do not
+			// slow down its status (a DNS query or a connection of a pod
+			// starts them at once)
+			time.AfterFunc(2*time.Second, func() { clusterNet(context.Background()) })
+		}),
 		// the console: the first container, and the kernel
 		"console": fn(func(a []js.Value) { tp.writeLog(tp.main(), a[0].String()) }),
 		"log": fn(func(a []js.Value) {
@@ -300,8 +319,25 @@ func (v *v86Pod) kill(c *tabCtr, sig int) {
 }
 
 func (v *v86Pod) stop() {
+	if v.stopped {
+		return
+	}
+	v.stopped = true
+	removeVM(v)
+	// the worker writes the persistent volumes back first (vm.js), then the
+	// volumes are free for the next sandbox or pod
+	release := sync.OnceFunc(func() { v.tp.releaseVolumes(v.gen) })
+	time.AfterFunc(10*time.Second, release) // a worker that is gone with its tab
 	if v.h.Type() == js.TypeObject {
-		v.h.Call("stop")
+		var done js.Func
+		done = js.FuncOf(func(js.Value, []js.Value) any { release(); done.Release(); return nil })
+		if p := v.h.Call("stop"); p.Type() == js.TypeObject {
+			p.Call("then", done, done)
+		} else {
+			release()
+		}
+	} else {
+		release()
 	}
 	funcs := v.funcs
 	v.funcs = nil
@@ -639,6 +675,12 @@ func (v *v86Pod) outbound(id int, ip string, port int) {
 	ctx, cancel := context.WithTimeout(v.tp.ctx, 10*time.Second)
 	defer cancel()
 	dst, err := dialFromPod(ctx, v.tp.ip, ip, port)
+	if errors.Is(err, errDropped) {
+		// no answer: the pod sends the SYN again, and that one is checked
+		// again
+		v.h.Call("drop", id)
+		return
+	}
 	if err != nil {
 		v.h.Call("refuse", id)
 		return
@@ -651,6 +693,12 @@ func (v *v86Pod) outbound(id int, ip string, port int) {
 
 // resolve answers a DNS query of the pod (clusternet.go).
 func (v *v86Pod) resolve(query []byte, reply js.Value) {
+	ctx, cancel := context.WithTimeout(v.tp.ctx, 5*time.Second)
+	defer cancel()
+	if !dnsAllowed(ctx, v.tp.ip) {
+		reply.Invoke(js.Null()) // dropped by a NetworkPolicy
+		return
+	}
 	answer := clusterDNS(v.tp.namespace, query)
 	if answer == nil {
 		reply.Invoke(js.Null())
