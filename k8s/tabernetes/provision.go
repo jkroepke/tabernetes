@@ -83,6 +83,15 @@ func runProvisioner(ctx context.Context) error {
 	if _, err := pi.AddEventHandler(add("pv/")); err != nil {
 		return err
 	}
+	// a claim that came before its class waits for it
+	requeue := func(any) {
+		for _, k := range pr.claims.ListKeys() {
+			pr.queue.Add("pvc/" + k)
+		}
+	}
+	if _, err := sc.AddEventHandler(cache.ResourceEventHandlerFuncs{AddFunc: requeue, UpdateFunc: func(_, o any) { requeue(o) }}); err != nil {
+		return err
+	}
 	f.Start(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), sc.HasSynced, ci.HasSynced, pi.HasSynced) {
 		return ctx.Err()
@@ -312,9 +321,13 @@ func (tp *tabPod) claimVolume(ctx context.Context, name string) (string, error) 
 
 // sweep deletes the data of volumes that have no PV anymore: a cluster that
 // did not boot from its snapshot, or a delete that broke off.
+// Only the control plane in the SharedWorker sweeps: it is the one cluster
+// of the origin. Without it, every tab runs its own cluster on the same
+// storage, and the volumes of the other tabs have no PV here.
 func (pr *provisioner) sweep(ctx context.Context) {
 	f := js.Global().Get("tabernetesVolumeNames")
-	if f.Type() != js.TypeFunction {
+	sw := js.Global().Get("SharedWorkerGlobalScope")
+	if f.Type() != js.TypeFunction || sw.Type() != js.TypeFunction || !js.Global().InstanceOf(sw) {
 		return
 	}
 	names := make(chan []string, 1)

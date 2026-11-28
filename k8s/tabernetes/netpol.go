@@ -273,11 +273,9 @@ func checkPolicy(ctx context.Context, src, ip string, port int) error {
 	if err != nil {
 		return err
 	}
-	from := c.podByIP(src)
-	if from == nil {
-		return nil
-	}
-	if !npAllowed(c, npPeer{ip: src, pod: from}, npPeer{ip: ip, pod: c.podByIP(ip)}, corev1.ProtocolTCP, port) {
+	// a source that the informer does not know yet (a pod that just
+	// started) has no egress rules, but the ingress rules of the target apply
+	if !npAllowed(c, npPeer{ip: src, pod: c.podByIP(src)}, npPeer{ip: ip, pod: c.podByIP(ip)}, corev1.ProtocolTCP, port) {
 		return errDropped
 	}
 	return nil

@@ -249,7 +249,7 @@ export function vmAPI({ version, workerURL, wasmURL, kernelURL, initURL, jitURL,
           if (!pv) { end(); return Promise.resolve(); }
           return new Promise((resolve) => {
             const done = () => { flushed = null; clearTimeout(t); end(); resolve(); };
-            const t = setTimeout(done, 5000);
+            const t = setTimeout(done, 9000); // the sync (3 s) and the writes
             flushed = done;
             send({ type: "flush" });
           });

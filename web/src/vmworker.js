@@ -837,6 +837,7 @@ async function start(m) {
   emulator.fs9p.storage = pod.storage = new LayerStorage(layers, mem);
   emulator.fs9p.load_from_json(fsJSON);
   statRoot(emulator.fs9p, m.ephemeralStorage || (await imageFSCapacity()));
+  if (pod.pvs.size) watchWrites(emulator.fs9p);
   emulator.run();
   // A restored VM has the clock and the random numbers of the saved one.
   const seed = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -851,8 +852,21 @@ async function start(m) {
 // the page cache of the guest back (sync), else the newest data would still
 // be in the VM (9p with cache=loose).
 const WRITE_BACK_MS = 3000;
+const SYNC_WAIT_MS = 3000; // vm.js waits longer for the flush
 const syncWaits = [];
-let writeBackTimer = 0, writing = null;
+let writeBackTimer = 0, writing = null, again = null;
+
+// The files that the guest wrote. A write over 9p changes neither mtime nor
+// ctime in v86, and Linux sends no setattr for it, so a write in place that
+// keeps the size (a database page) would not show otherwise.
+let written = new Set();
+function watchWrites(fs) {
+  const write = fs.Write;
+  fs.Write = function (id, ...rest) {
+    written.add(id);
+    return write.call(this, id, ...rest);
+  };
+}
 function writeBackSoon() {
   if (!pod?.pvs.size || writeBackTimer) return;
   writeBackTimer = setTimeout(async () => {
@@ -862,7 +876,14 @@ function writeBackSoon() {
   }, WRITE_BACK_MS);
 }
 
-function writeBack() {
+// writeBack writes the volumes back. fresh: the guest may have written
+// after the write-back that runs now began, so one more follows it (the
+// stop of the pod).
+function writeBack(fresh) {
+  if (writing && fresh) {
+    again ||= writing.catch(() => {}).then(() => { again = null; return writeBack(); });
+    return again;
+  }
   if (!writing) writing = writeBackNow().finally(() => (writing = null));
   return writing;
 }
@@ -871,9 +892,10 @@ async function writeBackNow() {
   if (!pod?.pvs.size || !emulator) return;
   const synced = new Promise((r) => syncWaits.push(r));
   command("sync");
-  await Promise.race([synced, new Promise((r) => setTimeout(r, 5000))]);
+  await Promise.race([synced, new Promise((r) => setTimeout(r, SYNC_WAIT_MS))]);
   const fs = emulator.fs9p;
-  const t = now();
+  const changed = written;
+  written = new Set();
   for (const [name, vol] of pod.pvs) {
     let id = 0;
     for (const part of `${VOL_DIR}/${name}`.split("/")) {
@@ -895,14 +917,18 @@ async function writeBackNow() {
         entries.set(prefix, { ...e, type: "link", target: ino.symlink });
       } else if (kind === modes.S_IFREG) {
         const size = ino.size;
-        // a file written in the last seconds may change again within the
-        // same second (mtime has seconds): it is read again
-        entries.set(prefix, { ...e, type: "file", size, sig: `${ino.mtime}:${ino.ctime}:${size}`, dirty: ino.mtime >= t - 1 - WRITE_BACK_MS / 1000,
+        // not ctime: v86 sets it to mtime when it loads a file
+        entries.set(prefix, { ...e, type: "file", size, sig: `${ino.mtime}:${size}`, dirty: changed.has(dir),
           read: async () => (size ? (await fs.Read(dir, 0, size)).slice() : new Uint8Array(0)) });
       }
     };
     walk(id, "");
-    await saveVolume(vol, entries);
+    try {
+      await saveVolume(vol, entries);
+    } catch (e) {
+      for (const f of changed) written.add(f); // again next time
+      throw e;
+    }
   }
 }
 
@@ -1057,7 +1083,7 @@ self.onmessage = ({ data: m }) => {
     case "refuse": conns.get(m.id)?.reset(); conns.delete(m.id); break;
     case "drop": { const c = conns.get(m.id); conns.delete(m.id); if (c) forget(c); break; }
     // the pod stops: the persistent volumes go back first
-    case "flush": writeBack().catch((e) => console.warn("tabernetes: writing back the volumes:", e)).finally(() => post({ type: "flushed" })); break;
+    case "flush": writeBack(true).catch((e) => console.warn("tabernetes: writing back the volumes:", e)).finally(() => post({ type: "flushed" })); break;
     case "egress": setEgress(m.allowed); break;
     case "write": conns.get(m.id)?.write(new Uint8Array(m.data)); break;
     // a FIN to the pod; it may still send

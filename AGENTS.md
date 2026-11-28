@@ -121,7 +121,15 @@ that name.
   same for all of them), and deletes a released one with its data. The
   pod worker loads the files into its tree at the start (as memory files)
   and writes back the changes every 3 s and on `flush` (vm.js `stop`
-  waits for it, at most 5 s). 9p is `cache=loose`, so the page cache of
+  waits for it, at most 9 s; a flush that comes while a write-back runs
+  starts one more after it). A write over 9p changes neither mtime nor
+  ctime in v86, and Linux sends no setattr for it, so the worker wraps
+  `fs9p.Write` to know the written files (a database page written in
+  place keeps the size). Only the control plane in the SharedWorker
+  deletes data without a PV at its start: without one, every tab is a
+  cluster of its own on the same OPFS. A pod that cannot get all of
+  its volumes lets go of the ones it got, else two pods that wait for
+  each other would wait forever. 9p is `cache=loose`, so the page cache of
   the guest holds new data for ~30 s: init answers `sync` with `synced`
   after sync(2). That changed init, so the saved state and `jit.bin` of
   a build change too. Files are blobs that are new for every write, and

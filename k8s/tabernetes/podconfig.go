@@ -181,6 +181,12 @@ func (tp *tabPod) apiConfig(ctx context.Context) (*podConfig, error) {
 		}
 		vol, err := tp.volume(ctx, v)
 		if err != nil {
+			// let go of the claims of this try: two pods that wait for the
+			// volume of each other would wait forever
+			tp.mu.Lock()
+			gen := tp.vmGen
+			tp.mu.Unlock()
+			tp.releaseVolumes(gen)
 			return nil, fmt.Errorf("MountVolume.SetUp failed for volume %q : %w", v.Name, err)
 		}
 		cfg.volumes[v.Name] = vol

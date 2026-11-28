@@ -82,7 +82,8 @@ export async function openVolume(name) {
     if (e.blob) {
       try {
         f.data = await readFile(dir, e.blob);
-      } catch {
+      } catch (err) {
+        console.warn(`tabernetes: volume ${name}: the data of ${path} is gone:`, err);
         f.data = new Uint8Array(0);
       }
     }
